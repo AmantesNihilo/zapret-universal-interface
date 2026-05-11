@@ -32,6 +32,7 @@ class TestAllWorker(QObject):
         target_names: set[str] | None = None,
         timeout_sec: int = 5,
         warmup_sec: int = 4,
+        target_workers: int = 4,
     ) -> None:
         super().__init__()
         self.paths = paths
@@ -39,6 +40,7 @@ class TestAllWorker(QObject):
         self.target_names = target_names or set()
         self.timeout_sec = timeout_sec
         self.warmup_sec = warmup_sec
+        self.target_workers = target_workers
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -51,6 +53,7 @@ class TestAllWorker(QObject):
             target_list = [target for target in target_list if target.name in self.target_names]
         total = len(self.preset_list)
         self.log.emit(f"Targets loaded: {len(target_list)}")
+        self.log.emit(f"Parallel target workers: {self.target_workers}")
 
         try:
             for index, preset in enumerate(self.preset_list, start=1):
@@ -84,6 +87,7 @@ class TestAllWorker(QObject):
                         self.timeout_sec,
                         on_target_done,
                         lambda: self._stop_requested,
+                        self.target_workers,
                     )
                     if self._stop_requested:
                         self.log.emit("Test stopped by user.")
