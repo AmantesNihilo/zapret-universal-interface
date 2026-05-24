@@ -49,7 +49,7 @@ The MIT license text for tg-ws-proxy is included in the vendored source tree. Ke
 
 If you publish a fork, repack, installer, or modified portable build:
 
-- keep `README.md`, `README.ru.md`, and this `NOTICE.md`;
+- keep the files from the `docs` directory, including `README.md`, `README.ru.md`, and this `NOTICE.md`;
 - keep upstream license files;
 - do not remove warnings about administrator rights, WinDivert, antivirus heuristics, or VPN/proxy conflicts;
 - clearly mark modified builds as modified;

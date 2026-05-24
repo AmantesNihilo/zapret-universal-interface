@@ -1,20 +1,33 @@
 from __future__ import annotations
 
 import re
+import ipaddress
+import socket
 import subprocess
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from .targets import Target
 
 
 CREATE_NO_WINDOW = 0x08000000
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
 class TargetResult:
     name: str
+    category: str
+    service: str
+    primary: bool
+    url: str | None
+    ping_target: str | None
     http_tokens: tuple[str, ...]
     ping_ok: bool
     ping_text: str
@@ -37,13 +50,44 @@ URL_TESTS = (
 )
 
 
+def host_resolves_to_loopback(host: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            if ipaddress.ip_address(info[4][0]).is_loopback:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def url_resolves_to_loopback(url: str) -> bool:
+    host = urlparse(url).hostname
+    return bool(host and host_resolves_to_loopback(host))
+
+
 def test_url_protocol(url: str, timeout_sec: int, label: str, protocol_args: tuple[str, ...]) -> str:
     command = [
         "curl.exe",
-        "-I",
+        "--noproxy",
+        "*",
         "-s",
+        "-L",
         "-m",
         str(timeout_sec),
+        "--connect-timeout",
+        str(timeout_sec),
+        "--max-redirs",
+        "4",
+        "-A",
+        BROWSER_USER_AGENT,
+        "-H",
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "-H",
+        "Accept-Language: en-US,en;q=0.9",
         "-o",
         "NUL",
         "-w",
@@ -61,8 +105,10 @@ def test_url_protocol(url: str, timeout_sec: int, label: str, protocol_args: tup
             check=False,
             creationflags=CREATE_NO_WINDOW,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return f"{label}:ERR"
+    except subprocess.TimeoutExpired:
+        return f"{label}:ERR_TIMEOUT"
+    except OSError:
+        return f"{label}:ERR_RUN"
 
     stderr = completed.stderr or ""
     unsupported = completed.returncode == 35 or re.search(
@@ -74,12 +120,40 @@ def test_url_protocol(url: str, timeout_sec: int, label: str, protocol_args: tup
         return f"{label}:UNSUP"
     if re.search(r"certificate|SSL|self.?signed", stderr, re.IGNORECASE):
         return f"{label}:SSL"
-    if completed.returncode == 0:
-        return f"{label}:OK"
-    return f"{label}:FAIL"
+    http_code_text = (completed.stdout or "").strip()
+    try:
+        http_code = int(http_code_text[-3:])
+    except ValueError:
+        http_code = 0
+
+    if completed.returncode == 0 and 200 <= http_code < 400:
+        return f"{label}:OK{http_code}"
+    if completed.returncode == 0 and http_code:
+        return f"{label}:HTTP{http_code}"
+    error_hint = curl_error_hint(completed.returncode, stderr)
+    return f"{label}:FAIL{completed.returncode}_{error_hint}"
+
+
+def curl_error_hint(returncode: int, stderr: str) -> str:
+    text = (stderr or "").lower()
+    if returncode == 28 or "timed out" in text or "timeout" in text:
+        return "TIMEOUT"
+    if returncode == 35 or "ssl connect" in text or "schannel" in text:
+        return "TLS"
+    if returncode == 52 or "empty reply" in text:
+        return "EMPTY"
+    if returncode == 56 or "recv failure" in text or "connection was reset" in text:
+        return "RESET"
+    if returncode == 7 or "could not connect" in text:
+        return "CONNECT"
+    if returncode == 6 or "could not resolve" in text:
+        return "DNS"
+    return "ERR"
 
 
 def test_url(url: str, timeout_sec: int) -> tuple[str, ...]:
+    if url_resolves_to_loopback(url):
+        return tuple(f"{label}:DNS_LOOPBACK" for label, _protocol_args in URL_TESTS)
     with ThreadPoolExecutor(max_workers=len(URL_TESTS)) as executor:
         futures = [
             executor.submit(test_url_protocol, url, timeout_sec, label, protocol_args)
@@ -115,12 +189,35 @@ def test_ping(target: str | None, timeout_sec: int) -> tuple[bool, str]:
 
 
 def test_target(target: Target, timeout_sec: int) -> TargetResult:
+    if target.url and url_resolves_to_loopback(target.url):
+        return TargetResult(
+            target.name,
+            target.category,
+            target.service,
+            target.primary,
+            target.url,
+            target.ping_target,
+            tuple(f"{label}:DNS_LOOPBACK" for label, _protocol_args in URL_TESTS),
+            False,
+            "DNS loopback",
+        )
+
     with ThreadPoolExecutor(max_workers=2) as executor:
         url_future = executor.submit(test_url, target.url, timeout_sec) if target.url else None
         ping_future = executor.submit(test_ping, target.ping_target, timeout_sec)
         tokens = url_future.result() if url_future is not None else tuple()
         ping_success, ping_text = ping_future.result()
-    return TargetResult(target.name, tokens, ping_success, ping_text)
+    return TargetResult(
+        target.name,
+        target.category,
+        target.service,
+        target.primary,
+        target.url,
+        target.ping_target,
+        tokens,
+        ping_success,
+        ping_text,
+    )
 
 
 ProgressCallback = Callable[[Target, TargetResult, int, int], None]
@@ -158,10 +255,20 @@ def test_targets(
             try:
                 target_result = future.result()
             except Exception:
-                target_result = TargetResult(target.name, ("HTTP:ERR", "TLS1.2:ERR", "TLS1.3:ERR"), False, "ERR")
+                target_result = TargetResult(
+                    target.name,
+                    target.category,
+                    target.service,
+                    target.primary,
+                    target.url,
+                    target.ping_target,
+                    ("HTTP:ERR", "TLS1.2:ERR", "TLS1.3:ERR"),
+                    False,
+                    "ERR",
+                )
 
             for token in target_result.http_tokens:
-                if token.endswith(":OK"):
+                if re.search(r":(?:OK|HTTP)\d{3}$", token):
                     ok += 1
                 elif token.endswith(":UNSUP"):
                     unsup += 1

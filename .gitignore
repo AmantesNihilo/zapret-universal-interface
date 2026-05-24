@@ -21,5 +21,6 @@ utils/preset-active.txt
 # Local/editor noise
 .idea/
 .vscode/
+backups/
 *.tmp
 *.bak

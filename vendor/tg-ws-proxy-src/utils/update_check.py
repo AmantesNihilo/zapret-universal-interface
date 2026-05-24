@@ -14,7 +14,8 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+from proxy.utils import build_github_opener
 
 REPO = "Flowseal/tg-ws-proxy"
 RELEASES_LATEST_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -73,7 +74,7 @@ def _parse_version_tuple(s: str) -> tuple:
         return (0,)
     parts = []
     for seg in s.split("."):
-        digits = "".join(c for c in seg if c.isdigit())
+        digits = next((seg[:i] for i, c in enumerate(seg) if not c.isdigit()), seg)
         if digits:
             try:
                 parts.append(int(digits))
@@ -135,7 +136,7 @@ def fetch_latest_release(
         method="GET",
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with build_github_opener().open(req, timeout=timeout) as resp:
             code = getattr(resp, "status", None) or resp.getcode()
             new_etag = resp.headers.get("ETag")
             raw = resp.read().decode("utf-8", errors="replace")

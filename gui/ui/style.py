@@ -211,6 +211,72 @@ QLabel#MetaLabel {{
     padding: 2px 0;
 }}
 
+QLabel#TourIcon {{
+    background: {c["button"]};
+    border: 1px solid {c["button_border"]};
+    border-radius: 22px;
+    min-width: 44px;
+    max-width: 44px;
+    min-height: 44px;
+    max-height: 44px;
+}}
+
+QLabel#TourBody {{
+    color: {c["text"]};
+    background: {c["meta"]};
+    border: 1px solid {c["grid"]};
+    border-radius: 10px;
+    padding: 16px;
+    font-size: 11pt;
+    line-height: 145%;
+}}
+
+QFrame#TourCard {{
+    background: {c["panel"]};
+    border: 1px solid {c["primary_border"]};
+    border-radius: 14px;
+}}
+
+QFrame#BusyPanel {{
+    background: {c["panel"]};
+    border: 1px solid {c["panel_border"]};
+    border-radius: 10px;
+}}
+
+QWidget#BusyProgressLine {{
+    background: transparent;
+    border: none;
+}}
+
+QLabel#BusyTitle {{
+    color: {c["title"]};
+    background: transparent;
+    border: none;
+    font-size: 12pt;
+    font-weight: 650;
+}}
+
+QLabel#TourRouteTitle {{
+    color: {c["section"]};
+    background: transparent;
+    border: none;
+    font-weight: 700;
+    padding: 4px 0 0 0;
+}}
+
+QLabel#TourStepLabel {{
+    color: {c["disabled_text"]};
+    background: transparent;
+    border: none;
+    padding: 3px 0;
+    font-size: 9pt;
+}}
+
+QLabel#TourStepLabel[active="true"] {{
+    color: {c["primary"]};
+    font-weight: 700;
+}}
+
 QLabel#InlineLabel {{
     color: {c["section"]};
     background: transparent;
@@ -261,62 +327,44 @@ QLabel#TgEndpointBadge {{
 }}
 
 #HomeServiceCard {{
-    background: {c["panel"]};
-    border: 1px solid {c["panel_border"]};
+    background: transparent;
+    border: none;
     border-radius: 16px;
-    min-height: 150px;
+    min-height: 118px;
 }}
 
 QLabel#HomeServiceTitle {{
     color: {c["title"]};
     background: transparent;
     border: none;
-    font-size: 22pt;
+    font-size: 15pt;
     font-weight: 700;
 }}
 
 QLabel#HomeServiceStatusOn {{
     color: {c["running_text"]};
-    background: transparent;
-    border: none;
-    font-size: 58pt;
-    font-weight: 800;
+    background: {c["running_bg"]};
+    border: 1px solid {c["running_border"]};
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 10pt;
+    font-weight: 700;
 }}
 
 QLabel#HomeServiceStatusOff {{
     color: {c["stopped_text"]};
-    background: transparent;
-    border: none;
-    font-size: 58pt;
-    font-weight: 800;
+    background: {c["stopped_bg"]};
+    border: 1px solid {c["stopped_border"]};
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 10pt;
+    font-weight: 700;
 }}
 
 QCheckBox#HomeServiceToggle {{
-    color: {c["section"]};
-    background: {c["button"]};
-    border: 1px solid {c["button_border"]};
-    border-radius: 16px;
-    padding: 7px 12px;
-    spacing: 9px;
-    font-weight: 650;
-}}
-
-QCheckBox#HomeServiceToggle:hover {{
-    background: {c["button_hover"]};
-    border-color: {c["primary_border"]};
-}}
-
-QCheckBox#HomeServiceToggle::indicator {{
-    width: 30px;
-    height: 16px;
-    border-radius: 8px;
-    border: 1px solid {c["button_border"]};
-    background: {c["meta"]};
-}}
-
-QCheckBox#HomeServiceToggle::indicator:checked {{
-    background: {c["primary"]};
-    border-color: {c["primary_border"]};
+    background: transparent;
+    border: none;
+    padding: 0;
 }}
 
 QLabel#HomeSectionTitle {{
@@ -333,10 +381,59 @@ QLabel#HomeSectionTitle {{
     border-radius: 12px;
 }}
 
+#HomeLaunchCard {{
+    background: {c["panel"]};
+    border: 1px solid {c["panel_border"]};
+    border-radius: 12px;
+}}
+
+QLabel#LaunchFieldLabel {{
+    color: {c["section"]};
+    background: transparent;
+    border: none;
+    font-size: 10pt;
+    font-weight: 650;
+}}
+
 #OnboardingCard {{
     background: {c["panel"]};
     border: 1px solid {c["panel_border"]};
     border-radius: 12px;
+}}
+
+#ReadinessCard {{
+    background: {c["panel"]};
+    border: 1px solid {c["panel_border"]};
+    border-radius: 12px;
+}}
+
+#ReadinessItem {{
+    background: {c["meta"]};
+    border: 1px solid {c["grid"]};
+    border-radius: 10px;
+}}
+
+QLabel#ReadinessIcon {{
+    color: {c["primary"]};
+    background: {c["button"]};
+    border: 1px solid {c["button_border"]};
+    border-radius: 15px;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
+}}
+
+#Panel[tourHighlight="true"],
+#ReadinessCard[tourHighlight="true"],
+#ReadinessItem[tourHighlight="true"],
+#HomePresetCard[tourHighlight="true"],
+#HomeLaunchCard[tourHighlight="true"],
+QTableView[tourHighlight="true"],
+QFrame[tourHighlight="true"],
+QPushButton[tourHighlight="true"] {{
+    background: {c["button_hover"]};
+    border: 1px solid {c["primary_border"]};
 }}
 
 QWidget#OnboardingStep {{
@@ -637,6 +734,17 @@ QLabel#DialogText {{
     color: {c["section"]};
 }}
 
+QLabel#CloseDialogIcon {{
+    color: {c["primary"]};
+    background: {c["button"]};
+    border: 1px solid {c["primary_border"]};
+    border-radius: 22px;
+    min-width: 44px;
+    max-width: 44px;
+    min-height: 44px;
+    max-height: 44px;
+}}
+
 QPushButton {{
     background: {c["button"]};
     border: 1px solid {c["button_border"]};
@@ -692,6 +800,26 @@ QPushButton#HomePowerButton:hover {{
 }}
 
 QPushButton#HomePowerButton:disabled {{
+    background: {c["disabled_bg"]};
+    border-color: {c["disabled_border"]};
+    color: {c["disabled_text"]};
+}}
+
+QPushButton#HomeDangerButton {{
+    background: {c["danger"]};
+    border: 1px solid {c["danger_border"]};
+    border-radius: 14px;
+    color: {c["stopped_text"]};
+    font-size: 15pt;
+    font-weight: 700;
+    padding: 18px 34px;
+}}
+
+QPushButton#HomeDangerButton:hover {{
+    background: {c["danger_hover"]};
+}}
+
+QPushButton#HomeDangerButton:disabled {{
     background: {c["disabled_bg"]};
     border-color: {c["disabled_border"]};
     color: {c["disabled_text"]};
@@ -777,22 +905,30 @@ QPushButton#TableActionButton {{
     font-weight: 700;
 }}
 
-QTableWidget {{
+QTableWidget, QTableView {{
     background: {c["table"]};
-    alternate-background-color: {c["table_alt"]};
+    alternate-background-color: transparent;
     border: 1px solid {c["panel_border"]};
     border-radius: 8px;
     gridline-color: transparent;
     selection-background-color: {c["selection"]};
     selection-color: {c["selection_text"]};
+    outline: 0;
 }}
 
-QTableWidget::item {{
-    padding: 7px 8px;
-    border-bottom: 1px solid {c["grid"]};
+QTableWidget::item, QTableView::item {{
+    padding: 8px 10px;
+    border: none;
+    min-height: 28px;
 }}
 
-QTableWidget::item:selected {{
+QTableWidget::item:hover, QTableView::item:hover {{
+    background: {c["button_hover"]};
+    color: {c["text"]};
+}}
+
+QTableWidget::item:selected, QTableView::item:selected {{
+    background: {c["selection"]};
     color: {c["selection_text"]};
 }}
 
@@ -803,6 +939,30 @@ QHeaderView::section {{
     border-bottom: 1px solid {c["grid"]};
     padding: 9px 8px;
     font-weight: 650;
+}}
+
+QTableView QTableCornerButton::section {{
+    background: {c["table_header"]};
+    border: 0;
+    border-bottom: 1px solid {c["grid"]};
+}}
+
+QTableView::indicator {{
+    width: 16px;
+    height: 16px;
+    border-radius: 5px;
+    border: 1px solid {c["button_border"]};
+    background: {c["button"]};
+}}
+
+QTableView::indicator:hover {{
+    border-color: {c["primary_border"]};
+    background: {c["button_hover"]};
+}}
+
+QTableView::indicator:checked {{
+    background: {c["primary"]};
+    border-color: {c["primary_border"]};
 }}
 
 QCheckBox {{

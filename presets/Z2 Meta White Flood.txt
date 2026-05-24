@@ -1,0 +1,49 @@
+# Preset: Z2 Meta White Flood
+# ActivePreset: Z2 Meta White Flood
+# BasedOn: zapret-16kb flood_white
+# Experimental: white SNI flood before real Meta ClientHello
+# IconColor: #e599f7ff
+
+--lua-init=@lua/zapret-lib.lua
+--lua-init=@lua/zapret-antidpi.lua
+--lua-init=@lua/zapret-auto.lua
+--lua-init=@lua/init_vars.lua
+--lua-init=@lua/custom_funcs.lua
+--lua-init=@lua/custom_diag.lua
+--lua-init=@lua/zapret-16kb.lua
+--lua-init=@lua/zapret-multishake.lua
+
+--ctrack-disable=0
+--ipcache-lifetime=8400
+--ipcache-hostname=1
+
+--blob=tls_google:@bin/tls_clienthello_www_google_com.bin
+--blob=quic_google:@bin/quic_initial_www_google_com.bin
+--blob=quic_facebook:@bin/quic_initial_facebook_com.bin
+
+--wf-tcp-out=80,443,2053,2083,2087,2096,8443
+--wf-udp-out=443
+
+--filter-udp=443
+--ipset=lists/ipset-instagram.txt
+--ipset=lists/ipset-facebook.txt
+--ipset-exclude=lists/ipset-exclude.txt
+--payload=quic_initial
+--lua-desync=fake:blob=quic_facebook:repeats=10
+
+--new
+
+--filter-tcp=80,443,1080,2053,2083,2087,2096,8443
+--hostlist=lists/social-meta.txt
+--hostlist=lists/instagram.txt
+--hostlist=lists/facebook.txt
+--payload=tls_client_hello,http_req
+--lua-desync=flood_white:blob=tls_google:count=10:pos=1,midsld
+
+--new
+
+--filter-tcp=80,443
+--hostlist=lists/social-x-twitter.txt
+--hostlist=lists/social-whatsapp.txt
+--payload=tls_client_hello,http_req
+--lua-desync=fake:blob=tls_google:repeats=6:tcp_ts=-600000

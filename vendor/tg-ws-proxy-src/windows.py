@@ -8,8 +8,11 @@ import threading
 import time
 import webbrowser
 import winreg
+import tempfile
+
 from pathlib import Path
 from typing import Optional
+from proxy.utils import build_github_opener
 
 try:
     import pyperclip
@@ -219,9 +222,6 @@ def update_ctk_form(
 
 
 def _perform_update(download_url: str, set_status=None) -> None:
-    import tempfile
-    import urllib.request
-
     def _step(msg: str) -> None:
         log.info("Update: %s", msg)
         if set_status:
@@ -244,7 +244,14 @@ def _perform_update(download_url: str, set_status=None) -> None:
         os.close(fd)
         tmp_path = Path(tmp_name)
         log.info("Downloading update from %s", download_url)
-        urllib.request.urlretrieve(download_url, str(tmp_path))
+        opener = build_github_opener()
+        with opener.open(download_url) as _resp:
+            with open(str(tmp_path), "wb") as _fout:
+                while True:
+                    _chunk = _resp.read(65536)
+                    if not _chunk:
+                        break
+                    _fout.write(_chunk)
     except Exception as exc:
         _err(f"Не удалось скачать:\n{exc}")
         if tmp_path:
@@ -436,7 +443,11 @@ def _on_edit_config(icon=None, item=None) -> None:
 def _on_open_logs(icon=None, item=None) -> None:
     log.info("Opening log file: %s", LOG_FILE)
     if LOG_FILE.exists():
-        os.startfile(str(LOG_FILE))
+        try:
+            os.startfile(str(LOG_FILE))
+        except Exception as exc:
+            log.error("Failed to open log file: %s", exc)
+            _show_error(f"Не удалось открыть файл логов:\n{exc}")
     else:
         _show_info("Файл логов ещё не создан.")
 
@@ -485,9 +496,15 @@ def _edit_config_dialog() -> None:
             autostart_value=cfg.get("autostart", False),
         )
 
+        _original_appearance = ctk.get_appearance_mode()
+
         def _finish() -> None:
             root.destroy()
             done.set()
+
+        def _cancel() -> None:
+            ctk.set_appearance_mode(_original_appearance)
+            _finish()
 
         def on_save() -> None:
             from tkinter import messagebox
@@ -495,12 +512,25 @@ def _edit_config_dialog() -> None:
             if isinstance(merged, str):
                 messagebox.showerror("TG WS Proxy — Ошибка", merged, parent=root)
                 return
+
+            _ui_only_keys = {"appearance", "autostart", "check_updates"}
+            config_changed = any(merged.get(k) != cfg.get(k) for k in merged)
+            proxy_changed = any(merged.get(k) != cfg.get(k) for k in merged if k not in _ui_only_keys)
+
+            if not config_changed:
+                _finish()
+                return
+
             save_config(merged)
             _config.update(merged)
             log.info("Config saved: %s", merged)
             if _supports_autostart():
                 set_autostart_enabled(bool(merged.get("autostart", False)))
             _tray_icon.menu = _build_menu()
+
+            if not proxy_changed:
+                _finish()
+                return
 
             do_restart = messagebox.askyesno(
                 "Перезапустить?",
@@ -511,8 +541,8 @@ def _edit_config_dialog() -> None:
             if do_restart:
                 threading.Thread(target=lambda: restart_proxy(_config, _show_error), daemon=True).start()
 
-        root.protocol("WM_DELETE_WINDOW", _finish)
-        install_tray_config_buttons(ctk, footer, theme, on_save=on_save, on_cancel=_finish)
+        root.protocol("WM_DELETE_WINDOW", _cancel)
+        install_tray_config_buttons(ctk, footer, theme, on_save=on_save, on_cancel=_cancel)
 
     ctk_run_dialog(_build)
 
@@ -578,7 +608,7 @@ def run_tray() -> None:
 
     _config = load_config()
 
-    if is_windows_dark_theme:
+    if is_windows_dark_theme():
         apply_windows_dark_theme()
 
     bootstrap(_config)

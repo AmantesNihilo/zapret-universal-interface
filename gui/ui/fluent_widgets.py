@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QAction, QColor
+import math
+
+from PySide6.QtCore import Property, QEasingCurve, QPoint, QRectF, QPropertyAnimation, QTimer, Qt
+from PySide6.QtGui import QAction, QColor, QLinearGradient, QPainter, QPainterPath, QPalette
 from PySide6.QtWidgets import QHBoxLayout, QTableWidgetItem, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel as FluentBodyLabel,
@@ -185,6 +187,135 @@ class FluentCommandBar(CardWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("CommandBar")
+
+
+class GlowServiceCard(QWidget):
+    def __init__(self, accent: QColor, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("GlowServiceCard")
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self._accent = QColor(accent)
+        self._active = False
+        self._glow = 0.0
+        self._phase = 0.0
+        self._animation = QPropertyAnimation(self, b"glow", self)
+        self._animation.setDuration(360)
+        self._animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._animation.finished.connect(self._sync_motion_timer)
+        self._motion_timer = QTimer(self)
+        self._motion_timer.setInterval(33)
+        self._motion_timer.timeout.connect(self._tick_motion)
+        self.card_layout = QVBoxLayout(self)
+        self.card_layout.setContentsMargins(20, 18, 20, 18)
+        self.card_layout.setSpacing(12)
+
+    def getGlow(self) -> float:
+        return self._glow
+
+    def setGlow(self, value: float) -> None:
+        self._glow = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    glow = Property(float, getGlow, setGlow)
+
+    def set_running(self, running: bool, animate: bool = True) -> None:
+        if self._active == running and self._animation.state() != QPropertyAnimation.Running:
+            return
+        self._active = running
+        target = 1.0 if running else 0.0
+        if not animate:
+            self._animation.stop()
+            self.setGlow(target)
+            self._sync_motion_timer()
+            return
+        self._animation.stop()
+        self._animation.setStartValue(self._glow)
+        self._animation.setEndValue(target)
+        self._animation.start()
+        self._sync_motion_timer()
+
+    def _sync_motion_timer(self) -> None:
+        should_run = self._active or self._animation.state() == QPropertyAnimation.Running
+        if should_run and not self._motion_timer.isActive():
+            self._motion_timer.start()
+        elif not should_run and self._motion_timer.isActive():
+            self._motion_timer.stop()
+
+    def _tick_motion(self) -> None:
+        self._phase = (self._phase + 0.028) % (math.tau)
+        if self._active or self._animation.state() == QPropertyAnimation.Running:
+            self.update()
+        else:
+            self._motion_timer.stop()
+
+    def paintEvent(self, event) -> None:
+        if self.width() < 4 or self.height() < 4:
+            super().paintEvent(event)
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        if rect.width() <= 0 or rect.height() <= 0:
+            painter.end()
+            super().paintEvent(event)
+            return
+
+        corner_radius = min(16.0, rect.width() / 2, rect.height() / 2)
+        path = QPainterPath()
+        path.addRoundedRect(rect, corner_radius, corner_radius)
+
+        palette = self.palette()
+        base = QColor(palette.color(QPalette.Window))
+        if base.lightness() < 24:
+            base = QColor(25, 28, 35)
+        border = QColor(palette.color(QPalette.Mid))
+        inactive = QColor(255, 82, 98) if base.lightness() < 128 else QColor(226, 68, 83)
+        accent = QColor(self._accent)
+        base_is_light = base.lightness() > 128
+        mix = self._glow
+        glow_color = QColor(
+            int(inactive.red() * (1 - mix) + accent.red() * mix),
+            int(inactive.green() * (1 - mix) + accent.green() * mix),
+            int(inactive.blue() * (1 - mix) + accent.blue() * mix),
+        )
+
+        painter.fillPath(path, base)
+        painter.save()
+        painter.setClipPath(path)
+        wave = 0.5 + 0.5 * math.sin(self._phase)
+        drift = math.sin(self._phase * 0.72)
+        lift = math.cos(self._phase * 0.58)
+        start_x = rect.right() - rect.width() * (0.18 + 0.05 * drift)
+        start_y = rect.top() + rect.height() * (0.10 + 0.08 * lift)
+        end_x = rect.left() + rect.width() * 0.08
+        end_y = rect.bottom() - rect.height() * 0.08
+        active_alpha = int((36 if base_is_light else 62) + (16 if base_is_light else 24) * wave)
+        mid_alpha = int((12 if base_is_light else 18) + (8 if base_is_light else 14) * wave)
+        gradient = QLinearGradient(start_x, start_y, end_x, end_y)
+        gradient.setColorAt(0.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), active_alpha if self._active else 52))
+        gradient.setColorAt(0.36, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), mid_alpha if self._active else 18))
+        gradient.setColorAt(1.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 0))
+        painter.fillPath(path, gradient)
+
+        if self._active:
+            sweep = QLinearGradient(
+                rect.left() + rect.width() * (0.12 + 0.08 * math.cos(self._phase * 0.9)),
+                rect.bottom(),
+                rect.left() + rect.width() * 0.72,
+                rect.top(),
+            )
+            sweep.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), int((14 if base_is_light else 20) + 10 * (1 - wave))))
+            sweep.setColorAt(0.55, QColor(accent.red(), accent.green(), accent.blue(), 6 if base_is_light else 8))
+            sweep.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 0))
+            painter.fillPath(path, sweep)
+        painter.restore()
+
+        painter.setPen(border)
+        painter.drawPath(path)
+        painter.end()
+        super().paintEvent(event)
 
 
 def setting_row(title: str, control: QWidget) -> QWidget:

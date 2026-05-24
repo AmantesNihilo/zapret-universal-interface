@@ -1,0 +1,14 @@
+# Twitch
+twitch.tv
+www.twitch.tv
+m.twitch.tv
+gql.twitch.tv
+api.twitch.tv
+twitchcdn.net
+static.twitchcdn.net
+static-cdn.jtvnw.net
+ttvnw.net
+jtvnw.net
+ttwstatic.com
+ext-twitch.tv
+live-video.net

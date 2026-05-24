@@ -16,9 +16,7 @@ datas = [
     ("bin", "bin"),
     ("lua", "lua"),
     ("windivert.filter", "windivert.filter"),
-    ("README.md", "."),
-    ("README.ru.md", "."),
-    ("NOTICE.md", "."),
+    ("docs", "docs"),
     ("vendor/tg-ws-proxy-src/LICENSE", "licenses/tg-ws-proxy"),
 ]
 

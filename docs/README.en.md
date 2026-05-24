@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="gui/ui/assets/Z2.png" width="96" alt="Z2 GUI logo">
+<img src="../gui/ui/assets/Z2.png" width="96" alt="Z2 GUI logo">
 
 # Z2 GUI
 
@@ -11,13 +11,19 @@
 [![Build](https://img.shields.io/badge/build-portable-blue)](#build-from-source)
 [![License](https://img.shields.io/badge/license-see_credits-lightgrey)](#credits-and-licenses)
 
-[Русский](README.ru.md) | English
+[Русский](README.md) | English
 
 </div>
 
 Z2 GUI is a portable Windows application for finding, testing, saving, and launching zapret2 presets without manually editing scripts or running batch files.
 
 It also includes source-based `tg-ws-proxy` integration: the app can start a local Telegram MTProto WebSocket proxy, copy the proxy link, and open it directly in Telegram Desktop.
+
+## Screenshots
+
+| Home | Presets | Settings |
+| --- | --- | --- |
+| <img src="../gui/ui/assets/Home.jpg" alt="Home page" width="320"> | <img src="../gui/ui/assets/Preset.jpg" alt="Presets page" width="320"> | <img src="../gui/ui/assets/Setting.jpg" alt="Settings page" width="320"> |
 
 ## What It Is
 
@@ -38,6 +44,7 @@ It also includes source-based `tg-ws-proxy` integration: the app can start a loc
 
 ## Contents
 
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)

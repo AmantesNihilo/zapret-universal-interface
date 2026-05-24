@@ -11,17 +11,13 @@ if (-not (Test-Path $outDir)) {
     throw "Build output not found: $outDir"
 }
 
-$rootFiles = @(
-    "README.md",
-    "README.ru.md",
-    "NOTICE.md"
-)
-
-foreach ($file in $rootFiles) {
-    $source = Join-Path $PSScriptRoot $file
-    if (Test-Path -LiteralPath $source) {
-        Copy-Item -LiteralPath $source -Destination (Join-Path $outDir $file) -Force
+$docsSource = Join-Path $PSScriptRoot "docs"
+$docsDestination = Join-Path $outDir "docs"
+if (Test-Path -LiteralPath $docsSource) {
+    if (Test-Path -LiteralPath $docsDestination) {
+        Remove-Item -LiteralPath $docsDestination -Recurse -Force
     }
+    Copy-Item -LiteralPath $docsSource -Destination $docsDestination -Recurse -Force
 }
 
 Write-Host ""

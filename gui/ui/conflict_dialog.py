@@ -38,7 +38,7 @@ class ConflictDialog(QDialog):
         description.setObjectName("DialogText")
         layout.addWidget(description)
 
-        process_panel = panel_card("Detected Processes")
+        process_panel = panel_card("Detected Conflicts")
         process_layout = process_panel.layout()
         for process in processes:
             checkbox = FluentCheckBox()

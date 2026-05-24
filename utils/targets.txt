@@ -1,32 +1,103 @@
-# targets.txt - список целей для тестирования
+# targets.txt - internal endpoints for preset testing
 #
-# Формат:
-#   Имя = "https://host..."       -> HTTP/TLS проверки + ping
-#   Имя = "PING:1.2.3.4"          -> Только ping
+# Format:
+#   Name = "https://host..."       -> HTTP/TLS checks + ping
+#   Name = "PING:1.2.3.4"          -> ping only
 #
-# Можно добавлять/удалять строки свободно.
+# Sections use "Category / Service". Test Settings shows services to users,
+# while target details keep the exact endpoints for diagnostics.
 
-### Discord
-DiscordMain           = "https://discord.com"
-DiscordGateway        = "https://gateway.discord.gg"
-DiscordCDN            = "https://cdn.discordapp.com"
-DiscordUpdates        = "https://updates.discord.com"
+### Core / Google
+GoogleMain              = "https://www.google.com"
+GoogleGstatic           = "https://www.gstatic.com"
 
-### YouTube
-YouTubeWeb            = "https://www.youtube.com"
-YouTubeShort          = "https://youtu.be"
-YouTubeImage          = "https://i.ytimg.com"
-YouTubeVideo          = "https://redirector.googlevideo.com"
+### Core / Cloudflare
+CloudflareWeb           = "https://www.cloudflare.com"
+CloudflareCDN           = "https://cdnjs.cloudflare.com"
 
-### Google
-GoogleMain            = "https://www.google.com"
-GoogleGstatic         = "https://www.gstatic.com"
+### Core / DNS
+CloudflareDNS           = "PING:1.1.1.1"
+GoogleDNS               = "PING:8.8.8.8"
+Quad9DNS                = "PING:9.9.9.9"
 
-### Cloudflare
-CloudflareWeb         = "https://www.cloudflare.com"
-CloudflareCDN         = "https://cdnjs.cloudflare.com"
+### Video / YouTube
+YouTubeWeb              = "https://www.youtube.com"
+YouTubeShort            = "https://youtu.be"
+YouTubeImage            = "https://i.ytimg.com"
+YouTubeVideo            = "https://redirector.googlevideo.com"
 
-### DNS (Ping only)
-CloudflareDNS         = "PING:1.1.1.1"
-GoogleDNS             = "PING:8.8.8.8"
-Quad9DNS              = "PING:9.9.9.9"
+### Video / TikTok
+TikTokWeb               = "https://www.tiktok.com"
+TikTokCDN               = "https://www.tiktokcdn.com"
+TikTokVideoCDN          = "https://www.tiktokv.com"
+
+### Video / Twitch
+TwitchWeb               = "https://www.twitch.tv"
+TwitchGQL               = "https://gql.twitch.tv"
+TwitchStatic            = "https://static.twitchcdn.net"
+TwitchTTWStatic         = "https://static-cdn.jtvnw.net"
+
+### Social / Discord
+DiscordMain             = "https://discord.com"
+DiscordGateway          = "https://gateway.discord.gg"
+DiscordCDN              = "https://cdn.discordapp.com"
+DiscordUpdates          = "https://updates.discord.com"
+DiscordVoiceMedia       = "https://discord.media"
+
+### Social / Telegram
+TelegramWeb             = "https://web.telegram.org"
+TelegramAPI             = "https://api.telegram.org"
+TelegramMain            = "https://telegram.org"
+TelegramShort           = "https://t.me"
+
+### Social / Instagram
+Instagram               = "https://www.instagram.com"
+InstagramAPI            = "https://i.instagram.com"
+InstagramGraph          = "https://graph.instagram.com"
+InstagramStatic         = "https://static.cdninstagram.com"
+InstagramCDN            = "https://scontent.cdninstagram.com"
+
+### Social / Facebook
+Facebook                = "https://www.facebook.com"
+FacebookGraph           = "https://graph.facebook.com"
+FacebookStatic          = "https://static.xx.fbcdn.net"
+FacebookCDN             = "https://scontent.xx.fbcdn.net"
+FacebookSbx             = "https://lookaside.fbsbx.com"
+
+### Social / X / Twitter
+TwitterX                = "https://x.com"
+TwitterWeb              = "https://twitter.com"
+TwitterAPI              = "https://api.twitter.com"
+TwitterAPIX             = "https://api.x.com"
+TwitterImg              = "https://pbs.twimg.com"
+TwitterStatic           = "https://abs.twimg.com"
+TwitterVideo            = "https://video.twimg.com"
+
+### Social / WhatsApp
+WhatsAppWeb             = "https://web.whatsapp.com"
+WhatsAppStatic          = "https://static.whatsapp.net"
+WhatsAppMain            = "https://www.whatsapp.com"
+
+### Games / Steam
+SteamStore              = "https://store.steampowered.com"
+SteamCommunity          = "https://steamcommunity.com"
+SteamCDN                = "https://steamcdn-a.akamaihd.net"
+
+### Games / Roblox
+RobloxWeb               = "https://www.roblox.com"
+RobloxAPI               = "https://apis.roblox.com"
+RobloxCDN               = "https://images.rbxcdn.com"
+
+### Games / Epic Games
+EpicGames               = "https://www.epicgames.com"
+EpicStore               = "https://store.epicgames.com"
+EpicCDN                 = "https://cdn1.epicgames.com"
+
+### Games / Riot / Valorant
+RiotGames               = "https://www.riotgames.com"
+RiotAuth                = "https://auth.riotgames.com"
+Valorant                = "https://playvalorant.com"
+
+### Games / Discord Voice
+GameDiscordGateway      = "https://gateway.discord.gg"
+GameDiscordVoice        = "https://discord.media"

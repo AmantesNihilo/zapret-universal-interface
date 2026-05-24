@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import webbrowser
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from ui.ctk_theme import (
     main_content_frame,
 )
 from ui.ctk_tooltip import attach_ctk_tooltip, attach_tooltip_to_widgets
+
+log = logging.getLogger('tg-mtproto-proxy')
 
 _TIP_HOST = (
     "Адрес, на котором прокси принимает подключения.\n"
@@ -55,9 +58,6 @@ _TIP_CHECK_UPDATES = "При запуске проверять наличие о
 _TIP_CFPROXY = (
     "Использовать Cloudflare прокси для недоступных датацентров"
 )
-_TIP_CFPROXY_PRIORITY = (
-    "Пробовать CF-прокси раньше прямого TCP-подключения"
-)
 _TIP_CFPROXY_DOMAIN = (
     "Ваш собственный домен, проксируемый через Cloudflare, для WS-подключения.\n"
     "Если не указан — выбирается автоматически из поддерживаемых доменов"
@@ -65,14 +65,27 @@ _TIP_CFPROXY_DOMAIN = (
 _TIP_CFPROXY_USER_DOMAIN_CB = (
     "Указать свой домен вместо автоматического выбора"
 )
+_TIP_CFWORKER_DOMAIN = (
+    "Домен Cloudflare Worker (например, name.account.workers.dev).\n"
+    "Прокси передает через него подключение к Telegram DC по IP"
+)
 _TIP_SAVE = "Сохранить настройки"
 _TIP_CANCEL = "Закрыть окно без сохранения изменений"
 
 _CFPROXY_HELP_URL = "https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/CfProxy.md"
+_CFWORKER_HELP_URL = "https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/CfWorker.md"
 _CFPROXY_TEST_DCS = [1, 2, 3, 4, 5, 203]
+_CFWORKER_TEST_DST = {
+    1: '149.154.175.50',
+    2: '149.154.167.51',
+    3: '149.154.175.100',
+    4: '149.154.167.91',
+    5: '149.154.171.5',
+    203: '91.105.192.100',
+}
 
 
-def _run_cfproxy_connectivity_test(domain: str) -> dict:
+def _run_connectivity_test(cases: list) -> dict:
     import base64
     import ssl
     import socket as _socket
@@ -81,15 +94,14 @@ def _run_cfproxy_connectivity_test(domain: str) -> dict:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     results = {}
-    for dc in _CFPROXY_TEST_DCS:
-        host = f"kws{dc}.{domain}"
+    for dc, connect_host, sni_host, req_host, path in cases:
         try:
-            with _socket.create_connection((host, 443), timeout=5) as raw:
-                with ctx.wrap_socket(raw, server_hostname=host) as ssock:
+            with _socket.create_connection((connect_host, 443), timeout=5) as raw:
+                with ctx.wrap_socket(raw, server_hostname=sni_host) as ssock:
                     ws_key = base64.b64encode(os.urandom(16)).decode()
                     req = (
-                        f"GET /apiws HTTP/1.1\r\n"
-                        f"Host: {host}\r\n"
+                        f"GET {path} HTTP/1.1\r\n"
+                        f"Host: {req_host}\r\n"
                         f"Upgrade: websocket\r\n"
                         f"Connection: Upgrade\r\n"
                         f"Sec-WebSocket-Key: {ws_key}\r\n"
@@ -120,6 +132,23 @@ def _run_cfproxy_connectivity_test(domain: str) -> dict:
     return results
 
 
+def _run_cfproxy_connectivity_test(domain: str) -> dict:
+    cases = []
+    for dc in _CFPROXY_TEST_DCS:
+        host = f"kws{dc}.{domain}"
+        cases.append((dc, host, host, host, "/apiws"))
+    return _run_connectivity_test(cases)
+
+
+def _run_cfworker_connectivity_test(domain: str) -> dict:
+    cases = []
+    for dc in _CFPROXY_TEST_DCS:
+        dst = _CFWORKER_TEST_DST[dc]
+        path = f"/apiws?dst={dst}&dc={dc}&media=0"
+        cases.append((dc, domain, domain, domain, path))
+    return _run_connectivity_test(cases)
+
+
 def _run_cfproxy_auto_test(domains: list) -> tuple:
     merged: dict = {}
     best_domain = None
@@ -136,49 +165,39 @@ def _run_cfproxy_auto_test(domains: list) -> tuple:
     return best_domain, merged
 
 
-def _cfproxy_show_test_results(domain: str, results: dict) -> None:
+def _show_connectivity_results(title_base: str, results: dict,
+                               domain: str = '', label_prefix: str = 'DC',
+                               auto_mode: bool = False,
+                               unavailable_message: str = '') -> None:
     import tkinter as _tk
     from tkinter import messagebox as _mb
 
     ok = [dc for dc, v in results.items() if v is True]
-    fail = [(dc, v) for dc, v in results.items() if v is not True]
-    if len(ok) == len(_CFPROXY_TEST_DCS):
-        title = "CF-прокси: всё работает"
-        msg = f"\u2713 Все {len(_CFPROXY_TEST_DCS)} серверов доступны через {domain}."
-    elif not ok:
-        title = "CF-прокси: недоступен"
-        msg = f"\u2717 Ни один сервер не отвечает через {domain}.\n\nОшибки:\n"
-        msg += "\n".join(f"  kws{dc}: {v}" for dc, v in fail)
+    if auto_mode:
+        if domain:
+            title = f"{title_base}: доступен"
+            msg = f"\u2713 {title_base} работает. {len(ok)} из {len(_CFPROXY_TEST_DCS)} серверов доступны."
+        else:
+            title = f"{title_base}: недоступен"
+            msg = unavailable_message
     else:
-        title = "CF-прокси: частично работает"
-        msg = (
-            f"Домен: {domain}\n\n"
-            f"\u2713 Работают: {', '.join(f'kws{dc}' for dc in ok)}\n\n"
-            f"\u2717 Недоступны:\n"
-            + "\n".join(f"  kws{dc}: {v}" for dc, v in fail)
-        )
-    root = _tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    _mb.showinfo(title, msg, parent=root)
-    root.destroy()
+        fail = [(dc, v) for dc, v in results.items() if v is not True]
+        if len(ok) == len(_CFPROXY_TEST_DCS):
+            title = f"{title_base}: всё работает"
+            msg = f"\u2713 Все {len(_CFPROXY_TEST_DCS)} серверов доступны через {domain}."
+        elif not ok:
+            title = f"{title_base}: недоступен"
+            msg = f"\u2717 Ни один сервер не отвечает через {domain}.\n\nОшибки:\n"
+            msg += "\n".join(f"  {label_prefix}{dc}: {v}" for dc, v in fail)
+        else:
+            title = f"{title_base}: частично работает"
+            msg = (
+                f"Домен: {domain}\n\n"
+                f"\u2713 Работают: {', '.join(f'{label_prefix}{dc}' for dc in ok)}\n\n"
+                f"\u2717 Недоступны:\n"
+                + "\n".join(f"  {label_prefix}{dc}: {v}" for dc, v in fail)
+            )
 
-
-def _cfproxy_show_auto_test_results(ok_domain, results: dict) -> None:
-    import tkinter as _tk
-    from tkinter import messagebox as _mb
-
-    if ok_domain is not None:
-        title = "CF-прокси: доступен"
-        ok = [dc for dc, v in results.items() if v is True]
-        msg = f"\u2713 CF-прокси работает. {len(ok)} из {len(_CFPROXY_TEST_DCS)} серверов доступны."
-    else:
-        title = "CF-прокси: недоступен"
-        msg = "\u2717 Ни один из автоматических CF-доменов не отвечает.\n"
-        msg += "Возможно, блокировка или проблемы с сетью."
     root = _tk.Tk()
     root.withdraw()
     try:
@@ -296,8 +315,8 @@ class TrayConfigFormWidgets:
     autostart_var: Optional[Any]
     check_updates_var: Optional[Any]
     cfproxy_var: Optional[Any] = None
-    cfproxy_priority_var: Optional[Any] = None
     cfproxy_user_domain_var: Optional[Any] = None
+    cfproxy_worker_domain_var: Optional[Any] = None
     appearance_var: Optional[Any] = None
 
 
@@ -330,6 +349,7 @@ def install_tray_config_form(
     def _on_appearance_change(choice: str) -> None:
         cfg_val = _APPEARANCE_TO_CFG.get(choice, "auto")
         ctk.set_appearance_mode(_APPEARANCE_TO_CTK[cfg_val])
+        cfg["appearance"] = cfg_val
 
     ctk.CTkComboBox(
         header,
@@ -427,13 +447,6 @@ def install_tray_config_form(
     cf_cb.pack(side="left", padx=(0, 16))
     attach_ctk_tooltip(cf_cb, _TIP_CFPROXY)
 
-    cfproxy_priority_var = ctk.BooleanVar(
-        value=cfg.get("cfproxy_priority", default_config.get("cfproxy_priority", True))
-    )
-    cf_prio_cb = _checkbox(ctk, cf_row, theme, "Приоритет", cfproxy_priority_var)
-    cf_prio_cb.pack(side="left")
-    attach_ctk_tooltip(cf_prio_cb, _TIP_CFPROXY_PRIORITY)
-
     _cf_test_btn = [None]
 
     def _on_cf_test():
@@ -444,17 +457,42 @@ def install_tray_config_form(
         import threading as _threading
         if user_domain:
             def _worker():
-                res = _run_cfproxy_connectivity_test(user_domain)
-                if btn:
-                    btn.after(0, lambda: btn.configure(text="Тест", state="normal"))
-                    btn.after(0, lambda: _cfproxy_show_test_results(user_domain, res))
+                try:
+                    res = _run_cfproxy_connectivity_test(user_domain)
+                    if btn:
+                        btn.after(
+                            0,
+                            lambda: _show_connectivity_results(
+                                "CF-прокси", res, domain=user_domain, label_prefix='kws',
+                            ),
+                        )
+                except Exception as exc:
+                    log.error("CF proxy test failed: %s", exc)
+                finally:
+                    if btn:
+                        btn.after(0, lambda: btn.configure(text="Тест", state="normal"))
             _threading.Thread(target=_worker, daemon=True).start()
         else:
             def _worker_auto():
-                ok_domain, res = _run_cfproxy_auto_test(balancer.domains)
-                if btn:
-                    btn.after(0, lambda: btn.configure(text="Тест", state="normal"))
-                    btn.after(0, lambda: _cfproxy_show_auto_test_results(ok_domain, res))
+                try:
+                    ok_domain, res = _run_cfproxy_auto_test(balancer.domains)
+                    if btn:
+                        btn.after(
+                            0,
+                            lambda: _show_connectivity_results(
+                                "CF-прокси", res,
+                                domain=ok_domain or '',
+                                auto_mode=True,
+                                unavailable_message=(
+                                    "\u2717 Ни один из автоматических CF-доменов не отвечает."
+                                ),
+                            ),
+                        )
+                except Exception as exc:
+                    log.error("CF proxy auto-test failed: %s", exc)
+                finally:
+                    if btn:
+                        btn.after(0, lambda: btn.configure(text="Тест", state="normal"))
             _threading.Thread(target=_worker_auto, daemon=True).start()
 
     _cf_test_widget = ctk.CTkButton(
@@ -500,6 +538,80 @@ def install_tray_config_form(
 
     cf_custom_cb_var.trace_add("write", _sync_domain_entry)
     _sync_domain_entry()
+
+    cf_worker_inner = _config_section(ctk, frame, theme, "Cloudflare Worker")
+
+    cf_worker_row = ctk.CTkFrame(cf_worker_inner, fg_color="transparent")
+    cf_worker_row.pack(fill="x", pady=(0, 4))
+    cf_worker_lbl = _label(ctk, cf_worker_row, theme, "Cloudflare Worker домен", size=11)
+    cf_worker_lbl.pack(anchor="w", pady=(0, 2))
+
+    cf_worker_input = ctk.CTkFrame(cf_worker_inner, fg_color="transparent")
+    cf_worker_input.pack(fill="x")
+
+    cfproxy_worker_domain_var = ctk.StringVar(
+        value=cfg.get("cfproxy_worker_domain", default_config.get("cfproxy_worker_domain", ""))
+    )
+    cf_worker_entry = _entry(
+        ctk, cf_worker_input, theme, var=cfproxy_worker_domain_var,
+        height=32, radius=8,
+    )
+    cf_worker_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+    attach_tooltip_to_widgets([cf_worker_lbl, cf_worker_entry], _TIP_CFWORKER_DOMAIN)
+
+    _cfworker_test_btn = [None]
+
+    def _sync_cfworker_test_button(*_):
+        btn = _cfworker_test_btn[0]
+        if btn is None:
+            return
+        enabled = bool(cfproxy_worker_domain_var.get().strip())
+        btn.configure(state="normal" if enabled else "disabled")
+
+    def _on_cfworker_test():
+        domain = cfproxy_worker_domain_var.get().strip()
+        btn = _cfworker_test_btn[0]
+        if not domain or btn is None:
+            return
+        btn.configure(text="...", state="disabled")
+        import threading as _threading
+
+        def _worker():
+            try:
+                res = _run_cfworker_connectivity_test(domain)
+                btn.after(
+                    0,
+                    lambda: _show_connectivity_results(
+                        "CF Worker", res, domain=domain, label_prefix='DC',
+                    ),
+                )
+            except Exception as exc:
+                log.error("CF worker test failed: %s", exc)
+            finally:
+                btn.after(0, lambda: btn.configure(text="Тест"))
+                btn.after(0, _sync_cfworker_test_button)
+
+        _threading.Thread(target=_worker, daemon=True).start()
+
+    ctk.CTkButton(
+        cf_worker_input, text="?", width=28, height=32,
+        font=(theme.ui_font_family, 14), corner_radius=8,
+        fg_color=theme.tg_blue, hover_color=theme.tg_blue_hover,
+        text_color="#ffffff", border_width=1, border_color=theme.field_border,
+        command=lambda: webbrowser.open(_CFWORKER_HELP_URL),
+    ).pack(side="right")
+
+    _cfworker_test_widget = ctk.CTkButton(
+        cf_worker_input, text="Тест", width=56, height=32,
+        font=(theme.ui_font_family, 13), corner_radius=8,
+        fg_color=theme.tg_blue, hover_color=theme.tg_blue_hover,
+        text_color="#ffffff", border_width=1, border_color=theme.field_border,
+        command=_on_cfworker_test,
+    )
+    _cfworker_test_widget.pack(side="right", padx=(0, 6))
+    _cfworker_test_btn[0] = _cfworker_test_widget
+    cfproxy_worker_domain_var.trace_add("write", _sync_cfworker_test_button)
+    _sync_cfworker_test_button()
 
     log_inner = _config_section(ctk, frame, theme, "Логи и производительность")
 
@@ -590,8 +702,8 @@ def install_tray_config_form(
         adv_entries=adv_entries, adv_keys=adv_keys,
         autostart_var=autostart_var, check_updates_var=check_updates_var,
         cfproxy_var=cfproxy_var,
-        cfproxy_priority_var=cfproxy_priority_var,
         cfproxy_user_domain_var=cfproxy_user_domain_var,
+        cfproxy_worker_domain_var=cfproxy_worker_domain_var,
         appearance_var=appearance_var,
     )
 
@@ -671,10 +783,10 @@ def validate_config_form(
         new_cfg["check_updates"] = bool(widgets.check_updates_var.get())
     if widgets.cfproxy_var is not None:
         new_cfg["cfproxy"] = bool(widgets.cfproxy_var.get())
-    if widgets.cfproxy_priority_var is not None:
-        new_cfg["cfproxy_priority"] = bool(widgets.cfproxy_priority_var.get())
     if widgets.cfproxy_user_domain_var is not None:
         new_cfg["cfproxy_user_domain"] = widgets.cfproxy_user_domain_var.get().strip()
+    if widgets.cfproxy_worker_domain_var is not None:
+        new_cfg["cfproxy_worker_domain"] = widgets.cfproxy_worker_domain_var.get().strip()
     if widgets.appearance_var is not None:
         new_cfg["appearance"] = _APPEARANCE_TO_CFG.get(widgets.appearance_var.get(), "auto")
     return new_cfg

@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QHBoxLayout,
     QScrollArea,
@@ -20,7 +21,12 @@ from ui.fluent_widgets import BodyLabel, PrimaryButton, PushButton, panel_card
 RU_TEXT = {
     "Test Settings": "Настройки теста",
     "Choose targets for preset tests": "Выберите цели для проверки пресетов",
+    "Choose services for preset tests": "Выберите сервисы для проверки пресетов",
     "All": "Все",
+    "Core": "База",
+    "Video": "Видео",
+    "Social": "Соцсети",
+    "Games": "Игры",
     "None": "Ничего",
     "Select group": "Выбрать группу",
     "Save": "Сохранить",
@@ -40,28 +46,42 @@ class TestSettingsDialog(QDialog):
         super().__init__(parent)
         self.language = language
         self.setWindowTitle(self.tr_text("Test Settings"))
-        self.resize(520, 620)
+        self.resize(640, 620)
         self.targets = targets
+        self.service_targets: dict[str, list[Target]] = defaultdict(list)
+        self.service_categories: dict[str, str] = {}
         self.checkboxes: dict[str, FluentCheckBox] = {}
 
         active_names = selected_names or {target.name for target in targets}
+        for target in targets:
+            self.service_targets[target.service].append(target)
+            self.service_categories[target.service] = target.category
+        active_services = {
+            target.service
+            for target in targets
+            if target.name in active_names
+        }
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        title = BodyLabel(self.tr_text("Choose targets for preset tests"))
+        title = BodyLabel(self.tr_text("Choose services for preset tests"))
         title.setStyleSheet("font-size: 14pt; font-weight: 650;")
         layout.addWidget(title)
 
         quick_row = QHBoxLayout()
         self.all_btn = PushButton(self.tr_text("All"))
-        self.discord_btn = PushButton("Discord")
-        self.youtube_btn = PushButton("YouTube")
+        self.core_btn = PushButton(self.tr_text("Core"))
+        self.video_btn = PushButton(self.tr_text("Video"))
+        self.social_btn = PushButton(self.tr_text("Social"))
+        self.games_btn = PushButton(self.tr_text("Games"))
         self.none_btn = PushButton(self.tr_text("None"))
         quick_row.addWidget(self.all_btn)
-        quick_row.addWidget(self.discord_btn)
-        quick_row.addWidget(self.youtube_btn)
+        quick_row.addWidget(self.core_btn)
+        quick_row.addWidget(self.video_btn)
+        quick_row.addWidget(self.social_btn)
+        quick_row.addWidget(self.games_btn)
         quick_row.addWidget(self.none_btn)
         quick_row.addStretch(1)
         layout.addLayout(quick_row)
@@ -72,32 +92,27 @@ class TestSettingsDialog(QDialog):
         content_layout = QVBoxLayout(content)
         content_layout.setSpacing(10)
 
-        grouped: dict[str, list[Target]] = defaultdict(list)
-        for target in targets:
-            grouped[target.category].append(target)
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for service, category in self.service_categories.items():
+            grouped[category].append(service)
 
         for category in sorted(grouped, key=str.casefold):
-            group = panel_card(category)
+            group = panel_card(self.tr_text(category))
             group_layout = group.layout()
             group_check = FluentCheckBox(self.tr_text("Select group"))
             group_check.setTristate(False)
             group_layout.addWidget(group_check)
 
             child_boxes: list[FluentCheckBox] = []
-            for target in grouped[category]:
-                label = target.name
-                if target.url:
-                    label += f"  ({target.url})"
-                elif target.ping_target:
-                    label += f"  (PING {target.ping_target})"
-                checkbox = FluentCheckBox(label)
-                checkbox.setChecked(target.name in active_names)
-                checkbox.setProperty("target_name", target.name)
+            for service in sorted(grouped[category], key=str.casefold):
+                checkbox = FluentCheckBox(service)
+                checkbox.setChecked(service in active_services)
+                checkbox.setProperty("service_name", service)
                 group_layout.addWidget(checkbox)
-                self.checkboxes[target.name] = checkbox
+                self.checkboxes[service] = checkbox
                 child_boxes.append(checkbox)
 
-            def update_group_state(boxes=child_boxes, group_box=group_check):
+            def update_group_state(_state=None, boxes=child_boxes, group_box=group_check):
                 checked_count = sum(1 for box in boxes if box.isChecked())
                 group_box.blockSignals(True)
                 group_box.setCheckState(
@@ -108,7 +123,7 @@ class TestSettingsDialog(QDialog):
                 group_box.blockSignals(False)
 
             def set_group_state(state, boxes=child_boxes):
-                checked = state == Qt.Checked.value
+                checked = int(state) == Qt.Checked.value
                 for box in boxes:
                     box.setChecked(checked)
 
@@ -137,11 +152,28 @@ class TestSettingsDialog(QDialog):
 
         self.all_btn.clicked.connect(lambda: self.set_checked_by_category(None, True))
         self.none_btn.clicked.connect(lambda: self.set_checked_by_category(None, False))
-        self.discord_btn.clicked.connect(lambda: self.only_category("Discord"))
-        self.youtube_btn.clicked.connect(lambda: self.only_category("YouTube"))
+        self.core_btn.clicked.connect(lambda: self.only_category("Core"))
+        self.video_btn.clicked.connect(lambda: self.only_category("Video"))
+        self.social_btn.clicked.connect(lambda: self.only_category("Social"))
+        self.games_btn.clicked.connect(lambda: self.only_category("Games"))
+        self.configure_smooth_scrolling()
+
+    def configure_smooth_scrolling(self) -> None:
+        for view in self.findChildren(QAbstractItemView):
+            view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            view.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+            view.verticalScrollBar().setSingleStep(18)
+            view.horizontalScrollBar().setSingleStep(18)
+        for area in self.findChildren(QScrollArea):
+            area.verticalScrollBar().setSingleStep(18)
+            area.horizontalScrollBar().setSingleStep(18)
 
     def selected_target_names(self) -> set[str]:
-        return {name for name, checkbox in self.checkboxes.items() if checkbox.isChecked()}
+        selected: set[str] = set()
+        for service, checkbox in self.checkboxes.items():
+            if checkbox.isChecked():
+                selected.update(target.name for target in self.service_targets[service])
+        return selected
 
     def tr_text(self, text: str) -> str:
         if self.language == "ru":
@@ -155,10 +187,12 @@ class TestSettingsDialog(QDialog):
         super().accept()
 
     def set_checked_by_category(self, category: str | None, checked: bool) -> None:
-        for target in self.targets:
-            if category is None or target.category.casefold() == category.casefold():
-                self.checkboxes[target.name].setChecked(checked)
+        for service, checkbox in self.checkboxes.items():
+            service_category = self.service_categories.get(service, "")
+            if category is None or service_category.casefold() == category.casefold():
+                checkbox.setChecked(checked)
 
     def only_category(self, category: str) -> None:
-        for target in self.targets:
-            self.checkboxes[target.name].setChecked(target.category.casefold() == category.casefold())
+        for service, checkbox in self.checkboxes.items():
+            service_category = self.service_categories.get(service, "")
+            checkbox.setChecked(service_category.casefold() == category.casefold())

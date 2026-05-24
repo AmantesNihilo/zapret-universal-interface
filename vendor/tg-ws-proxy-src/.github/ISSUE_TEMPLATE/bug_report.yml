@@ -1,20 +1,23 @@
 name: 🐛 Проблема
 title: '[Проблема] '
 description: Сообщить о проблеме
-labels: ['type: проблема', 'status: нуждается в сортировке']
+labels: ['bug']
 
 body:
-  - type: textarea
-    id: description
+  - type: input
+    id: app_version
     attributes:
-      label: Опишите вашу проблему
-      description: Чётко опишите проблему с которой вы столкнулись
-      placeholder: Описание проблемы
+      label: Версия TG WS Proxy
+      description: Укажите версию приложения (например, v1.2.3)
+      placeholder: vX.Y.Z
     validations:
       required: true
 
   - type: textarea
-    id: additions
+    id: description
     attributes:
-      label: Дополнительные детали
-      description: Если у вас проблемы с работой прокси, то приложите файл логов в момент возникновения проблемы.
+      label: Опишите вашу проблему
+      description: Чётко опишите проблему, с которой вы столкнулись
+      placeholder: Описание проблемы
+    validations:
+      required: true

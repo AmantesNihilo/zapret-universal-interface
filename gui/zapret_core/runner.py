@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 from .paths import AppPaths
@@ -20,7 +19,6 @@ def stop_winws2() -> None:
         check=False,
         creationflags=CREATE_NO_WINDOW,
     )
-    time.sleep(0.5)
 
 
 def is_winws2_running() -> bool:
