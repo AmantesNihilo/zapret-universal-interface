@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - feature/**
+    tags:
+      - v[0-9]+.*
+  pull_request:
+
+jobs:
+  release-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check release version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$1"
+          }
+
+          compare_versions() {
+            python3 -c 'import sys; current = tuple(map(int, sys.argv[1].split("."))); base = tuple(map(int, sys.argv[2].split("."))); sys.exit(0 if current > base else 1)' "$1" "$2"
+          }
+
+          current_version="$(read_version Cargo.toml)"
+          if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=Cargo.toml::package.version must be numeric X.Y.Z, got '$current_version'"
+            exit 1
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}"
+            git show "origin/${GITHUB_BASE_REF}:Cargo.toml" > /tmp/base-Cargo.toml
+            base_version="$(read_version /tmp/base-Cargo.toml)"
+
+            if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::base package.version must be numeric X.Y.Z, got '$base_version'"
+              exit 1
+            fi
+
+            if ! compare_versions "$current_version" "$base_version"; then
+              echo "::error file=Cargo.toml::package.version must be greater than base branch version ($base_version), got '$current_version'"
+              exit 1
+            fi
+
+            echo "Release version OK: $base_version -> $current_version"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "$current_version" != "$tag_version" ]]; then
+              echo "::error file=Cargo.toml::tag ${GITHUB_REF_NAME} does not match package.version $current_version"
+              exit 1
+            fi
+
+            echo "Release tag OK: ${GITHUB_REF_NAME} matches Cargo.toml"
+          else
+            echo "Release version check skipped for ${GITHUB_EVENT_NAME} on ${GITHUB_REF_NAME}"
+          fi
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked

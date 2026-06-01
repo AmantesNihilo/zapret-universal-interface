@@ -1,26 +1,34 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
+# Dependencies
+node_modules/
 
-# PyInstaller
-build/
-dist/
+# Frontend build output
+/build/
+/.svelte-kit/
+/package/
+/dist/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Rust / Tauri build output
+/target/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+
+# Local runtime data
+/data/
+/release/
+logs/
 *.log
-
-# Z2 GUI runtime files
-utils/tg-ws-proxy.log
-utils/tg-ws-proxy-build-smoke.log
-utils/test-results/
-utils/ui-screens/
-utils/gui-settings.json
-utils/gui-results.json
-utils/current_preset.txt
-utils/preset-active.txt
-
-# Local/editor noise
-.idea/
-.vscode/
-backups/
 *.tmp
 *.bak
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

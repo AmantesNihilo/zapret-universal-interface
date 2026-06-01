@@ -1,0 +1,95 @@
+name: Release
+
+permissions:
+    contents: write
+
+on:
+    push:
+        tags:
+            - v[0-9]+.*
+
+jobs:
+    create-release:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: taiki-e/create-gh-release-action@v1
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+    upload-assets:
+        needs: create-release
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: aarch64-unknown-linux-musl
+                      os: ubuntu-latest
+                    - target: aarch64-apple-darwin
+                      os: macos-latest
+                    - target: x86_64-unknown-linux-musl
+                      os: ubuntu-latest
+                    - target: mipsel-unknown-linux-musl
+                      os: ubuntu-latest
+                    - target: armv7-unknown-linux-musleabihf
+                      os: ubuntu-latest
+                    - target: x86_64-apple-darwin
+                      os: macos-latest
+                    - target: x86_64-pc-windows-gnu
+                      os: windows-latest
+                    - target: universal-apple-darwin
+                      os: macos-latest
+                    - target: mips-unknown-linux-musl
+                      os: ubuntu-latest
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v6
+
+            # Default path (all targets except mipsel)
+            - name: Build & upload (default)
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              uses: taiki-e/upload-rust-binary-action@v1
+              with:
+                  bin: tg-ws-proxy
+                  target: ${{ matrix.target }}
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+            # Special path for mipsel: nightly + build-std, then upload via gh cli
+            - name: Install nightly + rust-src (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src
+
+            - name: Install cross (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              run: cargo install cross --locked
+
+            - name: Build (mipsel, build-std)
+              if: matrix.target == 'mipsel-unknown-linux-musl'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+
+            - name: Build (mips, build-std)
+              if: matrix.target == 'mips-unknown-linux-musl'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
+
+            - name: Inspect build output (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              run: |
+                  FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
+                  ls -lah "target/${{ matrix.target }}/release/" || true
+                  test -f "$FILE"
+
+            - name: Upload to GitHub Release (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  TAG="${GITHUB_REF_NAME}"
+                  NAME="tg-ws-proxy-${{ matrix.target }}"
+                  TMPDIR="$(mktemp -d)"
+                  cp "target/${{ matrix.target }}/release/tg-ws-proxy" "${TMPDIR}/tg-ws-proxy"
+                  tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
+                  gh release upload "$TAG" "${NAME}.tar.gz" --clobber

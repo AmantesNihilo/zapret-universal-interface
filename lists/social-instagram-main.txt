@@ -1,4 +1,0 @@
-# Instagram main page only.
-# Used by focused experiments so broad Meta rules do not touch working services.
-www.instagram.com
-instagram.com
