@@ -77,7 +77,10 @@ pub fn download_installer() -> Result<PathBuf, String> {
 
 pub fn launch_installer(path: &Path) -> Result<(), String> {
     if !path.exists() {
-        return Err(format!("Update installer was not found: {}", path.display()));
+        return Err(format!(
+            "Update installer was not found: {}",
+            path.display()
+        ));
     }
 
     let extension = path
@@ -133,8 +136,7 @@ fn build_update_check(release: GithubRelease) -> UpdateCheck {
     let portable_asset = pick_portable_asset(&release.assets);
     let distribution = paths::distribution_mode().to_string();
     let update_available = is_newer_version(&latest_version, &current_version);
-    let can_install =
-        distribution == "installed" && update_available && installer_asset.is_some();
+    let can_install = distribution == "installed" && update_available && installer_asset.is_some();
 
     UpdateCheck {
         update_available,

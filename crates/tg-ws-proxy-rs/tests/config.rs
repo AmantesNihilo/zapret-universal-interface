@@ -57,3 +57,21 @@ fn cf_worker_domain_accepts_python_alias_and_normalizes_url() {
         Some("example.user.workers.dev")
     );
 }
+
+#[test]
+fn cf_worker_domains_accept_multiple_values_and_deduplicate() {
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--cf-worker-domain",
+        "https://one.user.workers.dev/apiws,two.user.workers.dev;ONE.user.workers.dev",
+    ])
+    .unwrap();
+
+    assert_eq!(
+        cfg.cf_worker_domains(),
+        vec![
+            "one.user.workers.dev".to_string(),
+            "two.user.workers.dev".to_string(),
+        ]
+    );
+}

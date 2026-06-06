@@ -729,10 +729,17 @@ fn build_result(
     targets: Vec<TestTargetResult>,
 ) -> TestResult {
     let mut services = Vec::new();
-    let mut service_names: Vec<String> = ["Zapret", "Discord", "YouTube", "Google", "Cloudflare", "DNS"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let mut service_names: Vec<String> = [
+        "Zapret",
+        "Discord",
+        "YouTube",
+        "Google",
+        "Cloudflare",
+        "DNS",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     for target in &targets {
         if !service_names.iter().any(|name| name == &target.service) {
             service_names.push(target.service.clone());

@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Semaphore};
 
 pub const ENGINE_NAME: &str = "tg-ws-proxy-rs";
-pub const ENGINE_VERSION: &str = "1.5.0";
+pub const ENGINE_VERSION: &str = "1.7.2";
 
 pub struct TgWsRuntimeHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -107,8 +107,8 @@ fn config_from_profile(profile: &Profile) -> Result<Config, String> {
     let cf_worker_domain = profile
         .tg_ws_cf_worker_domain
         .as_ref()
-        .map(|domain| domain.trim().to_string())
-        .filter(|domain| !domain.is_empty());
+        .map(|domains| split_domain_list(domains))
+        .unwrap_or_default();
 
     let dc_ip = if cf_domains.is_empty() && !profile.tg_ws_default_domains {
         vec![
@@ -152,6 +152,26 @@ fn config_from_profile(profile: &Profile) -> Result<Config, String> {
         check: false,
         default_domains: profile.tg_ws_default_domains,
     })
+}
+
+fn split_domain_list(value: &str) -> Vec<String> {
+    let mut domains = Vec::new();
+    for domain in value
+        .replace(',', " ")
+        .replace(';', " ")
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty())
+    {
+        let domain = domain.to_string();
+        if !domains
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&domain))
+        {
+            domains.push(domain);
+        }
+    }
+    domains
 }
 
 async fn run_proxy(
@@ -357,9 +377,29 @@ mod tests {
             config.cf_domains,
             vec!["one.example".to_string(), "two.example".to_string()]
         );
-        assert_eq!(config.cf_worker_domain, Some("worker.example".to_string()));
+        assert_eq!(config.cf_worker_domain, vec!["worker.example".to_string()]);
         assert!(config.cf_priority);
         assert!(config.cf_balance);
+    }
+
+    #[test]
+    fn carries_multiple_worker_domains_from_profile_string() {
+        let profile = Profile {
+            tg_ws_cf_worker_domain: Some(
+                "one.user.workers.dev, two.user.workers.dev; one.user.workers.dev".to_string(),
+            ),
+            ..Profile::default()
+        };
+
+        let config = config_from_profile(&profile).expect("config");
+
+        assert_eq!(
+            config.cf_worker_domain,
+            vec![
+                "one.user.workers.dev".to_string(),
+                "two.user.workers.dev".to_string(),
+            ]
+        );
     }
 
     #[test]

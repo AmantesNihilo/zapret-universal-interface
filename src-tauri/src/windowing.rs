@@ -13,8 +13,12 @@ pub fn apply_layout(app: &AppHandle, layout: &LayoutOrientation) -> Result<(), S
         LayoutOrientation::Landscape => LANDSCAPE,
     };
     let size = Size::Logical(LogicalSize { width, height });
-    window.set_min_size(Some(size)).map_err(|error| error.to_string())?;
-    window.set_max_size(Some(size)).map_err(|error| error.to_string())?;
+    window
+        .set_min_size(Some(size))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_max_size(Some(size))
+        .map_err(|error| error.to_string())?;
     window.set_size(size).map_err(|error| error.to_string())?;
     window.center().map_err(|error| error.to_string())?;
     Ok(())

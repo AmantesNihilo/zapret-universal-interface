@@ -204,10 +204,10 @@ pub async fn run_check(config: &Config) -> bool {
     println!("  tg-ws-proxy connectivity check");
     println!("{}", sep);
 
-    let cf_worker_domain = config.cf_worker_domain();
+    let cf_worker_domains = config.cf_worker_domains();
 
     if config.cf_domains.is_empty()
-        && cf_worker_domain.is_none()
+        && cf_worker_domains.is_empty()
         && config.mtproto_proxies.is_empty()
     {
         println!();
@@ -239,17 +239,20 @@ pub async fn run_check(config: &Config) -> bool {
     }
 
     // ── Cloudflare Worker probe ──────────────────────────────────────────
-    if let Some(domain) = cf_worker_domain {
+    if !cf_worker_domains.is_empty() {
         println!();
-        println!("Cloudflare Worker (DC2 TCP tunnel probe):");
-        print!("  {:40}  ... ", domain);
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        println!("Cloudflare Worker domains (DC2 TCP tunnel probe):");
 
-        let status = probe_cf_worker(&domain, skip_tls, cf_timeout).await;
-        println!("[{}]  {}", status.marker(), status.detail());
+        for domain in cf_worker_domains {
+            print!("  {:40}  ... ", domain);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
 
-        if !status.is_ok() {
-            all_ok = false;
+            let status = probe_cf_worker(&domain, skip_tls, cf_timeout).await;
+            println!("[{}]  {}", status.marker(), status.detail());
+
+            if !status.is_ok() {
+                all_ok = false;
+            }
         }
     }
 

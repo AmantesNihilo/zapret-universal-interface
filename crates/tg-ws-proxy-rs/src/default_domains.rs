@@ -36,6 +36,16 @@ static FALLBACK_ENCODED: &[&str] = &[
     "mkuosckvso.com",
     "zaewayzmplad.com",
     "twdmbzcm.com",
+    "awzwsldi.com",
+    "clngqrflngqin.com",
+    "tjacxbqtj.com",
+    "bxaxtxmrw.com",
+    "dmohrsgmohcrwb.com",
+    "vwbmtmoi.com",
+    "khgrre.com",
+    "ulihssf.com",
+    "tmhqsdqmfpmk.com",
+    "xwuwoqbm.com",
 ];
 
 // ─── Deobfuscation ───────────────────────────────────────────────────────────
@@ -207,5 +217,11 @@ mod tests {
     #[test]
     fn deobfuscate_known_pair() {
         assert_eq!(deobfuscate("virkgj.com"), Some("pclead.co.uk".to_string()));
+    }
+
+    #[test]
+    fn fallback_domains_match_upstream_1_7_2_size() {
+        assert_eq!(FALLBACK_ENCODED.len(), 15);
+        assert_eq!(fallback_domains().len(), 15);
     }
 }

@@ -71,9 +71,19 @@ pub fn start_active_profile(
     Ok(state.lock().unwrap().app_state.clone())
 }
 
-pub fn restore_owned_processes(state: &Mutex<RuntimeState>) {
+pub fn restore_owned_processes(app: &AppHandle, state: &Mutex<RuntimeState>) {
+    let marker_exists = owned_winws_marker_path().exists();
     let owned = load_owned_winws_marker();
     if owned.is_empty() {
+        if marker_exists {
+            clear_owned_winws_marker();
+            logging::push(
+                app,
+                state,
+                LogSource::App,
+                "Crash recovery: stale zapret process marker was cleaned",
+            );
+        }
         return;
     }
     {
@@ -81,6 +91,21 @@ pub fn restore_owned_processes(state: &Mutex<RuntimeState>) {
         runtime.zapret_winws_pids = owned;
     }
     refresh_status(state);
+    let recovered = state.lock().unwrap().zapret_winws_pids.clone();
+    write_owned_winws_marker(&recovered);
+    logging::push(
+        app,
+        state,
+        LogSource::App,
+        format!(
+            "Crash recovery: attached to owned winws.exe PID {}",
+            recovered
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
 }
 
 pub fn stop_active_profile(
@@ -222,7 +247,19 @@ pub fn stop_zapret(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servi
     }
     let owned_winws = state.lock().unwrap().zapret_winws_pids.clone();
     if !owned_winws.is_empty() {
-        logging::push(app, state, LogSource::Zapret, "Stopping owned winws.exe");
+        logging::push(
+            app,
+            state,
+            LogSource::Zapret,
+            format!(
+                "Stopping owned winws.exe PID {}",
+                owned_winws
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
         for pid in &owned_winws {
             let _ = system_process::kill_pid(*pid);
         }
@@ -264,7 +301,9 @@ fn wait_child_exit(child: &mut Child, timeout: Duration) {
 }
 
 fn owned_winws_marker_path() -> PathBuf {
-    paths::data_dir().join("runtime").join("zapret-owned-pids.txt")
+    paths::data_dir()
+        .join("runtime")
+        .join("zapret-owned-pids.txt")
 }
 
 fn write_owned_winws_marker(pids: &[u32]) {

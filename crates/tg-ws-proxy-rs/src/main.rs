@@ -216,8 +216,12 @@ async fn main() {
         }
     }
 
-    if let Some(worker_domain) = config.cf_worker_domain() {
-        info!("  Cloudflare Worker: {}", worker_domain);
+    let cf_worker_domains = config.cf_worker_domains();
+    if !cf_worker_domains.is_empty() {
+        info!("  Cloudflare Worker domain(s):");
+        for domain in &cf_worker_domains {
+            info!("    {}", domain);
+        }
     }
 
     if !config.mtproto_proxies.is_empty() {

@@ -12,7 +12,7 @@
   <a href="https://github.com/AmantesNihilo/zapret-universal-interface/releases">
     <img alt="Download" src="https://img.shields.io/badge/download-GitHub%20Releases-ff4fb8?style=for-the-badge">
   </a>
-  <img alt="Version" src="https://img.shields.io/badge/version-2.0.0-24c8db?style=for-the-badge">
+  <img alt="Version" src="https://img.shields.io/badge/version-2.0.1-24c8db?style=for-the-badge">
   <img alt="Windows" src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=for-the-badge">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-f0b83a?style=for-the-badge">
 </p>
@@ -61,13 +61,13 @@ ZUI - современная Windows-утилита для запуска `zapre
 
 | Файл                    | Что выбрать                                                                   |
 | --------------------------- | --------------------------------------------------------------------------------------- |
-| `ZUI_2.0.0_x64-setup.exe` | Рекомендуемый вариант для обычной установки      |
-| `ZUI_2.0.0_x64_en-US.msi` | MSI-пакет для ручной или корпоративной установки |
-| `ZUI_2.0.0_portable.zip`  | Portable-версия без установки                                         |
+| `ZUI_2.0.1_x64-setup.exe` | Рекомендуемый вариант для обычной установки      |
+| `ZUI_2.0.1_x64_en-US.msi` | MSI-пакет для ручной или корпоративной установки |
+| `ZUI_2.0.1_portable.zip`  | Portable-версия без установки                                         |
 | `SHA256SUMS.txt`          | Хэши для проверки целостности файлов                    |
 
 > [!TIP]
-> Если не знаете, что выбрать, скачивайте `ZUI_2.0.0_x64-setup.exe`.
+> Если не знаете, что выбрать, скачивайте `ZUI_2.0.1_x64-setup.exe`.
 
 ## Для кого это
 
@@ -117,7 +117,7 @@ ZUI подойдет, если вы:
 
 ## Быстрый старт
 
-1. Скачайте и установите `ZUI_2.0.0_x64-setup.exe`.
+1. Скачайте и установите `ZUI_2.0.1_x64-setup.exe`.
 2. Запустите ZUI от имени администратора.
 3. Откройте `Настройки -> Проверки` и убедитесь, что ресурсы найдены.
 4. Запустите проверку пресетов и дождитесь результатов
@@ -200,7 +200,7 @@ ZUI тестирует только подходящие исполняемые 
 
 ### Обычная версия
 
-1. Скачайте `ZUI_2.0.0_x64-setup.exe`.
+1. Скачайте `ZUI_2.0.1_x64-setup.exe`.
 2. Запустите установщик.
 3. Откройте ZUI.
 4. Проверьте вкладку `Настройки -> Проверки`.
@@ -209,7 +209,7 @@ ZUI тестирует только подходящие исполняемые 
 
 ### Portable-версия
 
-1. Скачайте `ZUI_2.0.0_portable.zip`.
+1. Скачайте `ZUI_2.0.1_portable.zip`.
 2. Распакуйте архив в отдельную папку.
 3. Запустите `ZUI.exe`.
 4. Оставьте `portable.flag` рядом с `ZUI.exe`, чтобы приложение работало в portable-режиме.

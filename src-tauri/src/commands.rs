@@ -4,7 +4,7 @@ use crate::models::{
 };
 use crate::state::RuntimeState;
 use crate::{
-    conflicts, diagnostics, logging, presets, profiles, services, settings, tester, updater,
+    conflicts, diagnostics, logging, presets, profiles, report, services, settings, tester, updater,
     windowing,
 };
 use std::sync::Mutex;
@@ -306,29 +306,90 @@ pub async fn get_diagnostics(app: AppHandle) -> Diagnostics {
 }
 
 #[tauri::command]
-pub async fn check_for_update() -> Result<UpdateCheck, String> {
-    tauri::async_runtime::spawn_blocking(updater::check)
+pub fn collect_support_report(app: AppHandle) -> Result<String, String> {
+    let state = app.state::<Mutex<RuntimeState>>();
+    let report = report::collect(&state)?;
+    logging::push(&app, &state, crate::models::LogSource::App, "Support report collected");
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> Result<UpdateCheck, String> {
+    {
+        let state = app.state::<Mutex<RuntimeState>>();
+        logging::push(&app, &state, crate::models::LogSource::App, "Checking for updates");
+    }
+    let result = tauri::async_runtime::spawn_blocking(updater::check)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let state = app.state::<Mutex<RuntimeState>>();
+    match &result {
+        Ok(update) => logging::push(
+            &app,
+            &state,
+            crate::models::LogSource::App,
+            format!(
+                "Update check finished: current={}, latest={}, available={}",
+                update.current_version,
+                update.latest_version.clone().unwrap_or_default(),
+                update.update_available
+            ),
+        ),
+        Err(error) => logging::push(
+            &app,
+            &state,
+            crate::models::LogSource::App,
+            format!("Update check failed: {error}"),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    {
+        let state = app.state::<Mutex<RuntimeState>>();
+        logging::push(
+            &app,
+            &state,
+            crate::models::LogSource::App,
+            "Downloading update installer",
+        );
+    }
     let installer_path = tauri::async_runtime::spawn_blocking(updater::download_installer)
         .await
         .map_err(|error| error.to_string())??;
+    {
+        let state = app.state::<Mutex<RuntimeState>>();
+        logging::push(
+            &app,
+            &state,
+            crate::models::LogSource::App,
+            format!("Update installer downloaded: {}", installer_path.display()),
+        );
+    }
+
+    let stop_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = stop_app.state::<Mutex<RuntimeState>>();
+        state.lock().unwrap().shutting_down = true;
+        services::stop_active_profile(&stop_app, &state)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
     updater::launch_installer(&installer_path)?;
+    let state = app.state::<Mutex<RuntimeState>>();
+    logging::push(
+        &app,
+        &state,
+        crate::models::LogSource::App,
+        "Update installer launched",
+    );
 
     let exit_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-        let thread_app = exit_app.clone();
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            let state = thread_app.state::<Mutex<RuntimeState>>();
-            state.lock().unwrap().shutting_down = true;
-            let _ = services::stop_active_profile(&thread_app, &state);
-        })
-        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         exit_app.exit(0);
     });
 

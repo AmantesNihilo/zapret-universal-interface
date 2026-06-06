@@ -26,6 +26,7 @@ use std::time::Duration;
 use cipher::StreamCipher;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use rand::seq::SliceRandom;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -122,6 +123,14 @@ fn balanced_cf_domains(cf_domains: &[String]) -> Vec<String> {
         result.push(cf_domains[(idx + i) % n].clone());
     }
     result
+}
+
+fn shuffled_cf_worker_domains(cf_worker_domains: &[String]) -> Vec<String> {
+    let mut domains = cf_worker_domains.to_vec();
+    if domains.len() > 1 {
+        domains.shuffle(&mut rand::rng());
+    }
+    domains
 }
 
 /// Per-DC cooldown for the CF proxy path.
@@ -441,7 +450,7 @@ pub async fn handle_client(
 
     // ── Step 5: route the connection ──────────────────────────────────────
     let target_ip = dc_redirects.get(&dc_id).cloned();
-    let cf_worker_domain = config.cf_worker_domain();
+    let cf_worker_domains = config.cf_worker_domains();
     let media_tag = if is_media { "m" } else { "" };
 
     if target_ip.is_none() {
@@ -458,42 +467,44 @@ pub async fn handle_client(
         };
 
         // ── Try Cloudflare Worker if configured ──────────────────────────
-        if let Some(worker_domain) = cf_worker_domain.as_deref() {
+        if !cf_worker_domains.is_empty() {
             if !cf_worker_in_cooldown(dc_id, is_media) {
-                debug!(
-                    "[{}] DC{}{} {} → trying CF Worker {} for {}",
-                    label, dc_id, media_tag, reason, worker_domain, fallback
-                );
+                for worker_domain in shuffled_cf_worker_domains(&cf_worker_domains) {
+                    debug!(
+                        "[{}] DC{}{} {} → trying CF Worker {} for {}",
+                        label, dc_id, media_tag, reason, worker_domain, fallback
+                    );
 
-                if let Some(ws) = connect_cf_worker_ws_for_dc(
-                    worker_domain,
-                    &fallback,
-                    dc_id,
-                    is_media,
-                    skip_tls,
-                    cf_connect_timeout,
-                )
-                .await
-                {
-                    clear_cf_worker_cooldown(dc_id, is_media);
-                    info!(
-                        "[{}] DC{}{} {} → CF Worker connected",
-                        label, dc_id, media_tag, reason
-                    );
-                    bridge_ws(
-                        &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
-                    )
-                    .await;
-                    return;
-                } else {
-                    set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
-                    warn!(
-                        "[{}] DC{}{} CF Worker failed, cooldown {}s",
-                        label,
+                    if let Some(ws) = connect_cf_worker_ws_for_dc(
+                        &worker_domain,
+                        &fallback,
                         dc_id,
-                        media_tag,
-                        cf_fail_cooldown.as_secs()
-                    );
+                        is_media,
+                        skip_tls,
+                        cf_connect_timeout,
+                    )
+                    .await
+                    {
+                        clear_cf_worker_cooldown(dc_id, is_media);
+                        info!(
+                            "[{}] DC{}{} {} → CF Worker connected",
+                            label, dc_id, media_tag, reason
+                        );
+                        bridge_ws(
+                            &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                        )
+                        .await;
+                        return;
+                    } else {
+                        set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
+                        warn!(
+                            "[{}] DC{}{} CF Worker failed, cooldown {}s",
+                            label,
+                            dc_id,
+                            media_tag,
+                            cf_fail_cooldown.as_secs()
+                        );
+                    }
                 }
             } else {
                 debug!(
@@ -756,40 +767,42 @@ pub async fn handle_client(
                 }
 
                 // ── Try Cloudflare Worker if configured ──────────────────
-                if let Some(worker_domain) = cf_worker_domain.as_deref() {
+                if !cf_worker_domains.is_empty() {
                     if !cf_worker_in_cooldown(dc_id, is_media) {
-                        debug!(
-                            "[{}] DC{}{} WS failed → trying CF Worker {} for {}",
-                            label, dc_id, media_tag, worker_domain, target_ip
-                        );
-
-                        if let Some(ws) = connect_cf_worker_ws_for_dc(
-                            worker_domain,
-                            &target_ip,
-                            dc_id,
-                            is_media,
-                            skip_tls,
-                            cf_connect_timeout,
-                        )
-                        .await
-                        {
-                            clear_cf_worker_cooldown(dc_id, is_media);
-                            info!("[{}] DC{}{} → CF Worker connected", label, dc_id, media_tag);
-                            bridge_ws(
-                                &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
-                                is_media,
-                            )
-                            .await;
-                            return;
-                        } else {
-                            set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
-                            warn!(
-                                "[{}] DC{}{} CF Worker failed, cooldown {}s",
-                                label,
-                                dc_id,
-                                media_tag,
-                                cf_fail_cooldown.as_secs()
+                        for worker_domain in shuffled_cf_worker_domains(&cf_worker_domains) {
+                            debug!(
+                                "[{}] DC{}{} WS failed → trying CF Worker {} for {}",
+                                label, dc_id, media_tag, worker_domain, target_ip
                             );
+
+                            if let Some(ws) = connect_cf_worker_ws_for_dc(
+                                &worker_domain,
+                                &target_ip,
+                                dc_id,
+                                is_media,
+                                skip_tls,
+                                cf_connect_timeout,
+                            )
+                            .await
+                            {
+                                clear_cf_worker_cooldown(dc_id, is_media);
+                                info!("[{}] DC{}{} → CF Worker connected", label, dc_id, media_tag);
+                                bridge_ws(
+                                    &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
+                                    is_media,
+                                )
+                                .await;
+                                return;
+                            } else {
+                                set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
+                                warn!(
+                                    "[{}] DC{}{} CF Worker failed, cooldown {}s",
+                                    label,
+                                    dc_id,
+                                    media_tag,
+                                    cf_fail_cooldown.as_secs()
+                                );
+                            }
                         }
                     } else {
                         debug!(

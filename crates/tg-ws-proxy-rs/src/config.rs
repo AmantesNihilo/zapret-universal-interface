@@ -4,7 +4,7 @@
 //! environment-variable fallback (e.g. `--port` → `TG_PORT`).
 //! That makes Docker / systemd deployments trivial without a config file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 
 use clap::Parser;
@@ -214,9 +214,10 @@ pub struct Config {
         long = "cf-worker-domain",
         alias = "cfproxy-worker-domain",
         value_name = "DOMAIN",
+        value_delimiter = ',',
         env = "TG_CF_WORKER_DOMAIN"
     )]
-    pub cf_worker_domain: Option<String>,
+    pub cf_worker_domain: Vec<String>,
 
     /// Prioritise Cloudflare proxy over direct WebSocket connections for all
     /// DCs (even those with `--dc-ip` configured).
@@ -434,28 +435,34 @@ impl Config {
         self.dc_ip.iter().cloned().collect()
     }
 
-    /// Cloudflare Worker domain normalized for `Host` and TLS SNI use.
+    /// Cloudflare Worker domains normalized for `Host` and TLS SNI use.
+    ///
+    /// Each configured item may contain a single domain or a comma/semicolon/
+    /// whitespace-separated list. This keeps the old single-value CLI and ZUI
+    /// settings compatible while matching the upstream multi-worker fallback.
+    pub fn cf_worker_domains(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut domains = Vec::new();
+
+        for entry in &self.cf_worker_domain {
+            for domain in entry.replace(',', " ").replace(';', " ").split_whitespace() {
+                let Some(domain) = normalize_worker_domain(domain) else {
+                    continue;
+                };
+                let key = domain.to_ascii_lowercase();
+                if seen.insert(key) {
+                    domains.push(domain);
+                }
+            }
+        }
+
+        domains
+    }
+
+    /// First Cloudflare Worker domain, kept for compatibility with existing
+    /// callers that only need to know whether worker fallback is configured.
     pub fn cf_worker_domain(&self) -> Option<String> {
-        let domain = self.cf_worker_domain.as_deref()?.trim();
-        if domain.is_empty() {
-            return None;
-        }
-
-        let domain = domain
-            .strip_prefix("https://")
-            .or_else(|| domain.strip_prefix("http://"))
-            .unwrap_or(domain);
-        let domain = domain
-            .split_once('/')
-            .map(|(host, _)| host)
-            .unwrap_or(domain)
-            .trim_end_matches('/');
-
-        if domain.is_empty() {
-            None
-        } else {
-            Some(domain.to_string())
-        }
+        self.cf_worker_domains().into_iter().next()
     }
 
     /// The hostname/IP to advertise in the generated `tg://proxy` link.
@@ -498,6 +505,29 @@ impl Config {
 /// Works by opening a UDP socket and "connecting" it to a public IP (no
 /// packet is actually sent); the OS routing table then fills in the local
 /// source address.
+fn normalize_worker_domain(domain: &str) -> Option<String> {
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return None;
+    }
+
+    let domain = domain
+        .strip_prefix("https://")
+        .or_else(|| domain.strip_prefix("http://"))
+        .unwrap_or(domain);
+    let domain = domain
+        .split_once('/')
+        .map(|(host, _)| host)
+        .unwrap_or(domain)
+        .trim_end_matches('/');
+
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain.to_string())
+    }
+}
+
 fn detect_lan_ip() -> Option<String> {
     // 8.8.8.8:80 is Google's public DNS. No packet is actually sent — we just
     // need any well-known routable address so the kernel can select the right

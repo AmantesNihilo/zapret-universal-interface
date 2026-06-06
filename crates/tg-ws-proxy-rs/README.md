@@ -101,7 +101,7 @@ tg-ws-proxy [OPTIONS]
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
-| `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain for TCP-tunnel fallback, no owned domain required (see [Cloudflare Worker](#cloudflare-worker)) |
+| `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated, no owned domain required (see [Cloudflare Worker](#cloudflare-worker)) |
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
 | `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` values (see [CF Proxy](#cloudflare-proxy)) |
@@ -135,6 +135,9 @@ tg-ws-proxy --cf-domain yourdomain.com
 
 # With Cloudflare Worker (free workers.dev TCP tunnel fallback)
 tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
+
+# Multiple Cloudflare Workers (randomized per fallback attempt)
+tg-ws-proxy --cf-worker-domain one.username.workers.dev,two.username.workers.dev
 
 # CF proxy only: omit --dc-ip so CF proxy handles all DCs
 tg-ws-proxy --cf-domain yourdomain.com --cf-priority
@@ -335,6 +338,13 @@ copy its `*.workers.dev` domain, and pass it to the proxy:
 
 ```bash
 tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
+```
+
+Multiple Worker domains can be passed as a comma-separated list. The proxy
+randomizes the selected Worker domain for each fallback attempt:
+
+```bash
+tg-ws-proxy --cf-worker-domain one.username.workers.dev,two.username.workers.dev
 ```
 
 Or via environment variable:

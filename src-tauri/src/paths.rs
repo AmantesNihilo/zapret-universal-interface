@@ -39,8 +39,7 @@ pub fn data_dir() -> PathBuf {
         return root.join("data");
     }
 
-    installed_data_dir()
-        .unwrap_or_else(|| root.join("data"))
+    installed_data_dir().unwrap_or_else(|| root.join("data"))
 }
 
 pub fn distribution_mode() -> &'static str {

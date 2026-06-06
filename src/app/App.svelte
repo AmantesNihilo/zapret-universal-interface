@@ -74,12 +74,14 @@
   let conflictApps = $state<ConflictProcess[]>([]);
   let aboutOpen = $state(false);
   let reportOpen = $state(false);
+  let reportText = $state("");
   let reportCopied = $state(false);
   let updateInfo = $state<UpdateCheck | null>(null);
   let updateOpen = $state(false);
   let updateChecking = $state(false);
   let updateInstalling = $state(false);
   let updateMessage = $state<string | null>(null);
+  let updatePostponedVersion = $state<string | null>(null);
 
   const themeOptions = $derived.by((): DropdownOption[] => [
     { value: "dark", label: $t("theme.dark"), hint: $t("theme.darkHint") },
@@ -246,7 +248,8 @@
     try {
       const info = await commands.checkForUpdate();
       updateInfo = info;
-      updateOpen = info.updateAvailable;
+      const version = info.latestVersion ?? "";
+      updateOpen = info.updateAvailable && version !== updatePostponedVersion;
     } catch {
       // Update checks should never block app startup.
     }
@@ -285,6 +288,17 @@
   async function openUpdateRelease() {
     if (!updateInfo?.releaseUrl) return;
     await commands.openUrl(updateInfo.releaseUrl);
+  }
+
+  async function openPortableDownload() {
+    const url = updateInfo?.portableAsset?.downloadUrl ?? updateInfo?.releaseUrl;
+    if (!url) return;
+    await commands.openUrl(url);
+  }
+
+  function postponeUpdate() {
+    updatePostponedVersion = updateInfo?.latestVersion ?? null;
+    updateOpen = false;
   }
 
   function formatBytes(bytes?: number | null) {
@@ -516,7 +530,7 @@
     const settingsSnapshot = get(settingsStore);
     const logSnapshot = get(logs);
     const lines = [
-      "ZUI 2.0.0 support report",
+      "ZUI 2.0.1 support report",
       `Created: ${new Date().toISOString()}`,
       "",
       "[App]",
@@ -555,8 +569,22 @@
     return lines.filter((line) => line !== "").join("\n");
   }
 
+  async function openReport() {
+    error = null;
+    try {
+      await Promise.all([loadAppState(), loadLogs(), loadDiagnostics()]);
+      reportText = await commands.collectSupportReport();
+      reportOpen = true;
+    } catch (caught) {
+      error = String(caught);
+    }
+  }
+
   async function copySupportReport() {
-    await navigator.clipboard?.writeText(buildSupportReport());
+    if (!reportText) {
+      reportText = buildSupportReport();
+    }
+    await navigator.clipboard?.writeText(reportText);
     reportCopied = true;
     window.setTimeout(() => (reportCopied = false), 1400);
   }
@@ -879,6 +907,7 @@
                     {$t("tg.cfWorker")}
                     <input
                       value={activeProfile.tgWsCfWorkerDomain ?? ""}
+                      placeholder="one.workers.dev, two.workers.dev"
                       disabled={serviceConfigLocked}
                       oninput={(event) => updateProfile({ tgWsCfWorkerDomain: event.currentTarget.value || null })}
                     />
@@ -1055,7 +1084,7 @@
                 <button class="secondary-button" type="button" onclick={() => runAction(loadDiagnostics)}>
                   <RotateCw size={16} /> {$t("common.refresh")}
                 </button>
-                <button class="secondary-button" type="button" onclick={() => (reportOpen = true)}>
+                <button class="secondary-button" type="button" onclick={openReport}>
                   {$t("report.title")}
                 </button>
               </div>
@@ -1139,13 +1168,13 @@
           <header>
             <div>
               <h3>{$t("report.title")}</h3>
-              <p>ZUI 2.0.0</p>
+              <p>ZUI 2.0.1</p>
             </div>
             <button class="icon-button" type="button" onclick={() => (reportOpen = false)} title={$t("common.close")}>
               <X size={18} />
             </button>
           </header>
-          <textarea readonly rows="18" value={buildSupportReport()}></textarea>
+          <textarea readonly rows="18" value={reportText || buildSupportReport()}></textarea>
           <button class="secondary-button" type="button" onclick={copySupportReport}>
             {reportCopied ? $t("report.copied") : $t("report.copy")}
           </button>
@@ -1154,7 +1183,7 @@
     {/if}
 
     {#if updateOpen && updateInfo}
-      <div class="about-overlay" role="presentation" onclick={(event) => event.currentTarget === event.target && (updateOpen = false)}>
+      <div class="about-overlay" role="presentation" onclick={(event) => event.currentTarget === event.target && postponeUpdate()}>
         <div class="about-panel update-panel" role="dialog" aria-modal="true" aria-label={$t("update.available")}>
           <header>
             <div class="about-mark" aria-hidden="true">
@@ -1173,7 +1202,7 @@
               class="icon-button"
               type="button"
               disabled={updateInstalling}
-              onclick={() => (updateOpen = false)}
+              onclick={postponeUpdate}
               title={$t("update.later")}
             >
               <X size={18} />
@@ -1212,10 +1241,15 @@
           {/if}
 
           <div class="update-actions">
-            <button class="secondary-button" type="button" disabled={updateInstalling} onclick={() => (updateOpen = false)}>
+            <button class="secondary-button" type="button" disabled={updateInstalling} onclick={postponeUpdate}>
               {$t("update.later")}
             </button>
-            <button class="secondary-button" type="button" disabled={updateInstalling || !updateInfo.releaseUrl} onclick={openUpdateRelease}>
+            <button
+              class="secondary-button"
+              type="button"
+              disabled={updateInstalling || (!updateInfo.releaseUrl && !updateInfo.portableAsset)}
+              onclick={updateInfo.distribution === "portable" ? openPortableDownload : openUpdateRelease}
+            >
               <ExternalLink size={16} /> {$t("update.openRelease")}
             </button>
             {#if updateInfo.canInstall}

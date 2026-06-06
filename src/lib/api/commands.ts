@@ -57,6 +57,7 @@ export const commands = {
   cancelPresetTest: () => invoke<void>("cancel_preset_test"),
   getTestResults: () => invoke<TestResult[]>("get_test_results"),
   getDiagnostics: () => invoke<Diagnostics>("get_diagnostics"),
+  collectSupportReport: () => invoke<string>("collect_support_report"),
   checkForUpdate: () => invoke<UpdateCheck>("check_for_update"),
   installUpdate: () => invoke<void>("install_update")
 };

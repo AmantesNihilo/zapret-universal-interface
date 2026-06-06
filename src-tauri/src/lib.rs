@@ -6,6 +6,7 @@ mod models;
 mod paths;
 mod presets;
 mod profiles;
+mod report;
 mod runtime;
 mod services;
 mod settings;
@@ -65,6 +66,7 @@ pub fn run() {
             cancel_preset_test,
             get_test_results,
             get_diagnostics,
+            collect_support_report,
             check_for_update,
             install_update
         ])
@@ -87,7 +89,17 @@ pub fn run() {
             runtime.app_state.active_profile_id = active_profile_id;
             runtime.settings = settings;
             drop(runtime);
-            services::restore_owned_processes(&runtime_state);
+            logging::push(
+                app.handle(),
+                &runtime_state,
+                models::LogSource::App,
+                format!(
+                    "ZUI {} started in {} mode",
+                    env!("CARGO_PKG_VERSION"),
+                    paths::distribution_mode()
+                ),
+            );
+            services::restore_owned_processes(app.handle(), &runtime_state);
             tray::setup(app)?;
             windowing::apply_layout(app.handle(), &layout_orientation).ok();
             if launch_minimized {

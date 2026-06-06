@@ -153,7 +153,12 @@ pub fn start_active_profile(app: &AppHandle) {
         .await;
         if let Ok(Err(error)) = outcome {
             let runtime_state = thread_app.state::<Mutex<RuntimeState>>();
-            logging::push(&thread_app, &runtime_state, crate::models::LogSource::App, error);
+            logging::push(
+                &thread_app,
+                &runtime_state,
+                crate::models::LogSource::App,
+                error,
+            );
         }
     });
 }
@@ -169,7 +174,12 @@ fn stop_active_profile(app: &AppHandle) {
         .await;
         if let Ok(Err(error)) = outcome {
             let runtime_state = thread_app.state::<Mutex<RuntimeState>>();
-            logging::push(&thread_app, &runtime_state, crate::models::LogSource::App, error);
+            logging::push(
+                &thread_app,
+                &runtime_state,
+                crate::models::LogSource::App,
+                error,
+            );
         }
     });
 }
