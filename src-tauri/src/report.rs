@@ -79,6 +79,7 @@ pub fn collect(state: &Mutex<RuntimeState>) -> Result<String, String> {
         "[Profile]".into(),
         format!("name={}", active_profile.name),
         format!("zapret_enabled={}", active_profile.zapret_enabled),
+        format!("zapret_engine={:?}", active_profile.zapret_engine),
         format!(
             "zapret_preset={}",
             selected_preset
@@ -87,7 +88,10 @@ pub fn collect(state: &Mutex<RuntimeState>) -> Result<String, String> {
                 .unwrap_or_default()
         ),
         format!("tg_ws_enabled={}", active_profile.tg_ws_enabled),
-        format!("tg_ws={}:{}", active_profile.tg_ws_host, active_profile.tg_ws_port),
+        format!(
+            "tg_ws={}:{}",
+            active_profile.tg_ws_host, active_profile.tg_ws_port
+        ),
         String::new(),
         "[Diagnostics]".into(),
         format!("admin={}", diagnostics.is_admin),
@@ -95,10 +99,18 @@ pub fn collect(state: &Mutex<RuntimeState>) -> Result<String, String> {
         format!("data={}", diagnostics.data_path),
         format!("logs={}", diagnostics.logs_path),
         format!("presets={}", diagnostics.preset_count),
-        format!("selected_preset_exists={}", diagnostics.selected_preset_exists),
+        format!(
+            "selected_preset_exists={}",
+            diagnostics.selected_preset_exists
+        ),
         format!("winws_found={}", diagnostics.winws_found),
         format!("winws_running={}", diagnostics.winws_running),
-        format!("tg_ws_engine={} {}", diagnostics.tg_ws_engine, diagnostics.tg_ws_engine_version),
+        format!("winws2_found={}", diagnostics.winws2_found),
+        format!("winws2_running={}", diagnostics.winws2_running),
+        format!(
+            "tg_ws_engine={} {}",
+            diagnostics.tg_ws_engine, diagnostics.tg_ws_engine_version
+        ),
         format!("tg_ws_running={}", diagnostics.tg_ws_running),
         format!("tg_ws_port_available={}", diagnostics.tg_ws_port_available),
         format!("warnings={}", diagnostics.warnings.join(" | ")),

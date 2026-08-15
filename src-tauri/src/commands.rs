@@ -1,11 +1,11 @@
 use crate::models::{
     AppState, ConflictProcess, Diagnostics, LayoutOrientation, LogLine, Profile, ProfilesFile,
-    ServiceName, ServiceStatus, Settings, TestResult, UpdateCheck,
+    ServiceName, ServiceStatus, Settings, TestResult, TgWsConnectivityReport, UpdateCheck,
 };
 use crate::state::RuntimeState;
 use crate::{
-    conflicts, diagnostics, logging, presets, profiles, report, services, settings, tester, updater,
-    windowing,
+    conflicts, diagnostics, logging, presets, profiles, report, services, settings, tester,
+    updater, windowing,
 };
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
@@ -15,6 +15,11 @@ use tauri_plugin_opener::OpenerExt;
 pub fn get_app_state(state: State<Mutex<RuntimeState>>) -> AppState {
     services::refresh_status(&state);
     state.lock().unwrap().app_state.clone()
+}
+
+#[tauri::command]
+pub fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[tauri::command]
@@ -178,6 +183,39 @@ pub async fn stop_tg_ws(app: AppHandle) -> Result<ServiceStatus, String> {
 }
 
 #[tauri::command]
+pub async fn test_tg_ws_cf_proxy(
+    app: AppHandle,
+    profile: Profile,
+) -> Result<TgWsConnectivityReport, String> {
+    let report = crate::runtime::tg_ws::test_cf_proxy(&profile).await;
+    log_tg_ws_test(&app, "CF Proxy", &report);
+    report
+}
+
+#[tauri::command]
+pub async fn test_tg_ws_cf_worker(
+    app: AppHandle,
+    profile: Profile,
+) -> Result<TgWsConnectivityReport, String> {
+    let report = crate::runtime::tg_ws::test_cf_worker(&profile).await;
+    log_tg_ws_test(&app, "CF Worker", &report);
+    report
+}
+
+fn log_tg_ws_test(app: &AppHandle, label: &str, result: &Result<TgWsConnectivityReport, String>) {
+    let state = app.state::<Mutex<RuntimeState>>();
+    let message = match result {
+        Ok(report) => format!(
+            "tg-ws {label} test: {}/{} DC probes passed",
+            report.probes.iter().filter(|probe| probe.ok).count(),
+            report.probes.len()
+        ),
+        Err(error) => format!("tg-ws {label} test failed: {error}"),
+    };
+    logging::push(app, &state, crate::models::LogSource::Tests, message);
+}
+
+#[tauri::command]
 pub fn get_service_status(
     state: State<Mutex<RuntimeState>>,
     service: ServiceName,
@@ -213,13 +251,26 @@ pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
-    if !url.starts_with("tg://proxy?") && !updater::is_allowed_release_url(&url) {
-        return Err("Only Telegram proxy links and ZUI release links can be opened.".into());
+    if !is_allowed_external_url(&url) {
+        return Err("This external URL is not allowed.".into());
     }
 
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|error| error.to_string())
+}
+
+fn is_allowed_external_url(url: &str) -> bool {
+    let allowed_project_url = matches!(
+        url.trim_end_matches('/'),
+        "https://github.com/AmantesNihilo"
+            | "https://github.com/bol-van/zapret"
+            | "https://github.com/bol-van/zapret2"
+            | "https://github.com/Flowseal/tg-ws-proxy"
+            | "https://github.com/Flowseal/zapret-discord-youtube"
+            | "https://github.com/hyperion-cs/dpi-checkers"
+    );
+    url.starts_with("tg://proxy?") || updater::is_allowed_release_url(url) || allowed_project_url
 }
 
 #[tauri::command]
@@ -235,18 +286,16 @@ pub fn minimize_to_tray(app: AppHandle) {
 }
 
 #[tauri::command]
+pub fn minimize_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not found".to_string())?;
+    window.minimize().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn quit_app(app: AppHandle) {
-    let exit_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let thread_app = exit_app.clone();
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            let state = thread_app.state::<Mutex<RuntimeState>>();
-            state.lock().unwrap().shutting_down = true;
-            let _ = services::stop_active_profile(&thread_app, &state);
-        })
-        .await;
-        exit_app.exit(0);
-    });
+    crate::tray::request_quit(&app);
 }
 
 #[tauri::command]
@@ -279,6 +328,32 @@ pub fn run_all_preset_test(app: AppHandle, preset_ids: Vec<String>) -> Result<St
 }
 
 #[tauri::command]
+pub fn run_selected_preset_test(app: AppHandle, preset_ids: Vec<String>) -> Result<String, String> {
+    tester::run_selected_preset_test(app, preset_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_external_url;
+
+    #[test]
+    fn allows_attributed_project_urls() {
+        assert!(is_allowed_external_url("https://github.com/bol-van/zapret"));
+        assert!(is_allowed_external_url(
+            "https://github.com/hyperion-cs/dpi-checkers/"
+        ));
+    }
+
+    #[test]
+    fn rejects_unlisted_external_urls() {
+        assert!(!is_allowed_external_url("https://example.com"));
+        assert!(!is_allowed_external_url(
+            "https://github.com/bol-van/zapret/issues"
+        ));
+    }
+}
+
+#[tauri::command]
 pub fn cancel_preset_test(app: AppHandle) {
     let state = app.state::<Mutex<RuntimeState>>();
     tester::cancel_with_app(&app, &state);
@@ -291,6 +366,21 @@ pub fn get_test_results(state: State<Mutex<RuntimeState>>) -> Result<Vec<TestRes
         runtime.test_results = tester::load_results()?;
     }
     Ok(runtime.test_results.clone())
+}
+
+#[tauri::command]
+pub fn export_test_results(path: String) -> Result<(), String> {
+    tester::export_results(path)
+}
+
+#[tauri::command]
+pub fn import_test_results(
+    path: String,
+    state: State<Mutex<RuntimeState>>,
+) -> Result<Vec<TestResult>, String> {
+    let results = tester::import_results(path)?;
+    state.lock().unwrap().test_results = results.clone();
+    Ok(results)
 }
 
 #[tauri::command]
@@ -309,7 +399,12 @@ pub async fn get_diagnostics(app: AppHandle) -> Diagnostics {
 pub fn collect_support_report(app: AppHandle) -> Result<String, String> {
     let state = app.state::<Mutex<RuntimeState>>();
     let report = report::collect(&state)?;
-    logging::push(&app, &state, crate::models::LogSource::App, "Support report collected");
+    logging::push(
+        &app,
+        &state,
+        crate::models::LogSource::App,
+        "Support report collected",
+    );
     Ok(report)
 }
 
@@ -317,7 +412,12 @@ pub fn collect_support_report(app: AppHandle) -> Result<String, String> {
 pub async fn check_for_update(app: AppHandle) -> Result<UpdateCheck, String> {
     {
         let state = app.state::<Mutex<RuntimeState>>();
-        logging::push(&app, &state, crate::models::LogSource::App, "Checking for updates");
+        logging::push(
+            &app,
+            &state,
+            crate::models::LogSource::App,
+            "Checking for updates",
+        );
     }
     let result = tauri::async_runtime::spawn_blocking(updater::check)
         .await

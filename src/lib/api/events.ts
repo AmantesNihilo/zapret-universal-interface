@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import type { AppState, LogLine, Preset, TestResult, TestTargetResult } from "./types";
+import type { AppState, LogLine, Preset, TestProgress, TestResult, TestTargetResult } from "./types";
 
 export function onAppStateChanged(callback: (state: AppState) => void) {
   return listen<AppState>("app_state_changed", (event) => callback(event.payload));
@@ -23,6 +23,10 @@ export function onTestStarted(callback: (id: string) => void) {
 
 export function onTestTargetFinished(callback: (result: TestTargetResult) => void) {
   return listen<TestTargetResult>("test_target_finished", (event) => callback(event.payload));
+}
+
+export function onTestProgress(callback: (progress: TestProgress) => void) {
+  return listen<TestProgress>("test_progress", (event) => callback(event.payload));
 }
 
 export function onTestPresetStarted(callback: (preset: Preset) => void) {

@@ -1,0 +1,30 @@
+{
+  "engine": "bol-van/zapret2",
+  "engineVersion": "1.0.4",
+  "engineTag": "v1.0.4",
+  "engineCommit": "2c21faa80e1acb71ddceb8b49176f266b7d33f05",
+  "engineArchitecture": "windows-x86_64",
+  "upstreamArchiveSha256": "5760b6d41c09459fff00b4a6fec5437a471a00aac15f734723ede149cd26c709",
+  "winws2Sha256": "31702b09b424893be881116f3fe9257721d9795e8c570aa27c66a900fe384bfb",
+  "verifiedUpstreamFileCount": 65,
+  "bundledFakeFileCount": 106,
+  "presetPack": "multi-source",
+  "presetPackVersion": "2026-08-15",
+  "presetCount": 82,
+  "presetSources": [
+    {
+      "name": "legacy-zapret2-builtins",
+      "version": "2.11",
+      "presetCount": 70
+    },
+    {
+      "name": "klondike0x/zapret2-youtube-discord",
+      "version": "1.0.6",
+      "tag": "v1.0.6",
+      "commit": "f97a4b069f265d813aa83a304786f1ff989eab3f",
+      "releasePublishedAt": "2026-08-03T22:15:31Z",
+      "archiveSha256": "c2547c349dc60be8b99e3d5835037ef1d60b4b48b497e7e891f07f7567afdb23",
+      "presetCount": 12
+    }
+  ]
+}

@@ -2,7 +2,13 @@
   import type { LogLine } from "$lib/api/types";
   import { t } from "$lib/stores/i18n";
 
-  let { lines = [] }: { lines: LogLine[] } = $props();
+  let {
+    lines = [],
+    emptyText
+  }: {
+    lines: LogLine[];
+    emptyText?: string;
+  } = $props();
 
   function formatTimestamp(value: string) {
     const seconds = Number(value);
@@ -17,7 +23,7 @@
 
 <div class="log-viewer" role="log" aria-live="polite">
   {#if lines.length === 0}
-    <div class="log-empty">{$t("activity.empty")}</div>
+    <div class="log-empty">{emptyText ?? $t("activity.empty")}</div>
   {:else}
     {#each lines.slice(-80) as line}
       <div class="log-line">

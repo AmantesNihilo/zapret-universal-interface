@@ -1,5 +1,5 @@
-use crate::models::{Preset, PresetKind, PresetPreferences};
-use crate::{paths, settings};
+use crate::models::{Preset, PresetKind, PresetPreferences, ZapretEngine};
+use crate::{json_storage, paths, settings};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -9,9 +9,10 @@ pub fn discover_presets() -> Result<Vec<Preset>, String> {
     let mut presets = Vec::new();
     for root in preset_roots()? {
         if root.exists() {
-            visit_dir(&root, &root, &mut presets)?;
+            visit_classic_dir(&root, &root, &mut presets)?;
         }
     }
+    visit_zapret2_presets(&paths::resources_zapret2_dir(), &mut presets)?;
 
     let preferences = load_preferences()?;
     for preset in &mut presets {
@@ -85,8 +86,25 @@ fn load_preferences() -> Result<HashMap<String, PresetPreferences>, String> {
         return Ok(HashMap::new());
     }
 
-    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&text).map_err(|error| error.to_string())
+    let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    match json_storage::parse(&text) {
+        Ok(preferences) => {
+            if text.starts_with('\u{feff}') {
+                save_preferences(&preferences)?;
+            }
+            Ok(preferences)
+        }
+        Err(error) => {
+            let backup = json_storage::backup_invalid(&path)?;
+            let preferences = HashMap::new();
+            save_preferences(&preferences)?;
+            eprintln!(
+                "Stored preset preferences were reset after a JSON error ({error}); backup: {}",
+                backup.display()
+            );
+            Ok(preferences)
+        }
+    }
 }
 
 fn save_preferences(preferences: &HashMap<String, PresetPreferences>) -> Result<(), String> {
@@ -95,13 +113,13 @@ fn save_preferences(preferences: &HashMap<String, PresetPreferences>) -> Result<
     std::fs::write(paths::preset_preferences_path(), text).map_err(|error| error.to_string())
 }
 
-fn visit_dir(root: &Path, dir: &Path, presets: &mut Vec<Preset>) -> Result<(), String> {
+fn visit_classic_dir(root: &Path, dir: &Path, presets: &mut Vec<Preset>) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         if path.is_dir() {
             if !is_service_dir(&path) {
-                visit_dir(root, &path, presets)?;
+                visit_classic_dir(root, &path, presets)?;
             }
             continue;
         }
@@ -118,15 +136,64 @@ fn visit_dir(root: &Path, dir: &Path, presets: &mut Vec<Preset>) -> Result<(), S
                 .unwrap_or("Preset")
                 .to_string();
             presets.push(Preset {
-                id: stable_id(&path),
+                id: stable_id(ZapretEngine::Classic, &path),
                 name,
                 path: path.to_string_lossy().to_string(),
                 relative_path: relative,
+                engine: ZapretEngine::Classic,
                 kind,
                 favorite: false,
                 hidden: false,
             });
         }
+    }
+    Ok(())
+}
+
+fn visit_zapret2_presets(root: &Path, presets: &mut Vec<Preset>) -> Result<(), String> {
+    let preset_dir = root.join("presets");
+    if !preset_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&preset_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if !path.is_file()
+            || !path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("txt"))
+                .unwrap_or(false)
+            || path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.starts_with('_'))
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Preset")
+            .to_string();
+        presets.push(Preset {
+            id: stable_id(ZapretEngine::Zapret2, &path),
+            name,
+            path: path.to_string_lossy().to_string(),
+            relative_path: format!(
+                "zapret2/presets/{}",
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+            ),
+            engine: ZapretEngine::Zapret2,
+            kind: PresetKind::Config,
+            favorite: false,
+            hidden: false,
+        });
     }
     Ok(())
 }
@@ -247,8 +314,11 @@ fn is_service_script(path: &Path) -> bool {
     )
 }
 
-fn stable_id(path: &PathBuf) -> String {
+fn stable_id(engine: ZapretEngine, path: &PathBuf) -> String {
     let mut hasher = DefaultHasher::new();
+    if engine == ZapretEngine::Zapret2 {
+        engine.hash(&mut hasher);
+    }
     path.to_string_lossy().to_lowercase().hash(&mut hasher);
     format!("preset-{:x}", hasher.finish())
 }
@@ -257,4 +327,48 @@ fn same_path_loose(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .trim_end_matches(['\\', '/'])
         .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_presets_for_both_engines() {
+        let presets = discover_presets().expect("preset discovery");
+        assert!(presets
+            .iter()
+            .any(|preset| preset.engine == ZapretEngine::Classic));
+        assert!(presets
+            .iter()
+            .any(|preset| preset.engine == ZapretEngine::Zapret2));
+    }
+
+    #[test]
+    fn zapret2_presets_are_config_files() {
+        let presets = discover_presets().expect("preset discovery");
+        let zapret2: Vec<&Preset> = presets
+            .iter()
+            .filter(|preset| preset.engine == ZapretEngine::Zapret2)
+            .collect();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths::resources_zapret2_dir().join("manifest.json"))
+                .expect("Zapret 2 manifest"),
+        )
+        .expect("valid Zapret 2 manifest");
+        let expected = manifest["presetCount"]
+            .as_u64()
+            .expect("manifest presetCount") as usize;
+        assert_eq!(zapret2.len(), expected);
+        assert!(zapret2
+            .iter()
+            .all(|preset| matches!(preset.kind, PresetKind::Config)));
+        assert_eq!(
+            zapret2
+                .iter()
+                .filter(|preset| preset.name.starts_with("KLD 1.0.6 -"))
+                .count(),
+            12
+        );
+    }
 }

@@ -10,11 +10,13 @@ import type {
   ServiceStatus,
   Settings,
   TestResult,
+  TgWsConnectivityReport,
   UpdateCheck
 } from "./types";
 
 export const commands = {
   getAppState: () => invoke<AppState>("get_app_state"),
+  getAppVersion: () => invoke<string>("get_app_version"),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settingsPayload: Settings) =>
     invoke<Settings>("save_settings", { settingsPayload }),
@@ -39,12 +41,17 @@ export const commands = {
   startTgWs: (host: string, port: number, secret: string) =>
     invoke<ServiceStatus>("start_tg_ws", { host, port, secret }),
   stopTgWs: () => invoke<ServiceStatus>("stop_tg_ws"),
+  testTgWsCfProxy: (profile: Profile) =>
+    invoke<TgWsConnectivityReport>("test_tg_ws_cf_proxy", { profile }),
+  testTgWsCfWorker: (profile: Profile) =>
+    invoke<TgWsConnectivityReport>("test_tg_ws_cf_worker", { profile }),
   getLogs: () => invoke<LogLine[]>("get_logs"),
   clearLogs: () => invoke<void>("clear_logs"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   minimizeToTray: () => invoke<void>("minimize_to_tray"),
+  minimizeWindow: () => invoke<void>("minimize_window"),
   quitApp: () => invoke<void>("quit_app"),
   showMainWindow: () => invoke<void>("show_main_window"),
   setWindowLayout: (layout: Settings["layoutOrientation"]) =>
@@ -54,8 +61,12 @@ export const commands = {
     invoke<string>("run_best_preset_test", { presetIds, maxCount }),
   runAllPresetTest: (presetIds: string[]) =>
     invoke<string>("run_all_preset_test", { presetIds }),
+  runSelectedPresetTest: (presetIds: string[]) =>
+    invoke<string>("run_selected_preset_test", { presetIds }),
   cancelPresetTest: () => invoke<void>("cancel_preset_test"),
   getTestResults: () => invoke<TestResult[]>("get_test_results"),
+  exportTestResults: (path: string) => invoke<void>("export_test_results", { path }),
+  importTestResults: (path: string) => invoke<TestResult[]>("import_test_results", { path }),
   getDiagnostics: () => invoke<Diagnostics>("get_diagnostics"),
   collectSupportReport: () => invoke<string>("collect_support_report"),
   checkForUpdate: () => invoke<UpdateCheck>("check_for_update"),

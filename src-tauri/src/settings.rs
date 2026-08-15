@@ -1,5 +1,5 @@
 use crate::models::Settings;
-use crate::paths;
+use crate::{json_storage, paths};
 use std::process::{Command, Stdio};
 
 pub fn load_settings() -> Result<Settings, String> {
@@ -11,8 +11,25 @@ pub fn load_settings() -> Result<Settings, String> {
         return Ok(settings);
     }
 
-    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&text).map_err(|error| error.to_string())
+    let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    match json_storage::parse(&text) {
+        Ok(settings) => {
+            if text.starts_with('\u{feff}') {
+                save_settings(&settings)?;
+            }
+            Ok(settings)
+        }
+        Err(error) => {
+            let backup = json_storage::backup_invalid(&path)?;
+            let settings = Settings::default();
+            save_settings(&settings)?;
+            eprintln!(
+                "Stored settings were reset after a JSON error ({error}); backup: {}",
+                backup.display()
+            );
+            Ok(settings)
+        }
+    }
 }
 
 pub fn save_settings(settings: &Settings) -> Result<(), String> {

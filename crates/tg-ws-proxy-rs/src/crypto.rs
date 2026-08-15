@@ -61,6 +61,46 @@ impl ProtoTag {
     }
 }
 
+// ─── Proxy secret layout ─────────────────────────────────────────────────────
+
+/// Length of the mode-flag prefix that `dd`/`ee` secrets carry.
+const SECRET_MODE_PREFIX_LEN: usize = 1;
+/// Length of the actual cryptographic key inside a proxy secret.
+const SECRET_KEY_LEN: usize = 16;
+/// Offset of the key when a mode-flag prefix is present.
+const PREFIXED_SECRET_LEN: usize = SECRET_MODE_PREFIX_LEN + SECRET_KEY_LEN;
+
+/// FakeTLS mode flag: the secret carries a key plus an SNI hostname.
+const SECRET_MODE_FAKETLS: u8 = 0xee;
+/// Padded-intermediate mode flag: the secret carries a key only.
+const SECRET_MODE_PADDED: u8 = 0xdd;
+
+fn has_mode_prefix(raw: &[u8]) -> bool {
+    raw.len() >= PREFIXED_SECRET_LEN && matches!(raw[0], SECRET_MODE_PADDED | SECRET_MODE_FAKETLS)
+}
+
+/// The 16-byte cryptographic key carried by a proxy secret.
+///
+/// Telegram proxy secrets optionally start with a 1-byte mode flag
+/// (`dd` = padded intermediate, `ee` = FakeTLS) followed by the key; an `ee`
+/// secret then appends the FakeTLS SNI hostname. Only the key participates in
+/// key derivation, so every caller has to strip the prefix the same way.
+/// Secrets without a recognised prefix are returned verbatim.
+pub fn secret_key(raw: &[u8]) -> &[u8] {
+    if has_mode_prefix(raw) {
+        &raw[SECRET_MODE_PREFIX_LEN..PREFIXED_SECRET_LEN]
+    } else {
+        raw
+    }
+}
+
+/// The FakeTLS SNI hostname carried by an `ee` secret, or `None` for any
+/// other secret shape.
+pub fn faketls_hostname(raw: &[u8]) -> Option<&[u8]> {
+    (raw.len() > PREFIXED_SECRET_LEN && raw[0] == SECRET_MODE_FAKETLS)
+        .then(|| &raw[PREFIXED_SECRET_LEN..])
+}
+
 // ─── Handshake parsing ───────────────────────────────────────────────────────
 
 /// Result of a successfully parsed client handshake.

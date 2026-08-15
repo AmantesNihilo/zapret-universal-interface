@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FolderOpen } from "@lucide/svelte";
+  import { AlertTriangle, CheckCircle2, ChevronDown, Cpu, Database, FolderOpen, Radio, ShieldCheck } from "@lucide/svelte";
   import type { Diagnostics } from "$lib/api/types";
   import { t } from "$lib/stores/i18n";
 
@@ -16,15 +16,17 @@
     "No zapret presets were discovered.": $t("diagnostics.warningNoPresets"),
     "Selected zapret preset is missing.": $t("diagnostics.warningPresetMissing"),
     "winws.exe was not found in zapret resources.": $t("diagnostics.warningWinwsMissing"),
+    "winws2.exe was not found in Zapret 2 resources.": $t("diagnostics.warningWinws2Missing"),
     "tg-ws port is busy or unavailable.": $t("diagnostics.warningTgPort")
   }));
 
   const systemItems = $derived.by(() => {
     if (!diagnostics) return [];
     return [
-      { label: $t("diagnostics.admin"), value: statusText(diagnostics.isAdmin), ok: diagnostics.isAdmin },
-      { label: "winws.exe", value: statusText(diagnostics.winwsFound), ok: diagnostics.winwsFound },
-      { label: $t("diagnostics.presets"), value: String(diagnostics.presetCount), ok: diagnostics.presetCount > 0 }
+      { label: $t("diagnostics.admin"), hint: $t("diagnostics.adminHint"), value: statusText(diagnostics.isAdmin), ok: diagnostics.isAdmin },
+      { label: "Zapret Classic", hint: $t("diagnostics.classicHint"), value: statusText(diagnostics.winwsFound), ok: diagnostics.winwsFound },
+      { label: "Zapret 2", hint: $t("diagnostics.zapret2Hint"), value: statusText(diagnostics.winws2Found), ok: diagnostics.winws2Found },
+      { label: $t("diagnostics.presets"), hint: $t("diagnostics.presetsHint"), value: String(diagnostics.presetCount), ok: diagnostics.presetCount > 0 }
     ];
   });
 
@@ -33,12 +35,14 @@
     return [
       {
         label: $t("diagnostics.tgEngine"),
+        hint: $t("diagnostics.tgEngineHint"),
         value: `${diagnostics.tgWsEngine} ${diagnostics.tgWsEngineVersion}`,
         ok: diagnostics.tgWsFound
       },
-      { label: $t("diagnostics.winwsRunning"), value: yesNo(diagnostics.winwsRunning), neutral: true },
-      { label: $t("diagnostics.tgRunning"), value: yesNo(diagnostics.tgWsRunning), neutral: true },
-      { label: $t("diagnostics.tgPort"), value: statusText(diagnostics.tgWsPortAvailable), ok: diagnostics.tgWsPortAvailable }
+      { label: $t("diagnostics.winwsRunning"), hint: $t("diagnostics.processHint"), value: yesNo(diagnostics.winwsRunning), neutral: true },
+      { label: $t("diagnostics.winws2Running"), hint: $t("diagnostics.processHint"), value: yesNo(diagnostics.winws2Running), neutral: true },
+      { label: $t("diagnostics.tgRunning"), hint: $t("diagnostics.processHint"), value: yesNo(diagnostics.tgWsRunning), neutral: true },
+      { label: $t("diagnostics.tgPort"), hint: $t("diagnostics.tgPortHint"), value: statusText(diagnostics.tgWsPortAvailable), ok: diagnostics.tgWsPortAvailable }
     ];
   });
 
@@ -50,6 +54,11 @@
       { label: $t("common.logs"), value: diagnostics.logsPath }
     ];
   });
+  const passedChecks = $derived(
+    systemItems.filter((item) => item.ok).length +
+      serviceItems.filter((item) => item.ok !== false).length
+  );
+  const totalChecks = $derived(systemItems.length + serviceItems.length);
 
   function statusText(value: boolean) {
     return value ? $t("common.ok") : $t("common.fail");
@@ -66,38 +75,86 @@
 
 <div class="diagnostics-panel">
   {#if diagnostics}
-    <section class="diagnostics-block">
-      <header>
-        <h4>{$t("diagnostics.system")}</h4>
-      </header>
+    <section class:warning={diagnostics.warnings.length > 0} class="diagnostics-overview">
+      <div class="diagnostics-health-icon">
+        {#if diagnostics.warnings.length > 0}
+          <AlertTriangle size={22} />
+        {:else}
+          <ShieldCheck size={22} />
+        {/if}
+      </div>
+      <div>
+        <strong>{diagnostics.warnings.length > 0 ? $t("diagnostics.attention") : $t("diagnostics.ready")}</strong>
+        <span>{$t("diagnostics.checksPassed", { passed: passedChecks, total: totalChecks })}</span>
+        <div class="diagnostics-progress" aria-hidden="true">
+          <span style={`width: ${totalChecks > 0 ? Math.round((passedChecks / totalChecks) * 100) : 0}%`}></span>
+        </div>
+      </div>
+      <span class="diagnostics-score">
+        <strong>{diagnostics.warnings.length}</strong>
+        <small>{$t("diagnostics.issues")}</small>
+      </span>
+    </section>
+
+    <details class="diagnostics-block diagnostics-check-group" open>
+      <summary class="diagnostics-section-title">
+        <span class="diagnostics-section-icon"><Cpu size={15} /></span>
+        <div>
+          <h4>{$t("diagnostics.system")}</h4>
+          <small>{$t("diagnostics.systemHint")}</small>
+        </div>
+        <ChevronDown class="diagnostics-chevron" size={16} />
+      </summary>
       <div class="diagnostic-pill-grid">
         {#each systemItems as item}
-          <div class="diagnostic-pill">
-            <span>{item.label}</span>
-            <strong class:bad={!item.ok}>{item.value}</strong>
+          <div class:bad={!item.ok} class="diagnostic-pill">
+            <span class="diagnostic-state-icon">
+              {#if item.ok}<CheckCircle2 size={15} />{:else}<AlertTriangle size={15} />{/if}
+            </span>
+            <span class="diagnostic-item-copy">
+              <strong>{item.label}</strong>
+              <small>{item.hint}</small>
+            </span>
+            <strong>{item.value}</strong>
           </div>
         {/each}
       </div>
-    </section>
+    </details>
 
-    <section class="diagnostics-block">
-      <header>
-        <h4>{$t("diagnostics.services")}</h4>
-      </header>
+    <details class="diagnostics-block diagnostics-check-group" open>
+      <summary class="diagnostics-section-title">
+        <span class="diagnostics-section-icon"><Radio size={15} /></span>
+        <div>
+          <h4>{$t("diagnostics.services")}</h4>
+          <small>{$t("diagnostics.servicesHint")}</small>
+        </div>
+        <ChevronDown class="diagnostics-chevron" size={16} />
+      </summary>
       <div class="diagnostic-pill-grid">
         {#each serviceItems as item}
-          <div class="diagnostic-pill">
-            <span>{item.label}</span>
-            <strong class:bad={item.ok === false} class:neutral={item.neutral}>{item.value}</strong>
+          <div class:bad={item.ok === false} class="diagnostic-pill">
+            <span class="diagnostic-state-icon">
+              {#if item.ok === false}<AlertTriangle size={15} />{:else}<CheckCircle2 size={15} />{/if}
+            </span>
+            <span class="diagnostic-item-copy">
+              <strong>{item.label}</strong>
+              <small>{item.hint}</small>
+            </span>
+            <strong class:neutral={item.neutral}>{item.value}</strong>
           </div>
         {/each}
       </div>
-    </section>
+    </details>
 
-    <section class="diagnostics-block">
-      <header>
-        <h4>{$t("diagnostics.paths")}</h4>
-      </header>
+    <details class="diagnostics-block diagnostics-path-block">
+      <summary class="diagnostics-section-title">
+        <span class="diagnostics-section-icon"><Database size={15} /></span>
+        <div>
+          <h4>{$t("diagnostics.paths")}</h4>
+          <small>{$t("diagnostics.pathsHint")}</small>
+        </div>
+        <ChevronDown class="diagnostics-chevron" size={16} />
+      </summary>
       <div class="diagnostic-paths">
         {#each pathItems as item}
           <article>
@@ -111,9 +168,9 @@
           </article>
         {/each}
       </div>
-    </section>
+    </details>
 
-    <section class="diagnostics-block">
+    <section class:empty={diagnostics.warnings.length === 0} class="diagnostics-block diagnostics-warnings">
       <header>
         <h4>{$t("diagnostics.warnings")}</h4>
         <span>{diagnostics.warnings.length}</span>

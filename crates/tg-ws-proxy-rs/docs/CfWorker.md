@@ -30,8 +30,9 @@ workers.dev
 6. Нажмите сверху справа кнопку **`Deploy`**
    <img width="415" height="138" alt="image" src="https://github.com/user-attachments/assets/58d8f83e-d8b5-40cf-a30f-741d7311047b" />
 
-7. Скопируйте домен из поля справа и укажите его в настройках **Cloudflare Worker** (или через аргумент `--cf-worker-domain`; совместимое имя из Python `--cfproxy-worker-domain` тоже поддерживается). Можно указать несколько Worker-доменов через запятую.
+7. Скопируйте домен из поля справа и укажите его в настройках **Cloudflare Worker** (или через аргумент `--cf-worker-domain`; совместимое имя из Python `--cfproxy-worker-domain` тоже поддерживается)
     * Пример домена: `random-symbols-1234.username.workers.dev`
+    * Можно указать несколько доменов (через запятую или повторяя `--cf-worker-domain`); с `--cf-balance` они будут использоваться в round-robin и с failover на следующий Worker.
    <img width="414" height="182" alt="image" src="https://github.com/user-attachments/assets/4fb0b111-8026-4d17-b993-6c70ec37f1f5" />
 
 В Docker / systemd можно использовать переменную окружения:
@@ -46,11 +47,11 @@ TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
 tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev --check
 ```
 
-Несколько Worker-доменов:
-
-```bash
-tg-ws-proxy --cf-worker-domain one.username.workers.dev,two.username.workers.dev --check
-```
+Проверка не ограничивается WebSocket-апгрейдом: через туннель отправляется
+настоящий MTProto init, и если Worker не может достучаться до Telegram, туннель
+закроется сразу — `--check` покажет `FAIL`. Cloudflare отвечает `101` из самого
+кода Worker'а, ещё до того как его `connect()` до датацентра отработает, поэтому
+успешный апгрейд сам по себе ничего не доказывает.
 
 ### Код Worker'а
 ```javascript

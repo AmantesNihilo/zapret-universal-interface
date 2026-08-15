@@ -53,25 +53,16 @@ pub fn setup(app: &mut App) -> tauri::Result<()> {
         let handle = app.handle().clone();
         window.on_window_event(move |event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let runtime_state = handle.state::<Mutex<RuntimeState>>();
+                if handle
+                    .state::<Mutex<RuntimeState>>()
+                    .lock()
+                    .unwrap()
+                    .shutting_down
                 {
-                    let mut runtime = runtime_state.lock().unwrap();
-                    if runtime.shutting_down {
-                        return;
-                    }
-                    runtime.shutting_down = true;
+                    return;
                 }
-                let cleanup_app = handle.clone();
                 api.prevent_close();
-                tauri::async_runtime::spawn(async move {
-                    let thread_app = cleanup_app.clone();
-                    let _ = tauri::async_runtime::spawn_blocking(move || {
-                        let state = thread_app.state::<Mutex<RuntimeState>>();
-                        let _ = services::stop_active_profile(&thread_app, &state);
-                    })
-                    .await;
-                    cleanup_app.exit(0);
-                });
+                request_quit(&handle);
             }
         });
     }
@@ -120,6 +111,7 @@ pub fn hide_main_window(app: &AppHandle) {
 
 pub fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -134,12 +126,31 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         MENU_TURN_ON => start_active_profile(app),
         MENU_TURN_OFF => stop_active_profile(app),
-        MENU_QUIT => {
-            stop_active_profile(app);
-            app.exit(0);
-        }
+        MENU_QUIT => request_quit(app),
         _ => {}
     }
+}
+
+pub fn request_quit(app: &AppHandle) {
+    let runtime_state = app.state::<Mutex<RuntimeState>>();
+    {
+        let mut runtime = runtime_state.lock().unwrap();
+        if runtime.shutting_down {
+            return;
+        }
+        runtime.shutting_down = true;
+    }
+
+    let cleanup_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let thread_app = cleanup_app.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let state = thread_app.state::<Mutex<RuntimeState>>();
+            let _ = services::stop_active_profile(&thread_app, &state);
+        })
+        .await;
+        cleanup_app.exit(0);
+    });
 }
 
 pub fn start_active_profile(app: &AppHandle) {

@@ -108,7 +108,7 @@ Goal: turn ZUI into a complete zapret control center.
 - Publish installer, MSI, portable ZIP and SHA256 for every release.
 - Consider Winget later, after the app is more stable and signed.
 
-## Suggested priority
+## Suggested priority!
 
 1. 2.0.1 Stability Patch
 2. 2.1 Test & Diagnostics

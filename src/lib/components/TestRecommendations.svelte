@@ -16,6 +16,7 @@
   let page = $state(1);
   const totalPages = $derived(Math.max(1, Math.ceil(results.length / pageSize)));
   const pageItems = $derived(results.slice((page - 1) * pageSize, page * pageSize));
+  const bestResult = $derived(results[0] ?? null);
   const pages = $derived.by(() => {
     if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1);
 
@@ -35,23 +36,44 @@
   $effect(() => {
     if (page > totalPages) page = totalPages;
   });
+
+  function recommendationLabel(value: TestResult["recommendation"]) {
+    if (value === "recommended") return $t("test.recommended");
+    if (value === "partial") return $t("test.partial");
+    return $t("test.notRecommended");
+  }
+
+  function modeLabel(value: TestResult["mode"]) {
+    return value === "all" ? $t("test.modeAll") : $t("test.modeSelected");
+  }
 </script>
 
 <div class="recommendations">
   {#if results.length === 0}
-    <p class="muted-text">{$t("test.recommendationsEmpty")}</p>
+    <p class="muted-text">{$t("test.noResults")}</p>
   {:else}
     <div class="recommendations-head">
       <span>{$t("test.presetsTested", { count: results.length })}</span>
       <span>{$t("common.page")} {page}/{totalPages}</span>
     </div>
 
+    {#if bestResult}
+      <article class="best-result-card">
+        <div class="score-pill">{bestResult.score}</div>
+        <div>
+          <strong>{bestResult.presetName}</strong>
+          <span>{recommendationLabel(bestResult.recommendation)} · {$t("test.passed", { ok: bestResult.ok, total: bestResult.total })}</span>
+        </div>
+        <button class="primary-button compact-button" type="button" onclick={() => onUse(bestResult)}>{$t("test.applyBest")}</button>
+      </article>
+    {/if}
+
     {#each pageItems as result}
       <article class="recommendation-row">
-        <div class="score-pill">{result.score}</div>
+        <div class="score-pill" class:partial={result.recommendation === "partial"} class:failed={result.recommendation === "notRecommended"}>{result.score}</div>
         <div class="recommendation-main">
           <strong>{result.presetName}</strong>
-          <span>{$t("test.passed", { ok: result.ok, total: result.total })}</span>
+          <span>{recommendationLabel(result.recommendation)} · {modeLabel(result.mode)} · {$t("test.passed", { ok: result.ok, total: result.total })}</span>
         </div>
         <button class="secondary-button" type="button" onclick={() => onDetails(result)}>{$t("common.details")}</button>
         <button class="secondary-button" type="button" onclick={() => onUse(result)}>{$t("common.use")}</button>

@@ -80,6 +80,10 @@ pub fn profiles_path() -> PathBuf {
     data_dir().join("profiles.json")
 }
 
+pub fn power_intent_path() -> PathBuf {
+    data_dir().join("power-intent.json")
+}
+
 pub fn test_results_path() -> PathBuf {
     data_dir().join("test-results.json")
 }
@@ -110,6 +114,17 @@ pub fn resources_zapret_dir() -> PathBuf {
     }
 
     local
+}
+
+pub fn resources_zapret2_dir() -> PathBuf {
+    if let Some(exe_dir) = exe_dir() {
+        let bundled = exe_dir.join("resources").join("zapret2");
+        if has_entries(&bundled) {
+            return bundled;
+        }
+    }
+
+    project_root().join("resources").join("zapret2")
 }
 
 fn has_entries(path: &PathBuf) -> bool {
@@ -155,6 +170,7 @@ pub fn ensure_data_layout() -> Result<(), std::io::Error> {
     let root = project_root();
     if is_development_tree(&root) {
         std::fs::create_dir_all(root.join("resources").join("zapret"))?;
+        std::fs::create_dir_all(root.join("resources").join("zapret2"))?;
     }
     Ok(())
 }

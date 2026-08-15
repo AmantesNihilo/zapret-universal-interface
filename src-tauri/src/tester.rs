@@ -1,8 +1,9 @@
 use crate::models::{
-    LogSource, ServiceTestResult, TestMode, TestResult, TestServiceStatus, TestTargetResult,
+    LogSource, ServiceTestResult, TestMode, TestPhase, TestProgress, TestRecommendation,
+    TestResult, TestServiceStatus, TestTargetConfig, TestTargetResult,
 };
 use crate::state::RuntimeState;
-use crate::{logging, paths, presets, services, system_process};
+use crate::{json_storage, logging, paths, presets, services, settings, system_process};
 use reqwest::{tls::Version, Method, Response};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -54,13 +55,20 @@ pub fn load_results() -> Result<Vec<TestResult>, String> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    match serde_json::from_str(&text) {
-        Ok(results) => Ok(results),
+    match json_storage::parse::<Vec<TestResult>>(&text) {
+        Ok(results) => {
+            if text.starts_with('\u{feff}') {
+                save_results(&results)?;
+            }
+            Ok(results)
+        }
         Err(error) => {
-            let backup = path.with_extension("json.bad");
-            let _ = std::fs::rename(&path, backup);
+            let backup = json_storage::backup_invalid(&path)?;
             save_results(&[])?;
-            eprintln!("Stored test results were reset: {error}");
+            eprintln!(
+                "Stored test results were reset after a JSON error ({error}); backup: {}",
+                backup.display()
+            );
             Ok(Vec::new())
         }
     }
@@ -72,6 +80,45 @@ pub fn save_results(results: &[TestResult]) -> Result<(), String> {
     std::fs::write(paths::test_results_path(), text).map_err(|error| error.to_string())
 }
 
+pub fn export_results(path: String) -> Result<(), String> {
+    let results = load_results()?;
+    let text = serde_json::to_string_pretty(&results).map_err(|error| error.to_string())?;
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+pub fn import_results(path: String) -> Result<Vec<TestResult>, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let imported = json_storage::parse::<Vec<TestResult>>(&text)
+        .map_err(|error| format!("Invalid ZUI test results file: {error}"))?;
+    let mut results = load_results()?;
+
+    for result in imported {
+        if result.id.trim().is_empty()
+            || result.preset_id.trim().is_empty()
+            || result.finished_at.trim().is_empty()
+        {
+            return Err("Invalid ZUI test result: required fields are missing".into());
+        }
+        if let Some(existing) = results.iter_mut().find(|existing| existing.id == result.id) {
+            *existing = result;
+        } else {
+            results.push(result);
+        }
+    }
+
+    results.sort_by(|left, right| {
+        left.finished_at
+            .parse::<u64>()
+            .unwrap_or_default()
+            .cmp(&right.finished_at.parse::<u64>().unwrap_or_default())
+    });
+    if results.len() > 500 {
+        results.drain(0..results.len() - 500);
+    }
+    save_results(&results)?;
+    Ok(results)
+}
+
 pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, String> {
     let preset = presets::find_preset(&preset_id)?;
     let runtime_state = app.state::<Mutex<RuntimeState>>();
@@ -80,7 +127,10 @@ pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, Strin
         if runtime.test_running {
             return Err("Preset test is already running".into());
         }
-        if runtime.zapret_child.is_some() || system_process::is_running("winws.exe") {
+        if runtime.zapret_child.is_some()
+            || system_process::is_running("winws.exe")
+            || system_process::is_running("winws2.exe")
+        {
             return Err("Stop zapret before running a preset test".into());
         }
         runtime.test_running = true;
@@ -96,8 +146,15 @@ pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, Strin
         let outcome = catch_unwind(AssertUnwindSafe(move || {
             let runtime_state = thread_app.state::<Mutex<RuntimeState>>();
             let _ = thread_app.emit("test_started", &thread_test_id);
-            let result =
-                run_one_preset(&thread_app, &runtime_state, thread_test_id.clone(), preset);
+            let result = run_one_preset(
+                &thread_app,
+                &runtime_state,
+                thread_test_id.clone(),
+                preset,
+                TestMode::Selected,
+                1,
+                1,
+            );
             let cancelled = is_cancelled(&runtime_state);
 
             {
@@ -146,13 +203,33 @@ pub fn run_best_preset_test(
     preset_ids: Vec<String>,
     max_count: usize,
 ) -> Result<String, String> {
+    run_batch_preset_test(app, preset_ids, max_count, TestMode::Selected)
+}
+
+pub fn run_all_preset_test(app: AppHandle, preset_ids: Vec<String>) -> Result<String, String> {
+    run_batch_preset_test(app, preset_ids, 500, TestMode::All)
+}
+
+pub fn run_selected_preset_test(app: AppHandle, preset_ids: Vec<String>) -> Result<String, String> {
+    run_batch_preset_test(app, preset_ids, 500, TestMode::Selected)
+}
+
+fn run_batch_preset_test(
+    app: AppHandle,
+    preset_ids: Vec<String>,
+    max_count: usize,
+    mode: TestMode,
+) -> Result<String, String> {
     let runtime_state = app.state::<Mutex<RuntimeState>>();
     {
         let mut runtime = runtime_state.lock().unwrap();
         if runtime.test_running {
             return Err("Preset test is already running".into());
         }
-        if runtime.zapret_child.is_some() || system_process::is_running("winws.exe") {
+        if runtime.zapret_child.is_some()
+            || system_process::is_running("winws.exe")
+            || system_process::is_running("winws2.exe")
+        {
             return Err("Stop zapret before running a preset test".into());
         }
         runtime.test_running = true;
@@ -178,6 +255,7 @@ pub fn run_best_preset_test(
     let batch_id = format!("batch-{}", unix_timestamp());
     let thread_app = app.clone();
     let thread_batch_id = batch_id.clone();
+    let mode_label = test_mode_label(&mode).to_string();
 
     std::thread::spawn(move || {
         let panic_app = thread_app.clone();
@@ -188,13 +266,13 @@ pub fn run_best_preset_test(
                 &thread_app,
                 &runtime_state,
                 LogSource::Tests,
-                format!("Find best preset started: {} presets", selected.len()),
+                format!("{mode_label} started: {} presets", selected.len()),
             );
 
+            let preset_count = selected.len();
             let mut batch_results = Vec::new();
-            for preset in selected {
+            for (preset_index, preset) in selected.into_iter().enumerate() {
                 if is_cancelled(&runtime_state) {
-                    let _ = thread_app.emit("test_cancelled", "cancelled");
                     break;
                 }
                 let result = run_one_preset(
@@ -202,6 +280,9 @@ pub fn run_best_preset_test(
                     &runtime_state,
                     format!("{}-{}", thread_batch_id, batch_results.len() + 1),
                     preset,
+                    mode.clone(),
+                    preset_index + 1,
+                    preset_count,
                 );
                 let _ = thread_app.emit("test_preset_finished", &result);
                 {
@@ -213,6 +294,9 @@ pub fn run_best_preset_test(
                     let _ = save_results(&runtime.test_results);
                 }
                 batch_results.push(result);
+                if is_cancelled(&runtime_state) {
+                    break;
+                }
             }
 
             batch_results.sort_by(|left, right| {
@@ -223,14 +307,25 @@ pub fn run_best_preset_test(
                     .then_with(|| left.preset_name.cmp(&right.preset_name))
             });
 
+            let cancelled = is_cancelled(&runtime_state);
             state_reset(&runtime_state);
-            let _ = thread_app.emit("test_batch_finished", &batch_results);
-            logging::push(
-                &thread_app,
-                &runtime_state,
-                LogSource::Tests,
-                "Find best preset finished",
-            );
+            if cancelled {
+                let _ = thread_app.emit("test_cancelled", "cancelled");
+                logging::push(
+                    &thread_app,
+                    &runtime_state,
+                    LogSource::Tests,
+                    format!("{mode_label} cancelled"),
+                );
+            } else {
+                let _ = thread_app.emit("test_batch_finished", &batch_results);
+                logging::push(
+                    &thread_app,
+                    &runtime_state,
+                    LogSource::Tests,
+                    format!("{mode_label} finished"),
+                );
+            }
         }));
         if outcome.is_err() {
             let runtime_state = panic_app.state::<Mutex<RuntimeState>>();
@@ -248,10 +343,6 @@ pub fn run_best_preset_test(
     Ok(batch_id)
 }
 
-pub fn run_all_preset_test(app: AppHandle, preset_ids: Vec<String>) -> Result<String, String> {
-    run_best_preset_test(app, preset_ids, 500)
-}
-
 pub fn cancel_with_app(app: &AppHandle, state: &Mutex<RuntimeState>) {
     state.lock().unwrap().test_cancelled = true;
     let _ = app.emit("test_stopping", "stopping");
@@ -262,14 +353,38 @@ fn run_one_preset(
     state: &Mutex<RuntimeState>,
     test_id: String,
     preset: crate::models::Preset,
+    mode: TestMode,
+    preset_index: usize,
+    preset_count: usize,
 ) -> TestResult {
     let started_at = unix_timestamp();
+    let targets = test_targets();
+    let total_checks = planned_check_count(&targets);
+    let mut progress = TestProgress {
+        test_id: test_id.clone(),
+        preset_id: preset.id.clone(),
+        preset_name: preset.name.clone(),
+        engine: preset.engine,
+        preset_index,
+        preset_count,
+        total_checks,
+        completed_checks: 0,
+        passed_checks: 0,
+        failed_checks: 0,
+        phase: TestPhase::Starting,
+        current_target: None,
+    };
     let _ = app.emit("test_preset_started", &preset);
+    emit_progress(app, &progress);
     logging::push(
         app,
         state,
         LogSource::Tests,
-        format!("Quick test started: {}", preset.relative_path),
+        format!(
+            "{} started: {}",
+            test_mode_label(&mode),
+            preset.relative_path
+        ),
     );
 
     let mut target_results = Vec::new();
@@ -277,18 +392,32 @@ fn run_one_preset(
     if let Err(error) = start_result {
         logging::push(app, state, LogSource::Tests, error.clone());
         target_results.push(startup_failure_target(&preset.relative_path, error));
+        progress.completed_checks = total_checks;
+        progress.failed_checks = total_checks;
+        progress.phase = TestPhase::Finishing;
+        emit_progress(app, &progress);
     } else {
+        progress.phase = TestPhase::Warmup;
+        emit_progress(app, &progress);
         warmup(app, state);
         if !is_cancelled(state) {
-            target_results = run_targets(app, state);
+            progress.phase = TestPhase::Checking;
+            emit_progress(app, &progress);
+            target_results = run_targets(app, state, targets, &mut progress);
         }
+        progress.phase = TestPhase::Finishing;
+        progress.current_target = None;
+        emit_progress(app, &progress);
         let _ = services::stop_zapret(app, state);
     }
 
     let result = build_result(
         test_id,
-        preset.id,
-        preset.name,
+        preset.id.clone(),
+        preset.name.clone(),
+        preset.relative_path.clone(),
+        preset.engine,
+        mode.clone(),
         started_at,
         unix_timestamp(),
         target_results,
@@ -298,7 +427,12 @@ fn run_one_preset(
         app,
         state,
         LogSource::Tests,
-        format!("Quick test finished: {}/{}", result.ok, result.total),
+        format!(
+            "{} finished: {}/{}",
+            test_mode_label(&mode),
+            result.ok,
+            result.total
+        ),
     );
     result
 }
@@ -307,14 +441,18 @@ fn warmup(app: &AppHandle, state: &Mutex<RuntimeState>) {
     let _ = app.emit("operation_progress", "Warmup");
     for _ in 0..2 {
         if is_cancelled(state) {
-            let _ = app.emit("test_cancelled", "cancelled");
             return;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn run_targets(app: &AppHandle, state: &Mutex<RuntimeState>) -> Vec<TestTargetResult> {
+fn run_targets(
+    app: &AppHandle,
+    state: &Mutex<RuntimeState>,
+    targets: Vec<Target>,
+    progress: &mut TestProgress,
+) -> Vec<TestTargetResult> {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -328,32 +466,53 @@ fn run_targets(app: &AppHandle, state: &Mutex<RuntimeState>) -> Vec<TestTargetRe
                 LogSource::Tests,
                 format!("Async test runtime failed: {error}"),
             );
+            progress.completed_checks = progress.total_checks;
+            progress.failed_checks = progress.total_checks;
+            progress.current_target = Some("Async test runtime".into());
+            emit_progress(app, progress);
             return Vec::new();
         }
     };
 
-    runtime.block_on(run_targets_async(app, state))
+    runtime.block_on(run_targets_async(app, state, targets, progress))
 }
 
-async fn run_targets_async(app: &AppHandle, state: &Mutex<RuntimeState>) -> Vec<TestTargetResult> {
+async fn run_targets_async(
+    app: &AppHandle,
+    state: &Mutex<RuntimeState>,
+    targets: Vec<Target>,
+    progress: &mut TestProgress,
+) -> Vec<TestTargetResult> {
     let checks = http_check_clients();
     let limiter = Arc::new(Semaphore::new(MAX_PARALLEL_TARGET_CHECKS));
 
     let mut tasks = tokio::task::JoinSet::new();
-    for target in test_targets() {
+    for target in targets {
         if is_cancelled(state) {
-            let _ = app.emit("test_cancelled", "cancelled");
             break;
         }
 
         match target.kind.clone() {
             TargetKind::Url(url) => {
                 if checks.is_empty() {
-                    let target = target.clone();
-                    let url = url.clone();
+                    let host = host_from_url(&url);
+                    let unavailable_target = target.clone();
+                    let unavailable_url = url.clone();
                     tasks.spawn(async move {
-                        unavailable_http_target(target, "HTTP client".into(), url)
+                        unavailable_http_target(
+                            unavailable_target,
+                            "HTTP client".into(),
+                            unavailable_url,
+                        )
                     });
+                    if let Some(host) = host {
+                        let limiter = Arc::clone(&limiter);
+                        let target = target.clone();
+                        tasks.spawn(async move {
+                            let _permit = limiter.acquire_owned().await.ok();
+                            check_ping_target(target, host).await
+                        });
+                    }
                     continue;
                 }
 
@@ -392,7 +551,6 @@ async fn run_targets_async(app: &AppHandle, state: &Mutex<RuntimeState>) -> Vec<
 
     while let Some(joined) = tasks.join_next().await {
         if is_cancelled(state) {
-            let _ = app.emit("test_cancelled", "cancelled");
             break;
         }
 
@@ -405,10 +563,22 @@ async fn run_targets_async(app: &AppHandle, state: &Mutex<RuntimeState>) -> Vec<
                     LogSource::Tests,
                     format!("Target check task failed: {error}"),
                 );
+                progress.completed_checks = progress.completed_checks.saturating_add(1);
+                progress.failed_checks = progress.failed_checks.saturating_add(1);
+                progress.current_target = Some("Internal check".into());
+                emit_progress(app, progress);
                 continue;
             }
         };
         let _ = app.emit("test_target_finished", &result);
+        progress.completed_checks = progress.completed_checks.saturating_add(1);
+        if result.ok {
+            progress.passed_checks = progress.passed_checks.saturating_add(1);
+        } else {
+            progress.failed_checks = progress.failed_checks.saturating_add(1);
+        }
+        progress.current_target = Some(result.label.clone());
+        emit_progress(app, progress);
         logging::push(
             app,
             state,
@@ -628,7 +798,43 @@ fn first_non_empty_line(text: &str) -> Option<String> {
 }
 
 fn test_targets() -> Vec<Target> {
-    load_hawdiho_targets().unwrap_or_else(fallback_targets)
+    load_custom_targets().unwrap_or_else(fallback_targets)
+}
+
+fn load_custom_targets() -> Option<Vec<Target>> {
+    let settings = settings::load_settings().ok()?;
+    let targets: Vec<Target> = settings
+        .test_targets
+        .iter()
+        .filter_map(target_from_config)
+        .collect();
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets)
+    }
+}
+
+fn target_from_config(config: &TestTargetConfig) -> Option<Target> {
+    if !config.enabled {
+        return None;
+    }
+    let service = config.service.trim();
+    let value = config.value.trim();
+    if service.is_empty() || value.is_empty() {
+        return None;
+    }
+    let kind = target_kind(value)?;
+    let name = if config.name.trim().is_empty() {
+        service
+    } else {
+        config.name.trim()
+    };
+    Some(Target {
+        name: name.into(),
+        service: service.into(),
+        kind,
+    })
 }
 
 fn fallback_targets() -> Vec<Target> {
@@ -645,65 +851,10 @@ fn fallback_targets() -> Vec<Target> {
         .collect()
 }
 
-fn load_hawdiho_targets() -> Option<Vec<Target>> {
-    let root = paths::resources_zapret_dir();
-    let candidates = [
-        root.join("hawdiho").join("utils").join("targets.txt"),
-        root.join("utils").join("targets.txt"),
-    ];
-
-    for path in candidates {
-        let text = std::fs::read_to_string(path).ok()?;
-        let targets: Vec<Target> = text
-            .lines()
-            .filter_map(parse_target_line)
-            .filter(|target| {
-                matches!(
-                    target.service.as_str(),
-                    "Discord" | "YouTube" | "Google" | "Cloudflare" | "DNS"
-                )
-            })
-            .collect();
-        if !targets.is_empty() {
-            return Some(targets);
-        }
-    }
-
-    None
-}
-
-fn parse_target_line(line: &str) -> Option<Target> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-    let (key, raw_url) = line.split_once('=')?;
-    let name = key.trim().to_string();
-    let service = target_service(&name)?;
-    let value = raw_url.trim().trim_matches('"').trim();
-    let kind = target_kind(value)?;
-    Some(Target {
-        name,
-        service,
-        kind,
-    })
-}
-
-fn target_service(key: &str) -> Option<String> {
-    for service in ["Discord", "YouTube", "Google", "Cloudflare", "DNS"] {
-        if key.starts_with(service) {
-            return Some(service.into());
-        }
-    }
-    if key.starts_with("Quad9") || key.contains("DNS") {
-        return Some("DNS".into());
-    }
-    None
-}
-
 fn target_kind(value: &str) -> Option<TargetKind> {
-    if let Some(host) = value.strip_prefix("PING:") {
-        let host = host.trim();
+    let value = value.trim();
+    if value.len() >= 5 && value[..5].eq_ignore_ascii_case("PING:") {
+        let host = value[5..].trim();
         if !host.is_empty() {
             return Some(TargetKind::Ping(host.into()));
         }
@@ -724,6 +875,9 @@ fn build_result(
     id: String,
     preset_id: String,
     preset_name: String,
+    preset_relative_path: String,
+    engine: crate::models::ZapretEngine,
+    mode: TestMode,
     started_at: String,
     finished_at: String,
     targets: Vec<TestTargetResult>,
@@ -785,19 +939,77 @@ fn build_result(
     } else {
         ((ok * 100) / total) as u8
     };
+    let recommendation = recommendation_for(score, &services);
 
     TestResult {
         id,
         preset_id,
         preset_name,
-        mode: TestMode::Quick,
+        engine,
+        preset_version: preset_version_from_path(&preset_relative_path),
+        mode,
         started_at,
-        finished_at,
+        finished_at: finished_at.clone(),
+        cached_at: finished_at,
+        recommendation,
         score,
         ok,
         total,
         services,
     }
+}
+
+fn recommendation_for(score: u8, services: &[ServiceTestResult]) -> TestRecommendation {
+    let core_services: Vec<&ServiceTestResult> = services
+        .iter()
+        .filter(|service| matches!(service.name.as_str(), "Discord" | "YouTube"))
+        .collect();
+    let core_failed = !core_services.is_empty()
+        && core_services
+            .iter()
+            .all(|service| matches!(service.status, TestServiceStatus::Failed));
+
+    if score >= 70 && !core_failed {
+        TestRecommendation::Recommended
+    } else if score >= 35 || services.iter().any(|service| service.ok > 0) {
+        TestRecommendation::Partial
+    } else {
+        TestRecommendation::NotRecommended
+    }
+}
+
+fn preset_version_from_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() >= 2 {
+        return format!("{}/{}", parts[0], parts[1]);
+    }
+    parts.first().copied().unwrap_or_default().to_string()
+}
+
+fn test_mode_label(mode: &TestMode) -> &'static str {
+    match mode {
+        TestMode::Selected => "Selected preset test",
+        TestMode::All => "All presets test",
+    }
+}
+
+fn planned_check_count(targets: &[Target]) -> u32 {
+    let http_checks = http_check_clients().len().max(1) as u32;
+    targets
+        .iter()
+        .map(|target| match target.kind {
+            TargetKind::Url(_) => http_checks + 1,
+            TargetKind::Ping(_) => 1,
+        })
+        .sum()
+}
+
+fn emit_progress(app: &AppHandle, progress: &TestProgress) {
+    let _ = app.emit("test_progress", progress);
 }
 
 fn is_cancelled(state: &Mutex<RuntimeState>) -> bool {
@@ -829,6 +1041,19 @@ impl CommandExtHidden for Command {
         use std::os::windows::process::CommandExt;
         CommandExt::creation_flags(self, flags);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planned_checks_are_stable_for_default_targets() {
+        let targets = fallback_targets();
+        let total = planned_check_count(&targets);
+        assert!(total > targets.len() as u32);
+        assert_eq!(total, planned_check_count(&targets));
     }
 }
 

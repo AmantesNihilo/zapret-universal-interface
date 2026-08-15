@@ -18,7 +18,6 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 // ─── TLS protocol constants ─────────────────────────────────────────────────
 
@@ -404,8 +403,10 @@ pub async fn read_tls_record<R: AsyncRead + Unpin>(
 /// We discard Handshake and ChangeCipherSpec records unconditionally and stop
 /// (returning `true`) as soon as we see the first Application Data record,
 /// which is the server's synthetic "finished" / fake certificate.
-pub async fn drain_faketls_server_hello(reader: &mut tokio::io::ReadHalf<TcpStream>) -> bool {
+pub async fn drain_faketls_server_hello<R: AsyncRead + Unpin>(reader: &mut R) -> bool {
     let mut header = [0u8; 5];
+    // One buffer reused across records instead of an allocation per record.
+    let mut payload = Vec::new();
 
     for _ in 0..TLS_MAX_HANDSHAKE_RECORDS {
         if reader.read_exact(&mut header).await.is_err() {
@@ -428,7 +429,7 @@ pub async fn drain_faketls_server_hello(reader: &mut tokio::io::ReadHalf<TcpStre
         }
 
         // Read and discard the record payload.
-        let mut payload = vec![0u8; payload_len];
+        payload.resize(payload_len, 0);
         if reader.read_exact(&mut payload).await.is_err() {
             return false;
         }

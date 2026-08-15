@@ -13,6 +13,8 @@ vite.config.ts.timestamp-*
 /target/
 /src-tauri/target/
 /src-tauri/gen/schemas/
+/.local-build-target/
+/.local-build-artifacts/
 
 # Local runtime data
 /data/
@@ -30,5 +32,6 @@ logs/
 # Editor and OS noise
 .vscode/
 .idea/
+/image/ROADMAP/
 .DS_Store
 Thumbs.db

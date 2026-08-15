@@ -9,9 +9,13 @@ export const settings = writable<Settings>({
   layoutOrientation: "portrait",
   launchMinimized: false,
   closeToTray: false,
+  minimizeBehavior: "taskbar",
+  minimizeDontAsk: false,
   startWithWindows: false,
   autoStartActiveProfileOnLaunch: false,
-  customPresetRoots: []
+  checkUpdatesOnLaunch: true,
+  customPresetRoots: [],
+  testTargets: []
 });
 
 export async function loadSettings() {

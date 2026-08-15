@@ -1,9 +1,11 @@
 mod commands;
 mod conflicts;
 mod diagnostics;
+mod json_storage;
 mod logging;
 mod models;
 mod paths;
+mod power_intent;
 mod presets;
 mod profiles;
 mod report;
@@ -27,11 +29,15 @@ pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(RuntimeState::default()))
         .invoke_handler(tauri::generate_handler![
             get_app_state,
+            get_app_version,
             get_settings,
             save_settings,
             get_profiles,
@@ -50,6 +56,8 @@ pub fn run() {
             kill_conflicting_apps,
             start_tg_ws,
             stop_tg_ws,
+            test_tg_ws_cf_proxy,
+            test_tg_ws_cf_worker,
             get_service_status,
             get_logs,
             clear_logs,
@@ -57,20 +65,25 @@ pub fn run() {
             open_url,
             reveal_path,
             minimize_to_tray,
+            minimize_window,
             quit_app,
             show_main_window,
             set_window_layout,
             run_preset_test,
             run_best_preset_test,
             run_all_preset_test,
+            run_selected_preset_test,
             cancel_preset_test,
             get_test_results,
+            export_test_results,
+            import_test_results,
             get_diagnostics,
             collect_support_report,
             check_for_update,
             install_update
         ])
         .setup(|app| {
+            runtime::tg_ws::install_logging(app.handle().clone());
             paths::ensure_data_layout()?;
             let settings = settings::load_settings().unwrap_or_default();
             let layout_orientation = settings.layout_orientation.clone();
@@ -78,6 +91,7 @@ pub fn run() {
             let auto_start_active_profile_on_launch = settings.auto_start_active_profile_on_launch;
             let profiles = profiles::load_profiles().unwrap_or_default();
             let active_profile_id = profiles.active_profile_id.clone();
+            let restore_last_power_state = power_intent::should_restore(&active_profile_id);
             let active_profile_autostart = profiles
                 .profiles
                 .iter()
@@ -105,7 +119,10 @@ pub fn run() {
             if launch_minimized {
                 tray::hide_main_window(app.handle());
             }
-            if auto_start_active_profile_on_launch || active_profile_autostart {
+            if restore_last_power_state
+                || auto_start_active_profile_on_launch
+                || active_profile_autostart
+            {
                 tray::start_active_profile(app.handle());
             }
             Ok(())

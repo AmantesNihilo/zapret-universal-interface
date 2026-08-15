@@ -1,0 +1,15 @@
+{
+  "source": "Flowseal/zapret-discord-youtube",
+  "version": "1.10.1",
+  "tag": "1.10.1",
+  "commit": "47da17f80ad36a8424cdd25658153fdebd7eb938",
+  "releasePublishedAt": "2026-08-09T15:20:39Z",
+  "archiveSha256": "f748d61fec75e4edc992cb5b09d554e914197c68c690384aceb61f143d8f76c9",
+  "archiveFileCount": 50,
+  "presetCount": 21,
+  "preservedUserFiles": [
+    "lists/ipset-exclude-user.txt",
+    "lists/list-exclude-user.txt",
+    "lists/list-general-user.txt"
+  ]
+}

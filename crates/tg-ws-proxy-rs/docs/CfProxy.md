@@ -96,10 +96,15 @@ entirely and `--cf-domain` is set, CF proxy becomes the primary path for
 
 ### `--cf-priority`
 
-When `--cf-priority` is set, the CF proxy is tried **before** the normal
-direct WebSocket connection for **all** DCs (even those with `--dc-ip`
-configured).  If the CF proxy fails, the proxy falls back to the normal WS
-path, then upstream MTProto proxies, then direct TCP.
+When `--cf-priority` is set, the Cloudflare tiers are tried **before** the
+normal direct WebSocket connection for **all** DCs (even those with `--dc-ip`
+configured): the Worker tunnel first (`--cf-worker-domain`), then the CF proxy
+(`--cf-domain`).  If both fail, the proxy falls back to the normal WS path,
+then upstream MTProto proxies, then direct TCP.
+
+The flag covers a Worker-only setup too — with only `--cf-worker-domain`
+configured it used to do nothing at all, so every connection still waited out
+the direct-WS timeout before reaching the Worker.
 
 ```sh
 tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority

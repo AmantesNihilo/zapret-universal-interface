@@ -1,8 +1,16 @@
 use crate::models::{LogLine, LogSource};
 use crate::paths;
 use crate::state::RuntimeState;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
+
+static TG_WS_LOG_MAX_BYTES: AtomicU64 = AtomicU64::new(5 * 1024 * 1024);
+
+pub fn set_tg_ws_log_max_mb(megabytes: f64) {
+    let bytes = (megabytes.clamp(1.0, 1024.0) * 1024.0 * 1024.0) as u64;
+    TG_WS_LOG_MAX_BYTES.store(bytes, Ordering::Relaxed);
+}
 
 pub fn push(
     app: &AppHandle,
@@ -74,11 +82,23 @@ fn append_file(line: &LogLine) -> Result<(), String> {
         LogSource::TgWs => "tg-ws.log",
         LogSource::Tests => "tests.log",
     };
+    let path = paths::logs_dir().join(file_name);
+    if matches!(line.source, LogSource::TgWs)
+        && std::fs::metadata(&path)
+            .map(|metadata| metadata.len() >= TG_WS_LOG_MAX_BYTES.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    {
+        let backup = paths::logs_dir().join("tg-ws.log.1");
+        if backup.exists() {
+            let _ = std::fs::remove_file(&backup);
+        }
+        std::fs::rename(&path, backup).map_err(|error| error.to_string())?;
+    }
     let text = format!("[{}] {}\n", line.timestamp, line.message);
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(paths::logs_dir().join(file_name))
+        .open(path)
         .and_then(|mut file| {
             use std::io::Write;
             file.write_all(text.as_bytes())

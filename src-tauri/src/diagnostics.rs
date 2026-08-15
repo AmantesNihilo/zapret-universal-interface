@@ -12,6 +12,7 @@ pub fn collect(state: Option<&Mutex<RuntimeState>>) -> Diagnostics {
     let presets = presets::discover_presets().unwrap_or_default();
     let profile = profiles::active_profile().ok();
     let winws_running = system_process::is_running("winws.exe");
+    let winws2_running = system_process::is_running("winws2.exe");
     let tg_ws_running = state
         .map(|state| {
             state
@@ -37,6 +38,10 @@ pub fn collect(state: Option<&Mutex<RuntimeState>>) -> Diagnostics {
         .unwrap_or(true);
 
     let winws_found = paths::find_file(&resources_path, "winws.exe").is_some();
+    let winws2_found = paths::resources_zapret2_dir()
+        .join("exe")
+        .join("winws2.exe")
+        .exists();
     let tg_ws_found = true;
     let is_admin = is_admin();
     let mut warnings = Vec::new();
@@ -58,6 +63,9 @@ pub fn collect(state: Option<&Mutex<RuntimeState>>) -> Diagnostics {
     if !winws_found {
         warnings.push("winws.exe was not found in zapret resources.".into());
     }
+    if !winws2_found {
+        warnings.push("winws2.exe was not found in Zapret 2 resources.".into());
+    }
     if profile
         .as_ref()
         .map(|profile| profile.tg_ws_enabled && !tg_ws_port_available)
@@ -73,10 +81,12 @@ pub fn collect(state: Option<&Mutex<RuntimeState>>) -> Diagnostics {
         preset_count: presets.len(),
         selected_preset_exists,
         winws_found,
+        winws2_found,
         tg_ws_found,
         tg_ws_engine: runtime::tg_ws::ENGINE_NAME.into(),
         tg_ws_engine_version: runtime::tg_ws::ENGINE_VERSION.into(),
         winws_running,
+        winws2_running,
         tg_ws_running,
         is_admin,
         tg_ws_port_available,

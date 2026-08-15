@@ -1,5 +1,7 @@
-use crate::models::{AppStatus, LogSource, PresetKind, ServiceName, ServiceState, ServiceStatus};
-use crate::{logging, paths, presets, profiles, runtime, system_process};
+use crate::models::{
+    AppStatus, LogSource, PresetKind, ServiceName, ServiceState, ServiceStatus, ZapretEngine,
+};
+use crate::{logging, paths, power_intent, presets, profiles, runtime, system_process};
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ pub fn start_active_profile(
     state: &Mutex<RuntimeState>,
 ) -> Result<crate::models::AppState, String> {
     let profile = profiles::active_profile()?;
+    let profile_id = profile.id.clone();
     let mut zapret_started = false;
 
     {
@@ -23,6 +26,19 @@ pub fn start_active_profile(
         runtime.app_state.last_error = None;
     }
     emit_state(app, state);
+
+    let start_zapret_service = match should_start_zapret(
+        profile.zapret_enabled,
+        profile.zapret_engine,
+        profile.zapret_preset_id.as_deref(),
+        profile.tg_ws_enabled,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            set_error(app, state, Some(ServiceName::Zapret), error.clone());
+            return Err(error);
+        }
+    };
 
     if !profile.zapret_enabled && !profile.tg_ws_enabled {
         refresh_status(state);
@@ -36,12 +52,32 @@ pub fn start_active_profile(
         return Ok(state.lock().unwrap().app_state.clone());
     }
 
-    if profile.zapret_enabled {
+    if profile.zapret_enabled && !start_zapret_service {
+        logging::push(
+            app,
+            state,
+            LogSource::App,
+            "zapret is enabled but not configured; starting tg-ws only",
+        );
+    }
+
+    if start_zapret_service {
         let Some(preset_id) = profile.zapret_preset_id.clone() else {
             let error = "No zapret preset selected".to_string();
             set_error(app, state, Some(ServiceName::Zapret), error.clone());
             return Err(error);
         };
+        let Some(engine) = profile.zapret_engine else {
+            let error = "No zapret engine selected".to_string();
+            set_error(app, state, Some(ServiceName::Zapret), error.clone());
+            return Err(error);
+        };
+        let preset = presets::find_preset(&preset_id)?;
+        if preset.engine != engine {
+            let error = "Selected preset belongs to another zapret engine".to_string();
+            set_error(app, state, Some(ServiceName::Zapret), error.clone());
+            return Err(error);
+        }
         if let Err(error) = start_zapret(app, state, preset_id) {
             set_error(app, state, Some(ServiceName::Zapret), error.clone());
             return Err(error);
@@ -66,14 +102,44 @@ pub fn start_active_profile(
     }
 
     refresh_status(state);
+    if let Err(error) = power_intent::remember_started(&profile_id) {
+        logging::push(
+            app,
+            state,
+            LogSource::App,
+            format!("Could not remember active profile power state: {error}"),
+        );
+    }
     logging::push(app, state, LogSource::App, "Profile started");
     emit_state(app, state);
     Ok(state.lock().unwrap().app_state.clone())
 }
 
+fn should_start_zapret(
+    enabled: bool,
+    engine: Option<ZapretEngine>,
+    preset_id: Option<&str>,
+    tg_ws_enabled: bool,
+) -> Result<bool, String> {
+    if !enabled {
+        return Ok(false);
+    }
+    if engine.is_some() && preset_id.is_some_and(|value| !value.trim().is_empty()) {
+        return Ok(true);
+    }
+    if tg_ws_enabled {
+        return Ok(false);
+    }
+    if engine.is_none() {
+        Err("No zapret engine selected".into())
+    } else {
+        Err("No zapret preset selected".into())
+    }
+}
+
 pub fn restore_owned_processes(app: &AppHandle, state: &Mutex<RuntimeState>) {
     let marker_exists = owned_winws_marker_path().exists();
-    let owned = load_owned_winws_marker();
+    let (engine, owned) = load_owned_winws_marker();
     if owned.is_empty() {
         if marker_exists {
             clear_owned_winws_marker();
@@ -89,16 +155,18 @@ pub fn restore_owned_processes(app: &AppHandle, state: &Mutex<RuntimeState>) {
     {
         let mut runtime = state.lock().unwrap();
         runtime.zapret_winws_pids = owned;
+        runtime.active_zapret_engine = Some(engine);
     }
     refresh_status(state);
     let recovered = state.lock().unwrap().zapret_winws_pids.clone();
-    write_owned_winws_marker(&recovered);
+    write_owned_winws_marker(engine, &recovered);
     logging::push(
         app,
         state,
         LogSource::App,
         format!(
-            "Crash recovery: attached to owned winws.exe PID {}",
+            "Crash recovery: attached to owned {} PID {}",
+            engine.process_name(),
             recovered
                 .iter()
                 .map(u32::to_string)
@@ -112,6 +180,17 @@ pub fn stop_active_profile(
     app: &AppHandle,
     state: &Mutex<RuntimeState>,
 ) -> Result<crate::models::AppState, String> {
+    let preserve_power_intent = state.lock().unwrap().shutting_down;
+    if !preserve_power_intent {
+        if let Err(error) = power_intent::clear() {
+            logging::push(
+                app,
+                state,
+                LogSource::App,
+                format!("Could not clear active profile power state: {error}"),
+            );
+        }
+    }
     {
         let mut runtime = state.lock().unwrap();
         runtime.app_state.status = AppStatus::Stopping;
@@ -145,50 +224,68 @@ pub fn start_zapret(
     preset_id: String,
 ) -> Result<ServiceStatus, String> {
     refresh_status(state);
-    if state.lock().unwrap().zapret_child.is_some() {
+    if {
+        let runtime = state.lock().unwrap();
+        runtime.zapret_child.is_some() || !runtime.zapret_winws_pids.is_empty()
+    } {
         return Ok(state.lock().unwrap().app_state.zapret.clone());
     }
-    let known_winws = state.lock().unwrap().zapret_winws_pids.clone();
-    let foreign_winws: Vec<u32> = system_process::image_pids("winws.exe")
-        .into_iter()
-        .filter(|pid| !known_winws.contains(pid))
-        .collect();
-    if !foreign_winws.is_empty() {
-        return Err(format!(
-            "Foreign winws.exe is already running: PID {}. Stop it before starting ZUI zapret.",
-            foreign_winws
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    let winws_before = system_process::image_pids("winws.exe");
 
     let preset = presets::find_preset(&preset_id)?;
-    if !matches!(preset.kind, PresetKind::Bat | PresetKind::Cmd) {
-        return Err("Selected preset is not executable".into());
+    match preset.engine {
+        ZapretEngine::Classic if !matches!(preset.kind, PresetKind::Bat | PresetKind::Cmd) => {
+            return Err("Selected Classic preset is not executable".into());
+        }
+        ZapretEngine::Zapret2 if !matches!(preset.kind, PresetKind::Config) => {
+            return Err("Selected Zapret 2 preset is not a config".into());
+        }
+        _ => {}
     }
+    ensure_no_foreign_zapret_processes(state)?;
+    let process_name = preset.engine.process_name();
+    let process_before = system_process::image_pids(process_name);
 
     logging::push(
         app,
         state,
         LogSource::Zapret,
-        format!("Starting preset: {}", preset.relative_path),
+        format!(
+            "Starting {} preset: {}",
+            preset.engine.display_name(),
+            preset.relative_path
+        ),
     );
 
-    let launch_path = managed_zapret_script(&preset)?;
-    let launch_dir = Path::new(&preset.path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-
-    let mut command = Command::new("cmd");
+    let mut command = match preset.engine {
+        ZapretEngine::Classic => {
+            let launch_path = managed_zapret_script(&preset)?;
+            let launch_dir = Path::new(&preset.path)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let mut command = Command::new("cmd");
+            command
+                .arg("/D")
+                .arg("/Q")
+                .arg("/C")
+                .arg(&launch_path)
+                .current_dir(launch_dir);
+            command
+        }
+        ZapretEngine::Zapret2 => {
+            let root = paths::resources_zapret2_dir();
+            validate_zapret2_resources(&root)?;
+            let executable = root.join("exe").join("winws2.exe");
+            if !executable.exists() {
+                return Err(format!("winws2.exe not found: {}", executable.display()));
+            }
+            let mut command = Command::new(executable);
+            command
+                .args(zapret2_config_arguments(Path::new(&preset.path))?)
+                .current_dir(root);
+            command
+        }
+    };
     command
-        .arg("/D")
-        .arg("/Q")
-        .arg("/C")
-        .arg(&launch_path)
-        .current_dir(launch_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -196,7 +293,31 @@ pub fn start_zapret(
 
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let pid = child.id();
-    let owned_winws = wait_for_owned_winws(&winws_before);
+    let mut owned_winws = wait_for_owned_process(process_name, &process_before);
+    if preset.engine == ZapretEngine::Zapret2 {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let mut details = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut details);
+            }
+            if details.trim().is_empty() {
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut details);
+                }
+            }
+            return Err(format!(
+                "winws2.exe exited during startup ({status}){}",
+                if details.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", details.trim())
+                }
+            ));
+        }
+    }
+    if preset.engine == ZapretEngine::Zapret2 && !owned_winws.contains(&pid) {
+        owned_winws.push(pid);
+    }
     if let Some(stdout) = child.stdout.take() {
         spawn_pipe_logger(app.clone(), LogSource::Zapret, stdout);
     }
@@ -216,7 +337,8 @@ pub fn start_zapret(
         let mut runtime = state.lock().unwrap();
         runtime.zapret_child = Some(child);
         runtime.zapret_winws_pids = owned_winws;
-        write_owned_winws_marker(&runtime.zapret_winws_pids);
+        runtime.active_zapret_engine = Some(preset.engine);
+        write_owned_winws_marker(preset.engine, &runtime.zapret_winws_pids);
         runtime.app_state.zapret = status.clone();
         runtime.app_state.status = AppStatus::On;
         runtime.app_state.last_error = None;
@@ -226,6 +348,11 @@ pub fn start_zapret(
 }
 
 pub fn stop_zapret(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<ServiceStatus, String> {
+    let engine = state
+        .lock()
+        .unwrap()
+        .active_zapret_engine
+        .unwrap_or(ZapretEngine::Classic);
     let child = state.lock().unwrap().zapret_child.take();
     if let Some(mut child) = child {
         let pid = child.id();
@@ -252,7 +379,8 @@ pub fn stop_zapret(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servi
             state,
             LogSource::Zapret,
             format!(
-                "Stopping owned winws.exe PID {}",
+                "Stopping owned {} PID {}",
+                engine.process_name(),
                 owned_winws
                     .iter()
                     .map(u32::to_string)
@@ -269,7 +397,8 @@ pub fn stop_zapret(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servi
             .collect();
         if !still_running.is_empty() {
             return Err(format!(
-                "Failed to stop owned winws.exe PID {}. Run ZUI as administrator and try again.",
+                "Failed to stop owned {} PID {}. Run ZUI as administrator and try again.",
+                engine.process_name(),
                 still_running
                     .iter()
                     .map(u32::to_string)
@@ -279,6 +408,7 @@ pub fn stop_zapret(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servi
         }
     }
     state.lock().unwrap().zapret_winws_pids.clear();
+    state.lock().unwrap().active_zapret_engine = None;
     clear_owned_winws_marker();
 
     refresh_status(state);
@@ -306,7 +436,7 @@ fn owned_winws_marker_path() -> PathBuf {
         .join("zapret-owned-pids.txt")
 }
 
-fn write_owned_winws_marker(pids: &[u32]) {
+fn write_owned_winws_marker(engine: ZapretEngine, pids: &[u32]) {
     if pids.is_empty() {
         clear_owned_winws_marker();
         return;
@@ -315,23 +445,35 @@ fn write_owned_winws_marker(pids: &[u32]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let text = pids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut lines = vec![match engine {
+        ZapretEngine::Classic => "classic".to_string(),
+        ZapretEngine::Zapret2 => "zapret2".to_string(),
+    }];
+    lines.extend(pids.iter().map(u32::to_string));
+    let text = lines.join("\n");
     let _ = std::fs::write(path, text);
 }
 
-fn load_owned_winws_marker() -> Vec<u32> {
+fn load_owned_winws_marker() -> (ZapretEngine, Vec<u32>) {
     let path = owned_winws_marker_path();
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return (ZapretEngine::Classic, Vec::new());
     };
-    text.lines()
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default().trim();
+    let (engine, pid_lines): (ZapretEngine, Box<dyn Iterator<Item = &str>>) = match first {
+        "zapret2" => (ZapretEngine::Zapret2, Box::new(lines)),
+        "classic" => (ZapretEngine::Classic, Box::new(lines)),
+        _ => (
+            ZapretEngine::Classic,
+            Box::new(std::iter::once(first).chain(lines)),
+        ),
+    };
+    let pids = pid_lines
         .filter_map(|line| line.trim().parse::<u32>().ok())
         .filter(|pid| system_process::is_pid_running(*pid))
-        .collect()
+        .collect();
+    (engine, pids)
 }
 
 fn clear_owned_winws_marker() {
@@ -378,6 +520,25 @@ fn managed_zapret_script(preset: &crate::models::Preset) -> Result<PathBuf, Stri
     Ok(script_path)
 }
 
+fn zapret2_config_arguments(path: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read Zapret 2 preset {}: {error}", path.display()))?;
+    let arguments = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if arguments.is_empty() {
+        return Err(format!(
+            "Zapret 2 preset contains no options: {}",
+            path.display()
+        ));
+    }
+    Ok(arguments)
+}
+
 fn skip_update_check_line(line: &str) -> bool {
     let normalized = line
         .trim()
@@ -404,9 +565,9 @@ fn rewrite_winws_start_line(line: &str) -> Option<String> {
     Some(format!("rem zui: managed hidden winws launch\r\n{direct}"))
 }
 
-fn wait_for_owned_winws(before: &[u32]) -> Vec<u32> {
+fn wait_for_owned_process(process_name: &str, before: &[u32]) -> Vec<u32> {
     for _ in 0..20 {
-        let current = system_process::image_pids("winws.exe");
+        let current = system_process::image_pids(process_name);
         let owned: Vec<u32> = current
             .into_iter()
             .filter(|pid| !before.contains(pid))
@@ -417,6 +578,70 @@ fn wait_for_owned_winws(before: &[u32]) -> Vec<u32> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Vec::new()
+}
+
+fn ensure_no_foreign_zapret_processes(state: &Mutex<RuntimeState>) -> Result<(), String> {
+    let known = state.lock().unwrap().zapret_winws_pids.clone();
+    for process_name in ["winws.exe", "winws2.exe"] {
+        let foreign: Vec<u32> = system_process::image_pids(process_name)
+            .into_iter()
+            .filter(|pid| !known.contains(pid))
+            .collect();
+        if !foreign.is_empty() {
+            return Err(format!(
+                "Foreign {} is already running: PID {}. Stop it before starting ZUI.",
+                process_name,
+                foreign
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+const ZAPRET2_ENGINE_VERSION: &str = "1.0.4";
+
+fn validate_zapret2_resources(root: &Path) -> Result<(), String> {
+    for relative in [
+        "manifest.json",
+        "exe/winws2.exe",
+        "exe/cygwin1.dll",
+        "exe/WinDivert.dll",
+        "exe/WinDivert64.sys",
+        "lua/zapret-lib.lua",
+        "lua/zapret-antidpi.lua",
+    ] {
+        let path = root.join(relative);
+        if !path.exists() {
+            return Err(format!("Zapret 2 resource is missing: {}", path.display()));
+        }
+    }
+
+    let library = std::fs::read_to_string(root.join("lua").join("zapret-lib.lua"))
+        .map_err(|error| error.to_string())?;
+    if !library.contains("NFQWS2_COMPAT_VER_REQUIRED=6") {
+        return Err(format!(
+            "Zapret 2 Lua runtime is incompatible with engine v{ZAPRET2_ENGINE_VERSION}"
+        ));
+    }
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("manifest.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("invalid Zapret 2 manifest: {error}"))?;
+    if manifest
+        .get("engineVersion")
+        .and_then(|value| value.as_str())
+        != Some(ZAPRET2_ENGINE_VERSION)
+    {
+        return Err(format!(
+            "Zapret 2 manifest does not describe engine v{ZAPRET2_ENGINE_VERSION}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn start_tg_ws(
@@ -471,6 +696,7 @@ pub fn start_tg_ws(
     profile.tg_ws_host = host;
     profile.tg_ws_port = port;
     profile.tg_ws_secret = secret;
+    logging::set_tg_ws_log_max_mb(profile.tg_ws_log_max_mb);
     let handle = runtime::tg_ws::spawn(&profile)?;
 
     let status = ServiceStatus {
@@ -536,13 +762,23 @@ pub fn refresh_status(state: &Mutex<RuntimeState>) {
             state: ServiceState::Running,
             pid: pid.or_else(|| runtime.zapret_winws_pids.first().copied()),
             message: Some(if zapret_child_alive {
-                "preset process".into()
+                runtime
+                    .active_zapret_engine
+                    .map(|engine| format!("{} preset process", engine.display_name()))
+                    .unwrap_or_else(|| "preset process".into())
             } else {
-                "owned winws.exe".into()
+                format!(
+                    "owned {}",
+                    runtime
+                        .active_zapret_engine
+                        .unwrap_or(ZapretEngine::Classic)
+                        .process_name()
+                )
             }),
             error: None,
         }
     } else {
+        runtime.active_zapret_engine = None;
         ServiceStatus::stopped(ServiceName::Zapret)
     };
 
@@ -660,5 +896,92 @@ trait CommandExtHidden {
 impl CommandExtHidden for Command {
     fn creation_flags(&mut self, _flags: u32) -> &mut Self {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_start_zapret, validate_zapret2_resources, zapret2_config_arguments};
+    use crate::models::ZapretEngine;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_zapret2_config_without_shell_splitting() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zui preset with spaces {stamp}"));
+        std::fs::create_dir_all(&dir).expect("temp preset directory");
+        let path = dir.join("Default old.txt");
+        std::fs::write(
+            &path,
+            "# comment\n\n--lua-init=@lua/zapret-lib.lua\n--hostlist-domains=example.com\n",
+        )
+        .expect("temp preset");
+
+        let arguments = zapret2_config_arguments(&path).expect("parsed arguments");
+        assert_eq!(
+            arguments,
+            vec![
+                "--lua-init=@lua/zapret-lib.lua",
+                "--hostlist-domains=example.com"
+            ]
+        );
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn allows_tg_ws_only_when_zapret_is_not_configured() {
+        assert_eq!(should_start_zapret(true, None, None, true), Ok(false));
+        assert_eq!(
+            should_start_zapret(true, Some(ZapretEngine::Classic), None, true),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn rejects_unconfigured_zapret_without_tg_ws() {
+        assert_eq!(
+            should_start_zapret(true, None, None, false),
+            Err("No zapret engine selected".into())
+        );
+        assert_eq!(
+            should_start_zapret(true, Some(ZapretEngine::Classic), None, false),
+            Err("No zapret preset selected".into())
+        );
+    }
+
+    #[test]
+    fn starts_configured_zapret_with_or_without_tg_ws() {
+        assert_eq!(
+            should_start_zapret(
+                true,
+                Some(ZapretEngine::Zapret2),
+                Some("zapret2/preset"),
+                false
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            should_start_zapret(
+                true,
+                Some(ZapretEngine::Classic),
+                Some("classic/preset"),
+                true
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn bundled_zapret2_resources_match_the_supported_engine() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("resources")
+            .join("zapret2");
+        validate_zapret2_resources(&root).expect("bundled Zapret 2 resources");
     }
 }

@@ -12,7 +12,7 @@
   <a href="https://github.com/AmantesNihilo/zapret-universal-interface/releases">
     <img alt="Download" src="https://img.shields.io/badge/download-GitHub%20Releases-ff4fb8?style=for-the-badge">
   </a>
-  <img alt="Version" src="https://img.shields.io/badge/version-2.0.1-24c8db?style=for-the-badge">
+  <img alt="Version" src="https://img.shields.io/badge/version-2.1.1-24c8db?style=for-the-badge">
   <img alt="Windows" src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=for-the-badge">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-f0b83a?style=for-the-badge">
 </p>
@@ -61,13 +61,13 @@ ZUI - современная Windows-утилита для запуска `zapre
 
 | Файл                    | Что выбрать                                                                   |
 | --------------------------- | --------------------------------------------------------------------------------------- |
-| `ZUI_2.0.1_x64-setup.exe` | Рекомендуемый вариант для обычной установки      |
-| `ZUI_2.0.1_x64_en-US.msi` | MSI-пакет для ручной или корпоративной установки |
-| `ZUI_2.0.1_portable.zip`  | Portable-версия без установки                                         |
+| `ZUI_2.1.1_x64-setup.exe` | Рекомендуемый вариант для обычной установки      |
+| `ZUI_2.1.1_x64_en-US.msi` | MSI-пакет для ручной или корпоративной установки |
+| `ZUI_2.1.1_portable.zip`  | Portable-версия без установки                                         |
 | `SHA256SUMS.txt`          | Хэши для проверки целостности файлов                    |
 
 > [!TIP]
-> Если не знаете, что выбрать, скачивайте `ZUI_2.0.1_x64-setup.exe`.
+> Если не знаете, что выбрать, скачивайте `ZUI_2.1.1_x64-setup.exe`.
 
 ## Для кого это
 
@@ -95,7 +95,8 @@ ZUI подойдет, если вы:
 - запуск и остановка `zapret` из главного окна;
 - отдельные карточки `zapret` и `tg-ws`;
 - запуск только выбранных сервисов;
-- базовые пресеты из `Flowseal/zapret-discord-youtube`;
+- 21 Classic-пресет из `Flowseal/zapret-discord-youtube 1.10.1`;
+- 82 Zapret 2-пресета, включая 12 свежих профилей `klondike0x/zapret2-youtube-discord v1.0.6`;
 - подключение пользовательских папок с пресетами;
 - поиск, избранное и скрытие ненужных пресетов;
 - фильтрация служебных файлов вроде `service`, `blockcheck`, `utils`, `cygwin-admin`;
@@ -117,7 +118,7 @@ ZUI подойдет, если вы:
 
 ## Быстрый старт
 
-1. Скачайте и установите `ZUI_2.0.1_x64-setup.exe`.
+1. Скачайте и установите `ZUI_2.1.1_x64-setup.exe`.
 2. Запустите ZUI от имени администратора.
 3. Откройте `Настройки -> Проверки` и убедитесь, что ресурсы найдены.
 4. Запустите проверку пресетов и дождитесь результатов
@@ -177,7 +178,7 @@ ZUI тестирует только подходящие исполняемые 
 
 ## tg-ws
 
-В ZUI используется встроенный Rust-порт `tg-ws`, основанный на оригинальном проекте [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy).
+В ZUI используется встроенный Rust-порт [`tg-ws-proxy-rs` 2.2.5-zui.1](https://github.com/valnesfjord/tg-ws-proxy-rs), основанный на upstream 2.2.4 и сверенный с оригинальным [`Flowseal/tg-ws-proxy` 1.10.0](https://github.com/Flowseal/tg-ws-proxy).
 
 Что это дает:
 
@@ -185,6 +186,10 @@ ZUI тестирует только подходящие исполняемые 
 - отдельной иконки tg-ws в трее нет;
 - состояние контролируется самим ZUI;
 - secret отображается так, как будет использован при запуске;
+- перенесены desktop-настройки Flowseal: DC→IP, CF Proxy auto/custom, несколько Workers, socket buffer, WS pool, verbose/log limit и test DC;
+- CF Proxy/Worker можно реально проверить по DC 1/2/3/4/5/203 до запуска; Worker test отправляет MTProto-init через туннель;
+- доступны Cloudflare proxy/Worker fallback, балансировка и domain fronting;
+- исправлена передача больших Telegram media-файлов через Worker tunnel;
 - Telegram-ссылка доступна только когда proxy включен и готов.
 
 ## Системные требования
@@ -200,7 +205,7 @@ ZUI тестирует только подходящие исполняемые 
 
 ### Обычная версия
 
-1. Скачайте `ZUI_2.0.1_x64-setup.exe`.
+1. Скачайте `ZUI_2.1.1_x64-setup.exe`.
 2. Запустите установщик.
 3. Откройте ZUI.
 4. Проверьте вкладку `Настройки -> Проверки`.
@@ -209,7 +214,7 @@ ZUI тестирует только подходящие исполняемые 
 
 ### Portable-версия
 
-1. Скачайте `ZUI_2.0.1_portable.zip`.
+1. Скачайте `ZUI_2.1.1_portable.zip`.
 2. Распакуйте архив в отдельную папку.
 3. Запустите `ZUI.exe`.
 4. Оставьте `portable.flag` рядом с `ZUI.exe`, чтобы приложение работало в portable-режиме.
@@ -308,6 +313,7 @@ src/                       интерфейс на Svelte
 src-tauri/                 backend на Rust/Tauri
 crates/tg-ws-proxy-rs/     встроенный Rust-порт tg-ws
 resources/zapret/          базовые zapret-ресурсы и пресеты
+resources/zapret2/         bol-van/zapret2 1.0.4 и 70 config-пресетов
 static/                    скриншоты и статические ассеты frontend
 ```
 

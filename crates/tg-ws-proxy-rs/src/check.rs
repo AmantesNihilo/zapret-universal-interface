@@ -13,6 +13,12 @@
 //! means Cloudflare is correctly routing the WebSocket traffic to Telegram's
 //! DC 2 server and the domain is usable by the proxy.
 //!
+//! **CF Worker** — The Worker's WebSocket tunnel to DC 2 is opened *and* a
+//! 64-byte MTProto init is pushed through it.  The upgrade on its own says
+//! nothing: the Worker returns `101` before its TCP `connect()` to Telegram is
+//! known to have worked, so only the init — and the silence that should follow
+//! it — proves the far end is really a DC.
+//!
 //! **MTProto proxy (plain / 0xdd)** — A TCP connection is made and the
 //! 64-byte MTProto obfuscation handshake is sent.  A successful send verifies
 //! the proxy is reachable at the network level.
@@ -25,18 +31,54 @@
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
-use crate::config::{Config, MtProtoProxy, default_dc_ips};
-use crate::crypto::{ProtoTag, generate_client_handshake};
+use crate::config::{Config, MtProtoProxy, default_dc_ip};
+use crate::crypto::{self, ProtoTag, generate_client_handshake};
 use crate::faketls;
-use crate::ws_client::{connect_cf_worker_ws_for_dc, connect_cf_ws_for_dc};
+use crate::outbound::OutboundConnector;
+use crate::ws_client::{
+    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound, ws_recv, ws_send,
+};
 
 // ─── Probe result ─────────────────────────────────────────────────────────────
 
 enum ProbeStatus {
     Ok(Duration),
     Fail(String),
+}
+
+/// Telegram data centres checked by the original Flowseal desktop UI.
+pub const TELEGRAM_TEST_DCS: [u32; 6] = [1, 2, 3, 4, 5, 203];
+
+/// Structured connectivity result for GUI and other library consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectivityProbeResult {
+    pub dc: u32,
+    pub target: String,
+    pub ok: bool,
+    pub latency_ms: Option<u128>,
+    pub detail: String,
+}
+
+impl ConnectivityProbeResult {
+    fn from_status(dc: u32, target: String, status: ProbeStatus) -> Self {
+        match status {
+            ProbeStatus::Ok(duration) => Self {
+                dc,
+                target,
+                ok: true,
+                latency_ms: Some(duration.as_millis()),
+                detail: "WebSocket tunnel is usable".to_string(),
+            },
+            ProbeStatus::Fail(detail) => Self {
+                dc,
+                target,
+                ok: false,
+                latency_ms: None,
+                detail,
+            },
+        }
+    }
 }
 
 impl ProbeStatus {
@@ -66,9 +108,23 @@ impl ProbeStatus {
 /// DC 2 is used as a representative data-centre — if the domain is correctly
 /// configured in Cloudflare (`kws2.{domain}` A record, orange-cloud, Flexible
 /// SSL), this probe will succeed and other DCs should work too.
-async fn probe_cf_domain(domain: &str, skip_tls: bool, timeout: Duration) -> ProbeStatus {
+async fn probe_cf_domain_status(
+    domain: &str,
+    dc: u32,
+    skip_tls: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> ProbeStatus {
     let start = Instant::now();
-    let (ws, _) = connect_cf_ws_for_dc(2, &[domain.to_string()], false, skip_tls, timeout).await;
+    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+        dc,
+        &[domain.to_string()],
+        false,
+        skip_tls,
+        timeout,
+        outbound,
+    )
+    .await;
     if ws.is_some() {
         ProbeStatus::Ok(start.elapsed())
     } else {
@@ -78,21 +134,114 @@ async fn probe_cf_domain(domain: &str, skip_tls: bool, timeout: Duration) -> Pro
     }
 }
 
-/// Probe a Cloudflare Worker by opening its WebSocket tunnel to DC 2.
-async fn probe_cf_worker(domain: &str, skip_tls: bool, timeout: Duration) -> ProbeStatus {
-    let Some(dst) = default_dc_ips().get(&2).cloned() else {
-        return ProbeStatus::Fail("DC 2 default IP is missing".to_string());
+/// Test one Cloudflare proxy domain against every Telegram DC used by the
+/// Flowseal UI. Probes run concurrently so a failed domain costs one timeout,
+/// not six consecutive timeouts.
+pub async fn probe_cf_domain_all_dcs(
+    domain: &str,
+    skip_tls: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> Vec<ConnectivityProbeResult> {
+    let domain = domain.trim().to_string();
+    let probes = TELEGRAM_TEST_DCS.into_iter().map(|dc| {
+        let domain = domain.clone();
+        async move {
+            let target = format!("kws{dc}.{domain}:443/apiws");
+            let status = probe_cf_domain_status(&domain, dc, skip_tls, timeout, outbound).await;
+            ConnectivityProbeResult::from_status(dc, target, status)
+        }
+    });
+    futures_util::future::join_all(probes).await
+}
+
+/// How long the Worker probe waits for its tunnel to be torn down before
+/// calling it healthy.
+///
+/// Telegram answers the 64-byte init with silence — it only speaks once the
+/// client sends a request — so silence *is* the success signal here and the
+/// probe can only wait it out.  Long enough to cover a Worker round trip plus
+/// the DC handshake, short enough that `--check` stays interactive.
+const WORKER_TUNNEL_SETTLE: Duration = Duration::from_secs(3);
+
+/// Probe a Cloudflare Worker by opening its WebSocket tunnel to DC 2 and
+/// pushing a real MTProto init through it.
+///
+/// The WebSocket upgrade alone proves nothing about the tunnel: Cloudflare
+/// answers `101` from the Worker script itself, before — and regardless of
+/// whether — its `connect()` to the Telegram DC ever succeeds.  A Worker that
+/// cannot reach Telegram therefore passed this check while every real client
+/// through it died instantly (#93).  Sending the init and watching for a
+/// close is what tells the two apart.
+async fn probe_cf_worker_status(
+    domain: &str,
+    dc: u32,
+    skip_tls: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> ProbeStatus {
+    let Some(dst) = default_dc_ip(dc) else {
+        return ProbeStatus::Fail(format!("DC {dc} default IP is missing"));
     };
 
     let start = Instant::now();
-    let ws = connect_cf_worker_ws_for_dc(domain, &dst, 2, false, skip_tls, timeout).await;
-    if ws.is_some() {
-        ProbeStatus::Ok(start.elapsed())
-    } else {
-        ProbeStatus::Fail(
+    let ws = connect_cf_worker_ws_for_dc_with_outbound(
+        domain, dst, dc, false, skip_tls, timeout, outbound,
+    )
+    .await;
+    let Some(mut ws) = ws else {
+        return ProbeStatus::Fail(
             "Worker WebSocket tunnel failed — check Worker code and domain".to_string(),
-        )
+        );
+    };
+
+    let relay_init = crypto::generate_relay_init(ProtoTag::Intermediate, dc as i16);
+    if let Err(e) = ws_send(&mut ws, relay_init.to_vec()).await {
+        return ProbeStatus::Fail(format!("Worker tunnel closed on send: {}", e));
     }
+
+    // Everything the user cares about timing has happened by now; the settle
+    // wait below is a fixed cost of the probe, not latency of the tunnel, and
+    // reporting it would make every healthy Worker look three seconds slow.
+    let elapsed = start.elapsed();
+
+    // Anything arriving here is the tunnel dying: either a close frame, or a
+    // stray payload from something on `dst:443` that is not a Telegram DC.
+    match tokio::time::timeout(WORKER_TUNNEL_SETTLE, ws_recv(&mut ws)).await {
+        Err(_) => ProbeStatus::Ok(elapsed),
+        Ok(None) => ProbeStatus::Fail(format!(
+            "Worker tunnel to {} closed immediately — the Worker cannot reach Telegram \
+             (check its live logs in the Cloudflare dashboard)",
+            dst
+        )),
+        Ok(Some(data)) => ProbeStatus::Fail(format!(
+            "Worker tunnel to {} answered the MTProto init with {} unexpected bytes — \
+             the far end is not a Telegram DC",
+            dst,
+            data.len()
+        )),
+    }
+}
+
+/// Test one Cloudflare Worker against all Telegram DCs. Besides WebSocket
+/// upgrade, each probe sends a real MTProto init through the Worker tunnel.
+pub async fn probe_cf_worker_all_dcs(
+    domain: &str,
+    skip_tls: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> Vec<ConnectivityProbeResult> {
+    let domain = domain.trim().to_string();
+    let probes = TELEGRAM_TEST_DCS.into_iter().map(|dc| {
+        let domain = domain.clone();
+        async move {
+            let destination = default_dc_ip(dc).unwrap_or("unknown");
+            let target = format!("{domain}:443/apiws?dst={destination}&dc={dc}&media=0");
+            let status = probe_cf_worker_status(&domain, dc, skip_tls, timeout, outbound).await;
+            ConnectivityProbeResult::from_status(dc, target, status)
+        }
+    });
+    futures_util::future::join_all(probes).await
 }
 
 /// Probe an MTProto proxy (plain or FakeTLS) by connecting and sending the
@@ -101,31 +250,25 @@ async fn probe_cf_worker(domain: &str, skip_tls: bool, timeout: Duration) -> Pro
 /// For FakeTLS proxies the probe also drains the server's fake TLS handshake,
 /// verifying end-to-end protocol negotiation.  For plain proxies a successful
 /// TCP connect + handshake send is sufficient to confirm reachability.
-async fn probe_mtproto_proxy(proxy: &MtProtoProxy, timeout: Duration) -> ProbeStatus {
+async fn probe_mtproto_proxy(
+    proxy: &MtProtoProxy,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> ProbeStatus {
     let secret = match hex::decode(&proxy.secret) {
         Ok(b) => b,
         Err(e) => return ProbeStatus::Fail(format!("invalid hex secret: {}", e)),
     };
 
-    let is_faketls = secret.len() > 17 && secret[0] == 0xee;
-    let key_bytes: &[u8] = if secret.len() >= 17 && matches!(secret[0], 0xdd | 0xee) {
-        &secret[1..17]
-    } else {
-        &secret
-    };
+    let key_bytes = crypto::secret_key(&secret);
+    let faketls_hostname = crypto::faketls_hostname(&secret);
 
     let start = Instant::now();
 
     // ── TCP connect ───────────────────────────────────────────────────────
-    let stream = match tokio::time::timeout(
-        timeout,
-        TcpStream::connect(format!("{}:{}", proxy.host, proxy.port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return ProbeStatus::Fail(format!("TCP connect failed: {}", e)),
-        Err(_) => return ProbeStatus::Fail("TCP connect timed out".to_string()),
+    let stream = match outbound.connect(&proxy.host, proxy.port, timeout).await {
+        Ok(s) => s,
+        Err(e) => return ProbeStatus::Fail(format!("TCP connect failed: {}", e)),
     };
     let _ = stream.set_nodelay(true);
 
@@ -134,13 +277,10 @@ async fn probe_mtproto_proxy(proxy: &MtProtoProxy, timeout: Duration) -> ProbeSt
         generate_client_handshake(key_bytes, 2, ProtoTag::PaddedIntermediate);
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    if is_faketls {
+    if let Some(hostname) = faketls_hostname {
         // ── FakeTLS path ──────────────────────────────────────────────────
-        let hostname = match std::str::from_utf8(&secret[17..]) {
-            Ok(h) => h,
-            Err(_) => {
-                return ProbeStatus::Fail("FakeTLS secret contains non-UTF-8 hostname".to_string());
-            }
+        let Ok(hostname) = std::str::from_utf8(hostname) else {
+            return ProbeStatus::Fail("FakeTLS secret contains non-UTF-8 hostname".to_string());
         };
 
         let mut client_hello = faketls::build_faketls_client_hello(hostname);
@@ -195,6 +335,19 @@ fn proxy_kind(proxy: &MtProtoProxy) -> &'static str {
 /// Prints a human-readable report to stdout.  Returns `true` when every probe
 /// passed so that the caller can exit with the appropriate status code.
 pub async fn run_check(config: &Config) -> bool {
+    let outbound = match config.outbound_connector() {
+        Ok(outbound) => outbound,
+        Err(e) => {
+            eprintln!("Invalid outbound proxy configuration: {e}");
+            return false;
+        }
+    };
+    run_check_with_outbound(config, &outbound).await
+}
+
+/// Same as [`run_check`], but uses a pre-built outbound connector so callers
+/// can share proxy configuration across runtime components.
+pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnector) -> bool {
     let cf_timeout = Duration::from_secs(config.cf_connect_timeout);
     let upstream_timeout = Duration::from_secs(config.upstream_connect_timeout);
     let skip_tls = config.skip_tls_verify;
@@ -229,7 +382,7 @@ pub async fn run_check(config: &Config) -> bool {
             // Flush so the user sees the label before the potentially slow probe.
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_cf_domain(domain, skip_tls, cf_timeout).await;
+            let status = probe_cf_domain_status(domain, 2, skip_tls, cf_timeout, outbound).await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {
@@ -242,12 +395,11 @@ pub async fn run_check(config: &Config) -> bool {
     if !cf_worker_domains.is_empty() {
         println!();
         println!("Cloudflare Worker domains (DC2 TCP tunnel probe):");
-
         for domain in cf_worker_domains {
             print!("  {:40}  ... ", domain);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_cf_worker(&domain, skip_tls, cf_timeout).await;
+            let status = probe_cf_worker_status(domain, 2, skip_tls, cf_timeout, outbound).await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {
@@ -266,7 +418,7 @@ pub async fn run_check(config: &Config) -> bool {
             print!("  {:40}  ... ", label);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_mtproto_proxy(proxy, upstream_timeout).await;
+            let status = probe_mtproto_proxy(proxy, upstream_timeout, outbound).await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {

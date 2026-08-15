@@ -1,0 +1,15 @@
+* text=auto
+
+# Keep source and Unix tooling portable across Windows checkouts.
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.svelte text eol=lf
+
+# Bundled upstream payloads, lists and executables must remain byte-for-byte.
+resources/** -text

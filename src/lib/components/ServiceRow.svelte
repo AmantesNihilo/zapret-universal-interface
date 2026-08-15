@@ -35,7 +35,13 @@
   const running = $derived(status.state === "running");
 </script>
 
-<section class:enabled class:running class="service-row">
+<section
+  class:enabled
+  class:running
+  class:busy-state={status.state === "starting" || status.state === "stopping"}
+  class:error-state={status.state === "error"}
+  class="service-row"
+>
   <button
     class="service-icon"
     class:telegram={kind === "tg-ws"}

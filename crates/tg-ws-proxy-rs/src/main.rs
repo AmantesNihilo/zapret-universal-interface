@@ -22,56 +22,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
-// ── File-descriptor budget helpers ───────────────────────────────────────────
-
-/// Read the soft per-process open-file limit from `/proc/self/limits` (Linux).
-/// Falls back to 1 024 on other platforms or when the file cannot be parsed.
-fn soft_nofile_limit() -> usize {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(content) = std::fs::read_to_string("/proc/self/limits") {
-            for line in content.lines() {
-                // Example line:
-                //   Max open files            1024                 4096                 files
-                if line.starts_with("Max open files") {
-                    if let Some(soft_str) = line.split_whitespace().nth(3) {
-                        if soft_str == "unlimited" {
-                            return usize::MAX;
-                        }
-                        if let Ok(n) = soft_str.parse::<usize>() {
-                            return n;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    1024 // conservative fallback for non-Linux or parse failures
-}
-
-/// Compute a safe default for the maximum number of concurrent connections
-/// given the system FD limit and pool configuration.
-///
-/// FD budget:
-///   1 (listener) + pool_size × dc_buckets × 2 (idle + one refill per bucket)
-///   + 32 (Tokio runtime, stdio, safety margin)
-///   + max_connections × 2 (one client socket + one outbound socket per conn)
-///
-/// Rearranging for max_connections:
-///   max_connections = (fd_limit − reserved) / 2
-fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) -> usize {
-    if fd_limit == usize::MAX {
-        // Unlimited FDs: cap at a large but sane value.
-        return 512;
-    }
-
-    let reserved = 1 + pool_size * dc_buckets * 2 + 32;
-
-    (fd_limit.saturating_sub(reserved) / 2).max(4)
-}
-
-use tg_ws_proxy_rs::{check, config::Config, default_domains, pool::WsPool, proxy};
+use tg_ws_proxy_rs::limits::{auto_max_connections, soft_nofile_limit};
+use tg_ws_proxy_rs::{
+    check, config::Config, default_domains, pool::WsPool, proxy, runtime::Runtime,
+};
 
 #[tokio::main]
 async fn main() {
@@ -80,6 +34,17 @@ async fn main() {
         .expect("failed to install rustls ring CryptoProvider");
 
     let mut config = Config::from_args();
+    let outbound = match config.outbound_connector() {
+        Ok(outbound) => outbound,
+        Err(e) => {
+            eprintln!("invalid outbound proxy config: {e}");
+            std::process::exit(2);
+        }
+    };
+    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
+        config.fronting_domain.clone(),
+        Duration::from_secs(config.fronting_cooldown),
+    ));
 
     // ── Logging ──────────────────────────────────────────────────────────
     let log_level = if config.quiet {
@@ -124,7 +89,8 @@ async fn main() {
     // the same fetched list.
     if config.default_domains {
         info!("Fetching default CF proxy domain list from GitHub…");
-        let fetched = default_domains::fetch_default_domains().await;
+        let fetched =
+            default_domains::fetch_default_domains_with_outbound(runtime.outbound()).await;
         info!("  Got {} default CF domain(s)", fetched.len());
         config.cf_domains.extend(fetched);
     }
@@ -134,12 +100,13 @@ async fn main() {
     // results, then exit.  This lets the user verify their configuration
     // before starting the proxy server.
     if config.check {
-        let all_ok = check::run_check(&config).await;
+        let all_ok = check::run_check_with_outbound(&config, runtime.outbound()).await;
         std::process::exit(if all_ok { 0 } else { 1 });
     }
 
     // ── Bind the server socket ────────────────────────────────────────────
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
+    let bind_host = config.bind_host();
+    let addr: SocketAddr = format!("{}:{}", bind_host, config.port)
         .parse()
         .expect("invalid listen address");
 
@@ -173,7 +140,7 @@ async fn main() {
     };
 
     // ── Print startup banner ──────────────────────────────────────────────
-    let secret = config.secret.as_deref().unwrap_or("");
+    let secret = config.primary_secret();
 
     let link_host = config.link_host();
     let tg_link = format!(
@@ -184,8 +151,11 @@ async fn main() {
     );
 
     info!("{}", "=".repeat(60));
-    info!("  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs)");
-    info!("  Listening on   {}:{}", config.host, config.port);
+    info!(
+        "  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs v{})",
+        env!("CARGO_PKG_VERSION")
+    );
+    info!("  Listening on   {}:{}", bind_host, config.port);
     info!("  Secret:        {}", secret);
     if let Some(domain) = config.listen_faketls_domain() {
         info!("  Inbound mode:   FakeTLS ee (SNI: {})", domain);
@@ -219,7 +189,7 @@ async fn main() {
     let cf_worker_domains = config.cf_worker_domains();
     if !cf_worker_domains.is_empty() {
         info!("  Cloudflare Worker domain(s):");
-        for domain in &cf_worker_domains {
+        for domain in cf_worker_domains {
             info!("    {}", domain);
         }
     }
@@ -231,6 +201,27 @@ async fn main() {
         }
     }
 
+    if let Some(summary) = runtime.outbound().summary() {
+        info!("  Outbound proxy: {}", summary);
+    }
+
+    if let Some(domain) = runtime.fronting_domain() {
+        if dc_redirects.is_empty() {
+            warn!(
+                "  ⚠  --fronting-domain {} has no effect: no --dc-ip is configured. \
+                 Fronting only applies to a direct connection to a DC's real IP \
+                 (matching upstream tg-ws-proxy) — it is never used for CF proxy, \
+                 CF Worker, or upstream MTProto proxy connections.",
+                domain
+            );
+        } else {
+            info!(
+                "  Domain fronting: enabled (SNI {}, sticky for {}s after success)",
+                domain, config.fronting_cooldown
+            );
+        }
+    }
+
     info!(
         "  Max connections: {} (fd-limit: {})",
         max_connections, fd_limit
@@ -238,31 +229,45 @@ async fn main() {
     info!("{}", "=".repeat(60));
     info!("  Telegram proxy link (use this on all devices):");
     info!("    {}", tg_link);
+    if config.secrets.len() > 1 {
+        info!("  Additional per-user proxy links:");
+        for secret in &config.secrets[1..] {
+            let link_secret = config.link_secret_for(secret);
+            info!(
+                "    tg://proxy?server={}&port={}&secret={}",
+                link_host, config.port, link_secret
+            );
+        }
+    }
 
-    if link_host != config.host {
+    if link_host != bind_host {
         info!(
             "  ℹ  Link uses auto-detected IP {}. \
              Use --link-ip <IP> to override.",
             link_host
         );
-    } else if matches!(config.host.as_str(), "127.0.0.1" | "::1") {
+    } else if matches!(bind_host.as_str(), "127.0.0.1" | "::1") {
         warn!(
             "  ⚠  Link shows {} — only the local machine can use this link. \
              Run with --host 0.0.0.0 (or --link-ip <router-LAN-IP>) \
              so other devices on the network can connect.",
-            config.host
+            bind_host
         );
     }
     info!("{}", "=".repeat(60));
 
     // ── Connection pool warm-up ───────────────────────────────────────────
-    let pool = Arc::new(WsPool::new(
+    let pool = Arc::new(WsPool::with_runtime(
         config.pool_size,
         Duration::from_secs(config.pool_max_age),
+        Arc::clone(&runtime),
     ));
+    // Shared for the rest of the process: every connection reads the same
+    // settings, so they are behind one `Arc` instead of a per-connection clone.
+    let config = Arc::new(config);
     {
         let pool_clone = pool.clone();
-        let config_clone = config.clone();
+        let config_clone = Arc::clone(&config);
         tokio::spawn(async move {
             pool_clone.warmup(&config_clone).await;
         });
@@ -286,13 +291,14 @@ async fn main() {
 
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                let cfg = config.clone();
+                let cfg = Arc::clone(&config);
                 let pool = pool.clone();
+                let runtime = Arc::clone(&runtime);
                 tokio::spawn(async move {
                     // Hold the permit for the lifetime of this connection so
                     // it is released (and the slot freed) when the task ends.
                     let _permit = permit;
-                    proxy::handle_client(stream, peer_addr, cfg, pool).await;
+                    proxy::handle_client_with_runtime(stream, peer_addr, cfg, pool, runtime).await;
                 });
             }
             Err(e) => {
