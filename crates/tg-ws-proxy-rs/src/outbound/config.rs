@@ -1,13 +1,27 @@
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 
 use ipnet::IpNet;
 use percent_encoding::percent_decode_str;
-use proxyvars::NoProxy;
 use url::Url;
 
 pub(super) struct OutboundConfig {
     pub proxy: Option<ProxyConfig>,
     pub no_proxy: Option<NoProxy>,
+}
+
+pub(super) struct NoProxy {
+    matchers: Vec<NoProxyMatcher>,
+}
+
+enum NoProxyMatcher {
+    Address(IpAddr, u16),
+    Network(IpNet),
+    Host {
+        suffix: String,
+        port: u16,
+        include_apex: bool,
+    },
+    Wildcard,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,13 +65,103 @@ impl OutboundConfig {
             }
             no_proxy_source
                 .filter(|no_proxy| !no_proxy.is_empty())
-                .map(NoProxy::from)
+                .map(|no_proxy| NoProxy::from_validated(&no_proxy))
         } else {
             None
         };
 
         Ok(Self { proxy, no_proxy })
     }
+}
+
+impl NoProxy {
+    pub(super) fn from_validated(raw: &str) -> Self {
+        let matchers = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(parse_no_proxy_matcher)
+            .collect();
+        Self { matchers }
+    }
+
+    pub fn matches(&self, target_host: &str, target_port: u16) -> bool {
+        let host = target_host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(target_host);
+        let target_ip = host.parse::<IpAddr>().ok();
+
+        if target_ip.is_some_and(|ip| ip.is_loopback()) {
+            return true;
+        }
+
+        self.matchers.iter().any(|matcher| match matcher {
+            NoProxyMatcher::Address(ip, port) => {
+                Some(*ip) == target_ip && (*port == 0 || *port == target_port)
+            }
+            NoProxyMatcher::Network(network) => target_ip.is_some_and(|ip| network.contains(&ip)),
+            NoProxyMatcher::Host {
+                suffix,
+                port,
+                include_apex,
+            } => (*port == 0 || *port == target_port) && host_matches(host, suffix, *include_apex),
+            NoProxyMatcher::Wildcard => true,
+        })
+    }
+}
+
+fn parse_no_proxy_matcher(entry: &str) -> NoProxyMatcher {
+    if entry == "*" {
+        return NoProxyMatcher::Wildcard;
+    }
+    if let Ok(network) = entry.parse::<IpNet>() {
+        return NoProxyMatcher::Network(network);
+    }
+
+    let (host, port) = if let Some(bracketed) = entry.strip_prefix('[') {
+        let end = bracketed.find(']').expect("validated bracketed IPv6");
+        let host = &bracketed[..end];
+        let rest = &bracketed[end + 1..];
+        let port = rest
+            .strip_prefix(':')
+            .map(|port| port.parse().expect("validated NO_PROXY port"))
+            .unwrap_or(0);
+        (host, port)
+    } else if entry.contains(':') {
+        let (host, port) = entry.rsplit_once(':').expect("validated host:port");
+        (host, port.parse().expect("validated NO_PROXY port"))
+    } else {
+        (entry, 0)
+    };
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return NoProxyMatcher::Address(ip, port);
+    }
+
+    let (suffix, include_apex) = host
+        .strip_prefix("*.")
+        .or_else(|| host.strip_prefix('.'))
+        .map_or((host, true), |suffix| (suffix, false));
+    NoProxyMatcher::Host {
+        suffix: suffix.to_string(),
+        port,
+        include_apex,
+    }
+}
+
+fn host_matches(host: &str, suffix: &str, include_apex: bool) -> bool {
+    if include_apex && host.eq_ignore_ascii_case(suffix) {
+        return true;
+    }
+    let Some(start) = host.len().checked_sub(suffix.len()) else {
+        return false;
+    };
+    start > 0
+        && host.as_bytes().get(start - 1) == Some(&b'.')
+        && host
+            .get(start..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 impl ProxyConfig {
@@ -120,18 +224,6 @@ pub(super) fn authority(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
-}
-
-pub(super) fn http_host(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    }
-}
-
-pub(super) fn target_url(host: &str, port: u16) -> String {
-    format!("https://{}", authority(host, port))
 }
 
 fn default_port(kind: ProxyKind) -> u16 {

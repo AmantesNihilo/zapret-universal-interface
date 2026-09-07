@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.1.1",
+    [string]$Version = "2.2.0",
     [string]$TargetDir = "",
     [string]$OutputDir = ""
 )
@@ -33,7 +33,10 @@ foreach ($path in @($tempZip, $portableZip)) {
 
 New-Item -ItemType Directory -Path $stage | Out-Null
 Copy-Item -LiteralPath (Join-Path $target "zui.exe") -Destination (Join-Path $stage "ZUI.exe")
-Copy-Item -LiteralPath (Join-Path $target "resources") -Destination (Join-Path $stage "resources") -Recurse
+$stageResources = Join-Path $stage "resources"
+New-Item -ItemType Directory -Path $stageResources | Out-Null
+Copy-Item -LiteralPath (Join-Path $root "resources\zapret") -Destination (Join-Path $stageResources "zapret") -Recurse
+Copy-Item -LiteralPath (Join-Path $root "resources\zapret2") -Destination (Join-Path $stageResources "zapret2") -Recurse
 New-Item -ItemType File -Path (Join-Path $stage "portable.flag") | Out-Null
 
 $data = Join-Path $stage "data"
@@ -92,6 +95,7 @@ $settings = @{
     minimizeBehavior = "taskbar"
     minimizeDontAsk = $false
     startWithWindows = $false
+    startWithWindowsInTray = $true
     autoStartActiveProfileOnLaunch = $false
     checkUpdatesOnLaunch = $true
     customPresetRoots = @()

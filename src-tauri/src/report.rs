@@ -2,9 +2,10 @@ use crate::models::LogSource;
 use crate::state::RuntimeState;
 use crate::{diagnostics, logging, paths, presets, profiles, services};
 use std::sync::Mutex;
+use tauri::AppHandle;
 
-pub fn collect(state: &Mutex<RuntimeState>) -> Result<String, String> {
-    services::refresh_status(state);
+pub fn collect(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<String, String> {
+    services::refresh_status(app, state);
 
     let app_state;
     let settings;
@@ -60,7 +61,7 @@ pub fn collect(state: &Mutex<RuntimeState>) -> Result<String, String> {
         format!(
             "tg_ws={:?} message={} error={}",
             app_state.tg_ws.state,
-            app_state.tg_ws.message.unwrap_or_default(),
+            redact_proxy_secrets(&app_state.tg_ws.message.unwrap_or_default()),
             app_state.tg_ws.error.unwrap_or_default()
         ),
         format!("owned_winws_pids={}", join_pids(&owned_winws_pids)),
@@ -73,6 +74,11 @@ pub fn collect(state: &Mutex<RuntimeState>) -> Result<String, String> {
         format!(
             "auto_start_active_profile_on_launch={}",
             settings.auto_start_active_profile_on_launch
+        ),
+        format!("start_with_windows={}", settings.start_with_windows),
+        format!(
+            "start_with_windows_in_tray={}",
+            settings.start_with_windows_in_tray
         ),
         format!("custom_preset_roots={}", settings.custom_preset_roots.len()),
         String::new(),
@@ -127,7 +133,24 @@ pub fn collect(state: &Mutex<RuntimeState>) -> Result<String, String> {
         ));
     }
 
-    Ok(lines.join("\n"))
+    Ok(redact_proxy_secrets(&lines.join("\n")))
+}
+
+fn redact_proxy_secrets(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remainder = value;
+    while let Some(secret_start) = remainder.find("secret=") {
+        let value_start = secret_start + "secret=".len();
+        output.push_str(&remainder[..value_start]);
+        output.push_str("<redacted>");
+        let value_end = remainder[value_start..]
+            .find(|character: char| character == '&' || character.is_whitespace())
+            .map(|offset| value_start + offset)
+            .unwrap_or(remainder.len());
+        remainder = &remainder[value_end..];
+    }
+    output.push_str(remainder);
+    output
 }
 
 fn join_pids(pids: &[u32]) -> String {
@@ -151,4 +174,29 @@ fn timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     now.as_secs().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn support_report_redacts_telegram_proxy_secret() {
+        assert_eq!(
+            redact_proxy_secrets(
+                "127.0.0.1:1443 tg://proxy?server=127.0.0.1&port=1443&secret=deadbeef"
+            ),
+            "127.0.0.1:1443 tg://proxy?server=127.0.0.1&port=1443&secret=<redacted>"
+        );
+    }
+
+    #[test]
+    fn support_report_redacts_every_secret_in_old_log_lines() {
+        assert_eq!(
+            redact_proxy_secrets(
+                "first secret=deadbeef&x=1\nsecond tg://proxy?server=localhost&secret=cafebabe"
+            ),
+            "first secret=<redacted>&x=1\nsecond tg://proxy?server=localhost&secret=<redacted>"
+        );
+    }
 }

@@ -110,7 +110,7 @@ fn load_preferences() -> Result<HashMap<String, PresetPreferences>, String> {
 fn save_preferences(preferences: &HashMap<String, PresetPreferences>) -> Result<(), String> {
     paths::ensure_data_layout().map_err(|error| error.to_string())?;
     let text = serde_json::to_string_pretty(preferences).map_err(|error| error.to_string())?;
-    std::fs::write(paths::preset_preferences_path(), text).map_err(|error| error.to_string())
+    json_storage::write_atomic(&paths::preset_preferences_path(), text.as_bytes())
 }
 
 fn visit_classic_dir(root: &Path, dir: &Path, presets: &mut Vec<Preset>) -> Result<(), String> {
@@ -314,7 +314,7 @@ fn is_service_script(path: &Path) -> bool {
     )
 }
 
-fn stable_id(engine: ZapretEngine, path: &PathBuf) -> String {
+fn stable_id(engine: ZapretEngine, path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     if engine == ZapretEngine::Zapret2 {
         engine.hash(&mut hasher);

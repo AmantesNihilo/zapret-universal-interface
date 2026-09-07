@@ -3,7 +3,10 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-tg-ws-proxy-rs
-PKG_VERSION:=$(if $(TG_PACKAGE_VERSION),$(TG_PACKAGE_VERSION),2.2.4)
+ifeq ($(strip $(TG_PACKAGE_VERSION)),)
+$(error TG_PACKAGE_VERSION is required; use openwrt/build-luci-package.sh)
+endif
+PKG_VERSION:=$(TG_PACKAGE_VERSION)
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=Lyedok

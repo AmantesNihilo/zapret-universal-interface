@@ -35,3 +35,7 @@ logs/
 /image/ROADMAP/
 .DS_Store
 Thumbs.db
+
+# Keep project/research notes local. README is the only public Markdown file.
+*.md
+!/README.md

@@ -7,5 +7,7 @@
 
 mod config;
 mod connector;
+#[cfg(test)]
+mod tests;
 
 pub use connector::{OutboundConnector, OutboundError};

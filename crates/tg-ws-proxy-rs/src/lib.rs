@@ -8,5 +8,9 @@ pub mod outbound;
 pub mod pool;
 pub mod proxy;
 pub mod runtime;
+pub mod server;
 pub mod splitter;
 pub mod ws_client;
+
+/// Version of the embedded engine, kept in one place for library consumers.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

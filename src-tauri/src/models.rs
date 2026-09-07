@@ -13,6 +13,7 @@ pub struct Settings {
     pub minimize_behavior: MinimizeBehavior,
     pub minimize_dont_ask: bool,
     pub start_with_windows: bool,
+    pub start_with_windows_in_tray: bool,
     pub auto_start_active_profile_on_launch: bool,
     pub check_updates_on_launch: bool,
     pub custom_preset_roots: Vec<String>,
@@ -31,6 +32,7 @@ impl Default for Settings {
             minimize_behavior: MinimizeBehavior::Taskbar,
             minimize_dont_ask: false,
             start_with_windows: false,
+            start_with_windows_in_tray: true,
             auto_start_active_profile_on_launch: false,
             check_updates_on_launch: true,
             custom_preset_roots: Vec::new(),
@@ -274,7 +276,7 @@ impl ServiceStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServiceName {
     Zapret,
@@ -372,18 +374,13 @@ pub enum TestMode {
     All,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TestRecommendation {
     Recommended,
     Partial,
+    #[default]
     NotRecommended,
-}
-
-impl Default for TestRecommendation {
-    fn default() -> Self {
-        Self::NotRecommended
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

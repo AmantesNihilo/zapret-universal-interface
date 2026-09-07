@@ -2,3 +2,22 @@
 /dist
 /openwrt/files/tg-ws-proxy
 .DS_Store
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/build-logic/build/
+android/build-logic/.gradle/
+android/build-logic/.kotlin/
+android/local.properties
+android/.idea/
+android/.kotlin/
+android/keystore.properties
+# Signing keys never belong in the tree: an Android release key is permanent —
+# lose it and no existing install can ever be updated again, publish it and
+# anyone can ship an update users' phones will accept.
+*.jks
+*.keystore
+*.iml
+android/captures/

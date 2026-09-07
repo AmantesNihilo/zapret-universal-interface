@@ -1,5 +1,5 @@
 use crate::state::RuntimeState;
-use crate::{logging, services, settings};
+use crate::{logging, services};
 use std::sync::Mutex;
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -11,8 +11,8 @@ const MENU_TURN_OFF: &str = "tray_turn_off";
 const MENU_SETTINGS: &str = "tray_settings";
 const MENU_QUIT: &str = "tray_quit";
 
-pub fn setup(app: &mut App) -> tauri::Result<()> {
-    let labels = TrayLabels::new(settings::load_settings().unwrap_or_default().language);
+pub fn setup(app: &mut App, language: &str) -> tauri::Result<()> {
+    let labels = TrayLabels::new(language);
     let menu = MenuBuilder::new(app)
         .text(MENU_SHOW, labels.show)
         .separator()
@@ -80,7 +80,7 @@ struct TrayLabels {
 }
 
 impl TrayLabels {
-    fn new(language: String) -> Self {
+    fn new(language: &str) -> Self {
         if language == "ru" {
             Self {
                 show: "Открыть ZUI",

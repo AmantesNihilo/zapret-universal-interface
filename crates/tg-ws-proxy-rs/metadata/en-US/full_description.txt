@@ -1,0 +1,25 @@
+<p><strong>Telegram MTProto WebSocket Bridge Proxy</strong> — a Rust <strong>vibecoded</strong> port of
+<a href="https://github.com/Flowseal/tg-ws-proxy">Flowseal/tg-ws-proxy</a>.</p>
+<p>Listens for Telegram Desktop&#39;s MTProto connections on a local port and
+tunnels them through WebSocket (TLS) connections to Telegram&#39;s DC servers.</p>
+<p>Telegram channel: <a href="https://t.me/tg_ws_proxy_rs">@tg<u>ws</u>proxy_rs</a>.</p>
+<pre><code>Telegram Desktop → MTProto (TCP 1443) → tg-ws-proxy-rs → WS (TLS 443) → Telegram DC
+                                                         ↘ CF proxy (kws{N}.{cf-domain}) → Telegram DC  (WS via Cloudflare)
+                                                         ↘ CF Worker (*.workers.dev) → Telegram DC  (TCP tunnel via Cloudflare)
+                                                         ↘ upstream MTProto proxy → Telegram DC  (WS fallback)
+                                                         ↘ direct TCP :443 → Telegram DC          (last resort)
+</code></pre>
+<h2>Android app</h2>
+<p>A minimal Jetpack Compose wrapper around the same core the CLI runs. Type the
+flags you would pass to <code>tg-ws-proxy</code>, tap <strong>Start</strong>, and when the <code>tg://proxy</code>
+link appears tap it (or let the app open it) to add the proxy in Telegram.</p>
+<p>The listen address should be <code>127.0.0.1</code> so Telegram on the same phone can
+connect.</p>
+<p>Add <code>--secret &lt;32 hex chars&gt;</code> if you want the link to stay the same across
+restarts. <code>--log-file</code> is ignored; logs go to the on-screen view and logcat
+(<code>tg-ws-proxy</code>).</p>
+<p>The default arguments carry <code>--quiet</code>, so the on-screen <strong>Log</strong> panel stays
+empty until you remove it. That is the default and not a failed start: drop
+<code>--quiet</code> (or swap it for <code>--verbose</code>) before tapping <strong>Start</strong> to see log
+lines. The <code>tg://</code> link appears either way — it reaches the UI from the listen
+callback rather than by scraping the log, so <code>--quiet</code> never hides it.</p>

@@ -30,7 +30,7 @@ $missing = @($references | Where-Object {
 })
 Assert-True ($missing.Count -eq 0) "Missing Zapret 2 resources: $($missing -join ', ')"
 
-$flowseal = Join-Path $ProjectRoot 'resources\zapret\flowseal\1.10.1'
+$flowseal = Join-Path $ProjectRoot 'resources\zapret\flowseal\1.10.2'
 $flowManifest = Get-Content (Join-Path $flowseal 'zui-manifest.json') -Raw | ConvertFrom-Json
 $flowPresets = @(Get-ChildItem $flowseal -File -Filter 'general*.bat')
 Assert-True ($flowPresets.Count -eq [int]$flowManifest.presetCount) "Flowseal preset count mismatch: disk=$($flowPresets.Count), manifest=$($flowManifest.presetCount)"

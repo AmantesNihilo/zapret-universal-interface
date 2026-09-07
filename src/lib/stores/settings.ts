@@ -12,6 +12,7 @@ export const settings = writable<Settings>({
   minimizeBehavior: "taskbar",
   minimizeDontAsk: false,
   startWithWindows: false,
+  startWithWindowsInTray: true,
   autoStartActiveProfileOnLaunch: false,
   checkUpdatesOnLaunch: true,
   customPresetRoots: [],

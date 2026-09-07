@@ -8,7 +8,7 @@ VERSION=''
 FORMAT=''
 
 usage() {
-    printf 'Usage: %s --sdk PATH --version PACKAGE_VERSION --format apk|ipk [--output PATH]\n' "$0"
+    printf 'Usage: %s --sdk PATH [--version PACKAGE_VERSION] --format apk|ipk [--output PATH]\n' "$0"
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -23,6 +23,9 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 [[ -n "$SDK" && -d "$SDK" ]] || { printf 'error: valid --sdk is required\n' >&2; exit 1; }
+if [[ -z "$VERSION" ]]; then
+    VERSION="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$ROOT/Cargo.toml")"
+fi
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((_beta[0-9]+)|(~beta\.[0-9]+))?$ ]] || {
     printf 'error: invalid package version: %s\n' "$VERSION" >&2
     exit 1
@@ -39,10 +42,10 @@ shopt -s nullglob
 old_packages=("$SDK"/bin/packages/*/*/luci-app-tg-ws-proxy-rs*."$FORMAT")
 ((${#old_packages[@]} == 0)) || rm -f "${old_packages[@]}"
 
+export TG_PACKAGE_VERSION="$VERSION"
 make -C "$SDK" defconfig >/dev/null
 make -C "$SDK" package/luci-app-tg-ws-proxy-rs/clean >/dev/null
-make -C "$SDK" package/luci-app-tg-ws-proxy-rs/compile \
-    TG_PACKAGE_VERSION="$VERSION"
+make -C "$SDK" package/luci-app-tg-ws-proxy-rs/compile
 
 packages=("$SDK"/bin/packages/*/*/luci-app-tg-ws-proxy-rs*."$FORMAT")
 [[ "${#packages[@]}" -eq 1 ]] || {

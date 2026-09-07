@@ -27,10 +27,10 @@ pub fn push(
     let _ = append_file(&line);
     {
         let mut runtime = state.lock().unwrap();
-        runtime.logs.push(line.clone());
-        if runtime.logs.len() > 500 {
-            runtime.logs.remove(0);
+        if runtime.logs.len() >= 500 {
+            runtime.logs.drain(..100);
         }
+        runtime.logs.push(line.clone());
     }
     let _ = app.emit("log_line", line);
 }
@@ -75,20 +75,23 @@ pub fn load_recent(limit: usize) -> Vec<LogLine> {
 }
 
 fn append_file(line: &LogLine) -> Result<(), String> {
-    paths::ensure_data_layout().map_err(|error| error.to_string())?;
     let file_name = match line.source {
         LogSource::App => "app.log",
         LogSource::Zapret => "zapret.log",
         LogSource::TgWs => "tg-ws.log",
         LogSource::Tests => "tests.log",
     };
-    let path = paths::logs_dir().join(file_name);
+    let logs_dir = paths::logs_dir();
+    if !logs_dir.is_dir() {
+        std::fs::create_dir_all(&logs_dir).map_err(|error| error.to_string())?;
+    }
+    let path = logs_dir.join(file_name);
     if matches!(line.source, LogSource::TgWs)
         && std::fs::metadata(&path)
             .map(|metadata| metadata.len() >= TG_WS_LOG_MAX_BYTES.load(Ordering::Relaxed))
             .unwrap_or(false)
     {
-        let backup = paths::logs_dir().join("tg-ws.log.1");
+        let backup = logs_dir.join("tg-ws.log.1");
         if backup.exists() {
             let _ = std::fs::remove_file(&backup);
         }

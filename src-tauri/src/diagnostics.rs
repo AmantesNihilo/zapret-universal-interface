@@ -11,8 +11,13 @@ pub fn collect(state: Option<&Mutex<RuntimeState>>) -> Diagnostics {
     let logs_path = paths::logs_dir();
     let presets = presets::discover_presets().unwrap_or_default();
     let profile = profiles::active_profile().ok();
-    let winws_running = system_process::is_running("winws.exe");
-    let winws2_running = system_process::is_running("winws2.exe");
+    let zapret_processes = system_process::running_processes_by_names(&["winws.exe", "winws2.exe"]);
+    let winws_running = zapret_processes
+        .iter()
+        .any(|process| process.image.eq_ignore_ascii_case("winws.exe"));
+    let winws2_running = zapret_processes
+        .iter()
+        .any(|process| process.image.eq_ignore_ascii_case("winws2.exe"));
     let tg_ws_running = state
         .map(|state| {
             state

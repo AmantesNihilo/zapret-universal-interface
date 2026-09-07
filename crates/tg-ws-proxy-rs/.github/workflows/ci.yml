@@ -5,10 +5,53 @@ on:
     branches:
       - main
       - master
-      - feature/**
     tags:
       - v[0-9]+.*
   pull_request:
+
+# `feature/**` is deliberately absent from the push list. Every feature branch
+# here gets a PR as soon as it exists, and `pull_request` already rebuilds on
+# every push to a branch with an open PR, so listing it above only made each
+# push run the whole workflow twice over the same commit -- and since the
+# android-emulator matrix that bill is two NDK installs, two Rust
+# cross-compiles and two emulator boots.
+#
+# Dropping the trigger rather than folding the pair into one concurrency group:
+# a group deduplicates by starting both runs and letting the second cancel the
+# first, and GitHub does not order the `push` and `pull_request synchronize`
+# webhooks. Two pushes in quick succession can interleave so that the survivor
+# is the `push` run, leaving the PR showing a cancelled `CI` check that nothing
+# will re-run -- which blocks the PR outright wherever a job here is a required
+# status check.
+#
+# What this costs: a feature branch with no PR open yet gets no CI at all.
+# Opening the PR runs the full workflow on it, so the gap closes the moment the
+# branch is proposed for merge. release-version is unaffected -- it compares
+# against the base branch only for `pull_request` and validates the tag only
+# for tag pushes, and a push to a branch was already its "skipped" case.
+concurrency:
+  # Only pull_request runs share a group, keyed on the PR, so successive pushes
+  # to a PR branch supersede each other. Every other run -- default branch,
+  # release tag -- gets a group of exactly one, named after its own run id: a
+  # run on a merged or tagged commit is the record for that commit, and the one
+  # place a result is consulted later, so cancelling it halfway would leave a
+  # missing check on it. A group nothing else can ever join is what makes that
+  # unconditional. A cancel-in-progress condition would not be: a same-repo PR
+  # opened from `main` for a back-merge has head_ref `main`, so a branch-keyed
+  # group would put it alongside a push to `main` and cancel it.
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'pull_request'
+    && format('pr-{0}', github.event.pull_request.number)
+    || format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
+# The floor for every job below; raise it on a single job if one ever needs
+# more. Nothing here touches the API: `contents` covers checkout and the
+# base-branch fetch in release-version, and that is the whole list. This is
+# also the workflow that runs third-party actions and shells out to rustup and
+# cargo, so it is the one where the ambient token should be smallest.
+permissions:
+  contents: read
 
 jobs:
   release-version:
@@ -73,10 +116,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          toolchain="$(sed -n -E 's/^channel = "(.+)"/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           components: clippy
+          toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
 
       - name: Clippy
         run: cargo clippy --all-targets --locked
@@ -86,6 +138,471 @@ jobs:
 
       - name: Release build
         run: cargo build --release --locked
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Four invariants that no artifact in this workflow can show is broken.
+      # Each is a single token, each was a deliberate decision, and dropping any
+      # one of them leaves every other check in this file green: the APK still
+      # builds, R8 still keeps the callbacks, the emulator still starts the
+      # proxy and passes traffic. The damage only appears on a real phone, or
+      # never visibly at all. So they are asserted against the sources, up front
+      # and before the NDK build, because there is no later point at which their
+      # absence becomes observable.
+      #
+      # Asserted by parsing, not by matching source lines, wherever the
+      # invariant survives reformatting: an XML reindent, an attribute reorder,
+      # a rustfmt or ktlint pass are all legitimate edits that must not turn
+      # this red, and a check that breaks on them gets deleted rather than
+      # fixed. Where a numeric literal is compared it is compared against a
+      # range, so tuning the value stays possible and only removing it fails.
+      #
+      # python3 rather than a series of greps: half of these are XML attributes,
+      # and a single interpreter also means the step runs no pipeline at all,
+      # which is how it stays clear of the `grep -q` SIGPIPE trap documented at
+      # length in the packaged JNI symbol check below.
+      # Invariants no artifact in this workflow can show are broken: dropping any
+      # one leaves every other check green while the damage shows up only on a
+      # real phone. Asserted against the sources, before the NDK build, because
+      # there is no later point at which their absence becomes observable.
+      - name: Check the Android source invariants
+        shell: bash
+        run: python3 .github/scripts/check-android-invariants.py
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Performs the Gradle wrapper JAR checksum validation on every run.
+      #
+      # Held at v4 while the artifact and cache actions move on: release.yml
+      # sets Gradle up the same way, and the point of this job is that what it
+      # builds is what the release builds. Bump both together or neither.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # The runner images ship a single NDK and bump it without notice, which
+      # silently changes the toolchain used to cross-compile the native library.
+      # The version lives in android/gradle/libs.versions.toml and is read
+      # here, by the convention plugin, and by the F-Droid recipe; the
+      # sdkmanager install is a no-op when the version is already present.
+      - name: Install pinned Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk="$(sed -n -E 's/^ndk = "(.+)"/\1/p' android/gradle/libs.versions.toml)"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          toolchain="$(sed -n -E 's/^channel = "(.+)"/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+          workspaces: . -> target
+
+      # assembleDebug exercises the NDK cross-compile + packaging path,
+      # assembleRelease additionally runs R8, which is where the NativeProxy
+      # keep rules get checked. The .so is release-built for both.
+      - name: Build debug and release APKs
+        working-directory: android
+        shell: bash
+        run: ./gradlew :app:assembleDebug :app:assembleRelease
+
+      # Both ways the ABI splits can misfire are silent: a splits block that
+      # stopped applying still yields one perfectly valid fat APK, and a split
+      # for an ABI that was never cross-compiled still yields a perfectly valid
+      # APK whose lib/ is empty. Neither fails the build, both fail on a user's
+      # device, so assert the shape here. Keep the ABI list in sync with
+      # AndroidAbi.defaultAbis in android/build-logic.
+      - name: Check the split APK set
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          abis=(arm64-v8a armeabi-v7a x86_64)
+          want_universal="$(printf '%s\n' "${abis[@]}" | sort)"
+          for build_type in debug release; do
+            out="app/build/outputs/apk/$build_type"
+            # AGP appends -unsigned when no keystore is configured, so read the
+            # names AGP actually wrote rather than guessing at the suffix.
+            mapfile -t apks < <(jq -r '.elements[].outputFile' "$out/output-metadata.json")
+            if [[ "${#apks[@]}" -ne $(( ${#abis[@]} + 1 )) ]]; then
+              echo "::error::$build_type: expected $(( ${#abis[@]} + 1 )) APKs, got ${#apks[@]}: ${apks[*]}"
+              exit 1
+            fi
+            for abi in "${abis[@]}" universal; do
+              apk=""
+              for candidate in "${apks[@]}"; do
+                [[ "$candidate" == "app-$abi-$build_type.apk" || "$candidate" == "app-$abi-$build_type-unsigned.apk" ]] &&
+                  apk="$candidate"
+              done
+              if [[ -z "$apk" ]]; then
+                echo "::error::$build_type: no APK for $abi: ${apks[*]}"
+                exit 1
+              fi
+              want="$abi"
+              [[ "$abi" == universal ]] && want="$want_universal"
+              got="$({ unzip -Z1 "$out/$apk" 'lib/*/libtg_ws_proxy_jni.so' || true; } | cut -d/ -f2 | sort)"
+              if [[ "$got" != "$want" ]]; then
+                echo "::error::$out/$apk carries libtg_ws_proxy_jni.so for" \
+                  "[$(tr '\n' ' ' <<<"$got")], expected [$(tr '\n' ' ' <<<"$want")]"
+                exit 1
+              fi
+            done
+          done
+
+      # A JNI entry point is bound by name at the first call, not at link time,
+      # so the Kotlin package and the Rust `Java_...` symbols are a contract
+      # nothing in the build path enforces. Rename one side only and the app
+      # still compiles, packages, installs and starts — then dies with an
+      # UnsatisfiedLinkError the moment someone taps Start. That is precisely
+      # the failure the io.github.valnesfjord.tgwsproxyrs rename risked, so
+      # derive the names the runtime will look for from the namespace and check
+      # them against the .so that actually shipped.
+      - name: Check the packaged JNI symbols
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          namespace="$(sed -n 's/^ *namespace *= *"\(.*\)"$/\1/p' app/build.gradle.kts)"
+          if [[ ! "$namespace" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$ ]]; then
+            echo "::error file=android/app/build.gradle.kts::could not read a package" \
+              "name out of the android.namespace line, got '$namespace'"
+            exit 1
+          fi
+
+          # JNI's mangling, in the order the spec applies it: a literal '_'
+          # inside a package or class name becomes '_1', and only then does '.'
+          # become '_'. Escaping the separators first would mangle them too.
+          # The current package has no '_' left, which was the point of the
+          # rename — keeping the rule here is what makes this check correct
+          # rather than accidentally right if the package ever grows one back.
+          mangled="${namespace//_/_1}"
+          mangled="${mangled//./_}"
+
+          out=app/build/outputs/apk/release
+          # The universal APK carries every ABI, so one unzip covers all three
+          # .so files. The step above already asserted this file exists under
+          # one of the two names AGP picks depending on the signing config.
+          apk=""
+          while read -r candidate; do
+            [[ "$candidate" == "app-universal-release.apk" ||
+               "$candidate" == "app-universal-release-unsigned.apk" ]] && apk="$candidate"
+          done < <(jq -r '.elements[].outputFile' "$out/output-metadata.json")
+          if [[ -z "$apk" ]]; then
+            echo "::error::$out holds no universal release APK"
+            exit 1
+          fi
+
+          work="$(mktemp -d)"
+          # unzip exits 11 when the pattern matches nothing, which is a real
+          # failure here but a bare exit code as a message; let it through so
+          # the check below can name what is actually wrong.
+          unzip -q "$out/$apk" 'lib/*/libtg_ws_proxy_jni.so' -d "$work" || [[ "$?" -eq 11 ]]
+
+          libs=("$work"/lib/*/libtg_ws_proxy_jni.so)
+          if [[ "${#libs[@]}" -eq 0 ]]; then
+            echo "::error::$out/$apk carries no libtg_ws_proxy_jni.so"
+            exit 1
+          fi
+
+          for so in "${libs[@]}"; do
+            # readelf and not nm: this runner is x86_64 and two of the three
+            # libraries are not. GNU nm goes through BFD, which is configured
+            # per host and need not recognise a foreign architecture; readelf
+            # parses the ELF itself and reads every target. It is preinstalled,
+            # so this also needs no NDK path.
+            #
+            # .dynsym and not .symtab: [profile.release] sets strip = true, so
+            # .symtab is gone — and .dynsym is what the dynamic linker resolves
+            # against anyway, which makes it the table that decides whether the
+            # app works.
+            #
+            # Collected into a file rather than fed to each `grep -q` down a
+            # pipe, for the same reason as the dex extraction below: `grep -q`
+            # exits at the first match, and the SIGPIPE that kills the writer
+            # still mid-list fails the pipeline under `set -o pipefail`. That
+            # inverts to "symbol missing" for a symbol that is right there —
+            # a red release build over a library that is perfectly fine. An
+            # empty file still fails every grep below, so nothing here can
+            # pass by finding nothing.
+            readelf -W --dyn-syms "$so" |
+              awk '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" { print $8 }' \
+              > "$work/exported"
+            for entry in nativeStart nativeStop nativeIsRunning; do
+              want="Java_${mangled}_NativeProxy_${entry}"
+              if ! grep -Fxq -- "$want" "$work/exported"; then
+                echo "::error::${so#"$work"/} does not export $want;" \
+                  "crates/android-jni/src/android.rs must follow $namespace"
+                grep -F -- 'Java_' "$work/exported" ||
+                  echo "  (the library exports no Java_ symbol at all)"
+                exit 1
+              fi
+            done
+
+            # JNI_OnLoad caches the callback class by name (NATIVE_CLASS_NAME in
+            # crates/android-jni/src/android.rs), which the symbol names above
+            # cannot cover: a stale literal there passes every check so far and
+            # then fails on the device, at load, with a ClassNotFoundException.
+            # -F like every other grep here: the needle is a package path, and
+            # only the namespace validation above keeps its dots from being
+            # regex wildcards. That check is not this check's job to rely on.
+            if ! grep -qaF -- "$(tr . / <<<"$namespace")/NativeProxy" "$so"; then
+              echo "::error::${so#"$work"/} has no NATIVE_CLASS_NAME matching $namespace"
+              exit 1
+            fi
+          done
+
+          # R8 keeps the four Kotlin callbacks only because proguard-rules.pro
+          # names the class — spelled out as a string, so it is a third place
+          # the package name has to reach. assembleRelease succeeds with a stale
+          # rule; the app then starts, binds every symbol above, and silently
+          # never delivers a log line or a tg:// link.
+          #
+          # Extracted to a file rather than piped into grep: `grep -q` exits on
+          # the first match, and the SIGPIPE that gives unzip would fail the
+          # pipeline under `set -o pipefail` on success.
+          unzip -p "$out/$apk" 'classes*.dex' > "$work/classes.dex"
+          for callback in onNativeLog onNativeListening onNativeError onNativeStopped; do
+            if ! grep -qa -- "$callback" "$work/classes.dex"; then
+              echo "::error::$out/$apk: R8 stripped $callback;" \
+                "check app/proguard-rules.pro against $namespace"
+              exit 1
+            fi
+          done
+
+      # The globs need no change for the splits: they already take every APK in
+      # each directory, which is now four instead of one.
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apks
+          if-no-files-found: error
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*.apk
+
+  # The `android` job proves the app builds; this one proves it runs. Nobody
+  # working on the app necessarily owns a phone, so without an emulator the two
+  # most expensive failure modes ship unnoticed: a JNI symbol that no longer
+  # matches the Kotlin package (which builds, installs, and dies at the first
+  # Start) and a nativeStop() that blocks its caller into an ANR.
+  android-emulator:
+    runs-on: ubuntu-latest
+    # A hung emulator otherwise sits until the six-hour job limit.
+    timeout-minutes: 45
+    strategy:
+      # An API 26 hiccup must not hide the API 36 result, and vice versa.
+      fail-fast: false
+      matrix:
+        include:
+          # The minSdk floor, and the only level that runs ProxyService's
+          # pre-O notification-channel and pre-34 foreground-service-type
+          # branches.
+          - api-level: 26
+            target: default
+          # targetSdk: specialUse foreground-service enforcement and the
+          # POST_NOTIFICATIONS request path.
+          - api-level: 36
+            target: google_apis
+    env:
+      # The emulator is x86_64 and x86_64 is in AndroidAbi.defaultAbis, so the
+      # tests exercise the same library CI ships — but cross-compiling the two
+      # ABIs this job can never install would roughly triple its cargo time.
+      # Set at job level, not per step, because the emulator step re-enters
+      # Gradle: a value set on only one of the two would change the packaged
+      # ABI set between the build and the run.
+      TG_ANDROID_ABIS: x86_64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Same pin, and the same reasoning, as the `android` job above: the
+      # version lives only in android/gradle/libs.versions.toml.
+      - name: Install pinned Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk="$(sed -n -E 's/^ndk = "(.+)"/\1/p' android/gradle/libs.versions.toml)"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          toolchain="$(sed -n -E 's/^channel = "(.+)"/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
+
+      # A separate cache key from the `android` job: this one only ever builds
+      # the x86_64 target, so sharing would make each job evict the other's.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-emulator
+          workspaces: . -> target
+
+      # Built before the emulator boots rather than inside the emulator step,
+      # so the cargo cross-compile does not run with an idle emulator burning
+      # the job's wall clock beside it.
+      - name: Build the app and test APKs
+        working-directory: android
+        shell: bash
+        run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
+
+      # The hosted runners have /dev/kvm but do not expose it to the runner
+      # user. Without this the emulator silently falls back to software
+      # virtualisation: minutes to boot instead of seconds, and markedly
+      # flakier once it is up.
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Caching the AVD keeps the system-image download and the cold first boot
+      # off the common path; a cache miss just makes the run slower.
+      # No AVD snapshot cache here, deliberately. The usual recipe boots a
+      # throwaway emulator once, caches ~/.android/avd, and restores it on later
+      # runs to save the ~2 minutes an AVD takes to create. The first run that
+      # actually restored one hung: API 26 came up from the snapshot and never
+      # finished the suite, burning the full 45-minute timeout, while API 36
+      # restored fine. Older system images under `-gpu swiftshader_indirect` do
+      # not reliably survive a snapshot taken by a different emulator process.
+      #
+      # Two minutes a leg is the wrong thing to optimise when the failure mode
+      # is a 45-minute hang that says nothing about the code. Each run now
+      # creates its AVD from scratch, which is also the only way this job's
+      # result means the same thing on every run.
+
+      # `script:` below has to name the package to ask the device about, and
+      # output-metadata.json is where AGP records the id it actually built.
+      # Read here rather than there because the emulator runner splits `script`
+      # on newlines and runs each line as its own `sh -c`, so nothing set on
+      # one line survives to the next.
+      - name: Read the debug applicationId
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=app/build/outputs/apk/debug
+          # Assigned first, not inlined into the echo: a command substitution
+          # that fails inside another command leaves `set -e` nothing to catch,
+          # and APP_ID=null would only surface as an empty `pm path` later.
+          app_id="$(jq -er '.applicationId' "$out/output-metadata.json")"
+          echo "APP_ID=$app_id" >> "$GITHUB_ENV"
+
+      # The suite and the APK pull live in a script file, not in `script:`
+      # below. The runner wraps each line it is given in `sh -c "<line>"`, so a
+      # line with double quotes of its own -- which `adb pull "$(adb shell pm
+      # path ...)"` cannot avoid -- is cut short at the first inner quote. The
+      # file also puts `set -euo pipefail` around both commands rather than
+      # leaving a failed suite's visibility to the action's execution model.
+      - name: Run instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: ${{ matrix.target }}
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          working-directory: android
+          script: bash ../.github/scripts/run-connected-tests.sh
+
+      # The splits leave the debug variant with two installable outputs --
+      # app-x86_64-debug.apk and app-universal-debug.apk -- and AGP, not this
+      # workflow, picks between them. Only the split runs the per-ABI packaging
+      # path that "Check the packaged JNI symbols" over in the `android` job
+      # exists to protect; a green run against the universal APK would mean the
+      # emulator never loaded the artifact those assertions were about, and
+      # nothing would say so. Identify the installed APK by hash, so this
+      # names a file rather than trusting one.
+      - name: Check which APK the tests ran against
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=app/build/outputs/apk/debug
+          want="$(sha256sum "$RUNNER_TEMP/installed.apk" | cut -d' ' -f1)"
+          matched=()
+          while read -r candidate; do
+            [[ "$(sha256sum "$out/$candidate" | cut -d' ' -f1)" == "$want" ]] &&
+              matched+=("$candidate")
+          done < <(jq -r '.elements[].outputFile' "$out/output-metadata.json")
+          if [[ "${#matched[@]}" -eq 0 ]]; then
+            echo "::error::the tests installed an APK this build did not" \
+              "produce (sha256 $want), expected app-x86_64-debug.apk"
+            exit 1
+          fi
+          echo "connectedDebugAndroidTest ran against: ${matched[*]}"
+          if [[ "${matched[*]}" != "app-x86_64-debug.apk" ]]; then
+            echo "::error::the tests installed ${matched[*]}, expected" \
+              "app-x86_64-debug.apk — the per-ABI split is the packaging this" \
+              "job exists to load on a device"
+            exit 1
+          fi
+
+      # The Gradle failure message names the test but not why it failed; the
+      # HTML report carries the assertion text and the logcat excerpt, which is
+      # the difference between "flaky" and "diagnosable".
+      #
+      # The device logs are separate because the report has nothing to say when
+      # the instrumentation process dies natively -- and a JNI shim is exactly
+      # the kind of code that dies that way. run-connected-tests.sh collects
+      # them while the emulator is still alive.
+      - name: Upload the connected test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-test-report-api${{ matrix.api-level }}
+          if-no-files-found: warn
+          path: android/app/build/reports/androidTests/connected/**
+
+      - name: Upload the device logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-device-logs-api${{ matrix.api-level }}
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/device-logs/**
 
   openwrt:
     runs-on: ubuntu-latest
@@ -101,7 +618,7 @@ jobs:
         run: |
           shellcheck -s sh install.sh openwrt/luci-app/root/etc/init.d/tg-ws-proxy-rs \
             openwrt/luci-app/root/etc/uci-defaults/95_luci-tg-ws-proxy-rs
-          shellcheck -s bash openwrt/build-luci-package.sh openwrt/tests/*.sh
+          shellcheck -s bash .github/scripts/*.sh openwrt/build-luci-package.sh openwrt/tests/*.sh
 
       - name: Check LuCI JavaScript and JSON
         run: |

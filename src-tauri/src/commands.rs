@@ -12,8 +12,8 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
-pub fn get_app_state(state: State<Mutex<RuntimeState>>) -> AppState {
-    services::refresh_status(&state);
+pub fn get_app_state(app: AppHandle, state: State<Mutex<RuntimeState>>) -> AppState {
+    services::refresh_status(&app, &state);
     state.lock().unwrap().app_state.clone()
 }
 
@@ -217,10 +217,11 @@ fn log_tg_ws_test(app: &AppHandle, label: &str, result: &Result<TgWsConnectivity
 
 #[tauri::command]
 pub fn get_service_status(
+    app: AppHandle,
     state: State<Mutex<RuntimeState>>,
     service: ServiceName,
 ) -> ServiceStatus {
-    services::refresh_status(&state);
+    services::refresh_status(&app, &state);
     let runtime = state.lock().unwrap();
     match service {
         ServiceName::Zapret => runtime.app_state.zapret.clone(),
@@ -388,7 +389,7 @@ pub async fn get_diagnostics(app: AppHandle) -> Diagnostics {
     let thread_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = thread_app.state::<Mutex<RuntimeState>>();
-        services::refresh_status(&state);
+        services::refresh_status(&thread_app, &state);
         diagnostics::collect(Some(&state))
     })
     .await
@@ -398,7 +399,7 @@ pub async fn get_diagnostics(app: AppHandle) -> Diagnostics {
 #[tauri::command]
 pub fn collect_support_report(app: AppHandle) -> Result<String, String> {
     let state = app.state::<Mutex<RuntimeState>>();
-    let report = report::collect(&state)?;
+    let report = report::collect(&app, &state)?;
     logging::push(
         &app,
         &state,

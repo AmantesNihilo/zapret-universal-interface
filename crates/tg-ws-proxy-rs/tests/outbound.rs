@@ -355,6 +355,10 @@ async fn no_proxy_wildcard_bypasses_configured_proxy() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows may permit binding ::1 but block the matching client connect"
+)]
 async fn no_proxy_ipv6_port_bypasses_configured_proxy() {
     let Ok((target, target_task)) = ipv6_one_shot_server(b"direct").await else {
         return;

@@ -41,7 +41,7 @@ pub fn start_active_profile(
     };
 
     if !profile.zapret_enabled && !profile.tg_ws_enabled {
-        refresh_status(state);
+        refresh_status(app, state);
         logging::push(
             app,
             state,
@@ -101,7 +101,7 @@ pub fn start_active_profile(
         }
     }
 
-    refresh_status(state);
+    refresh_status(app, state);
     if let Err(error) = power_intent::remember_started(&profile_id) {
         logging::push(
             app,
@@ -157,7 +157,7 @@ pub fn restore_owned_processes(app: &AppHandle, state: &Mutex<RuntimeState>) {
         runtime.zapret_winws_pids = owned;
         runtime.active_zapret_engine = Some(engine);
     }
-    refresh_status(state);
+    refresh_status(app, state);
     let recovered = state.lock().unwrap().zapret_winws_pids.clone();
     write_owned_winws_marker(engine, &recovered);
     logging::push(
@@ -205,7 +205,7 @@ pub fn stop_active_profile(
     if let Err(error) = stop_zapret(app, state) {
         errors.push(error);
     }
-    refresh_status(state);
+    refresh_status(app, state);
     logging::push(app, state, LogSource::App, "Profile stopped");
     emit_state(app, state);
     if errors.is_empty() {
@@ -223,25 +223,48 @@ pub fn start_zapret(
     state: &Mutex<RuntimeState>,
     preset_id: String,
 ) -> Result<ServiceStatus, String> {
-    refresh_status(state);
-    if {
+    refresh_status(app, state);
+    let already_running = {
         let runtime = state.lock().unwrap();
         runtime.zapret_child.is_some() || !runtime.zapret_winws_pids.is_empty()
-    } {
+    };
+    if already_running {
         return Ok(state.lock().unwrap().app_state.zapret.clone());
     }
 
-    let preset = presets::find_preset(&preset_id)?;
+    let preset = presets::find_preset(&preset_id).map_err(|error| {
+        logged_start_failure(app, state, LogSource::Zapret, "preset lookup", error)
+    })?;
     match preset.engine {
         ZapretEngine::Classic if !matches!(preset.kind, PresetKind::Bat | PresetKind::Cmd) => {
-            return Err("Selected Classic preset is not executable".into());
+            return Err(logged_start_failure(
+                app,
+                state,
+                LogSource::Zapret,
+                "preset validation",
+                "Selected Classic preset is not executable",
+            ));
         }
         ZapretEngine::Zapret2 if !matches!(preset.kind, PresetKind::Config) => {
-            return Err("Selected Zapret 2 preset is not a config".into());
+            return Err(logged_start_failure(
+                app,
+                state,
+                LogSource::Zapret,
+                "preset validation",
+                "Selected Zapret 2 preset is not a config",
+            ));
         }
         _ => {}
     }
-    ensure_no_foreign_zapret_processes(state)?;
+    ensure_no_foreign_zapret_processes(state).map_err(|error| {
+        logged_start_failure(
+            app,
+            state,
+            LogSource::Zapret,
+            "process conflict check",
+            error,
+        )
+    })?;
     let process_name = preset.engine.process_name();
     let process_before = system_process::image_pids(process_name);
 
@@ -250,15 +273,24 @@ pub fn start_zapret(
         state,
         LogSource::Zapret,
         format!(
-            "Starting {} preset: {}",
+            "Launch requested: engine={}, preset={}, preset_id={}",
             preset.engine.display_name(),
-            preset.relative_path
+            preset.relative_path,
+            preset.id,
         ),
     );
 
-    let mut command = match preset.engine {
+    let (mut command, launch_summary) = match preset.engine {
         ZapretEngine::Classic => {
-            let launch_path = managed_zapret_script(&preset)?;
+            let launch_path = managed_zapret_script(&preset).map_err(|error| {
+                logged_start_failure(
+                    app,
+                    state,
+                    LogSource::Zapret,
+                    "Classic script preparation",
+                    error,
+                )
+            })?;
             let launch_dir = Path::new(&preset.path)
                 .parent()
                 .unwrap_or_else(|| Path::new("."));
@@ -269,54 +301,119 @@ pub fn start_zapret(
                 .arg("/C")
                 .arg(&launch_path)
                 .current_dir(launch_dir);
-            command
+            let summary = format!(
+                "launcher=cmd.exe, script={}, working_dir={}, target={}",
+                launch_path.display(),
+                launch_dir.display(),
+                process_name
+            );
+            (command, summary)
         }
         ZapretEngine::Zapret2 => {
             let root = paths::resources_zapret2_dir();
-            validate_zapret2_resources(&root)?;
+            validate_zapret2_resources(&root).map_err(|error| {
+                logged_start_failure(
+                    app,
+                    state,
+                    LogSource::Zapret,
+                    "Zapret 2 resource validation",
+                    error,
+                )
+            })?;
             let executable = root.join("exe").join("winws2.exe");
             if !executable.exists() {
-                return Err(format!("winws2.exe not found: {}", executable.display()));
+                return Err(logged_start_failure(
+                    app,
+                    state,
+                    LogSource::Zapret,
+                    "Zapret 2 executable validation",
+                    format!("winws2.exe not found: {}", executable.display()),
+                ));
             }
+            let arguments = zapret2_config_arguments(Path::new(&preset.path)).map_err(|error| {
+                logged_start_failure(
+                    app,
+                    state,
+                    LogSource::Zapret,
+                    "Zapret 2 config parsing",
+                    error,
+                )
+            })?;
+            let summary = format!(
+                "executable={}, working_dir={}, option_count={}, options={}",
+                executable.display(),
+                root.display(),
+                arguments.len(),
+                arguments.join(" ")
+            );
             let mut command = Command::new(executable);
-            command
-                .args(zapret2_config_arguments(Path::new(&preset.path))?)
-                .current_dir(root);
-            command
+            command.args(arguments).current_dir(root);
+            (command, summary)
         }
     };
+    logging::push(
+        app,
+        state,
+        LogSource::Zapret,
+        format!("Launch preflight passed: {launch_summary}"),
+    );
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(0x08000000);
 
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = command.spawn().map_err(|error| {
+        logged_start_failure(
+            app,
+            state,
+            LogSource::Zapret,
+            "process creation",
+            describe_process_error(process_name, &error),
+        )
+    })?;
     let pid = child.id();
-    let mut owned_winws = wait_for_owned_process(process_name, &process_before);
-    if preset.engine == ZapretEngine::Zapret2 {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            let mut details = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_string(&mut details);
-            }
-            if details.trim().is_empty() {
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_string(&mut details);
-                }
-            }
-            return Err(format!(
-                "winws2.exe exited during startup ({status}){}",
-                if details.trim().is_empty() {
+    logging::push(
+        app,
+        state,
+        LogSource::Zapret,
+        format!("Launcher process created: PID {pid}"),
+    );
+    let mut owned_winws = if preset.engine == ZapretEngine::Zapret2 {
+        vec![pid]
+    } else {
+        wait_for_owned_process(process_name, &process_before)
+    };
+    if let Some(status) = child.try_wait().map_err(|error| {
+        logged_start_failure(app, state, LogSource::Zapret, "startup status check", error)
+    })? {
+        if preset.engine == ZapretEngine::Zapret2 || owned_winws.is_empty() {
+            let details = read_child_output(&mut child);
+            let message = format!(
+                "{} exited during startup ({status}){}",
+                process_name,
+                if details.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", details.trim())
+                    format!(": {details}")
                 }
+            );
+            return Err(logged_start_failure(
+                app,
+                state,
+                LogSource::Zapret,
+                "early process exit",
+                message,
             ));
         }
     }
-    if preset.engine == ZapretEngine::Zapret2 && !owned_winws.contains(&pid) {
-        owned_winws.push(pid);
+    if preset.engine == ZapretEngine::Classic && owned_winws.is_empty() {
+        logging::push(
+            app,
+            state,
+            LogSource::Zapret,
+            "Classic launcher is alive, but winws.exe was not detected within 2 seconds; continuing to monitor the launcher output",
+        );
     }
     if let Some(stdout) = child.stdout.take() {
         spawn_pipe_logger(app.clone(), LogSource::Zapret, stdout);
@@ -324,6 +421,26 @@ pub fn start_zapret(
     if let Some(stderr) = child.stderr.take() {
         spawn_pipe_logger(app.clone(), LogSource::Zapret, stderr);
     }
+    owned_winws.sort_unstable();
+    owned_winws.dedup();
+    logging::push(
+        app,
+        state,
+        LogSource::Zapret,
+        format!(
+            "Launch confirmed: launcher_pid={pid}, owned_{}_pids={}",
+            process_name,
+            if owned_winws.is_empty() {
+                "none".to_string()
+            } else {
+                owned_winws
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ),
+    );
 
     let status = ServiceStatus {
         service: ServiceName::Zapret,
@@ -391,10 +508,7 @@ pub fn stop_zapret(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servi
         for pid in &owned_winws {
             let _ = system_process::kill_pid(*pid);
         }
-        let still_running: Vec<u32> = owned_winws
-            .into_iter()
-            .filter(|pid| system_process::is_pid_running(*pid))
-            .collect();
+        let still_running = system_process::running_pids(&owned_winws);
         if !still_running.is_empty() {
             return Err(format!(
                 "Failed to stop owned {} PID {}. Run ZUI as administrator and try again.",
@@ -411,7 +525,7 @@ pub fn stop_zapret(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servi
     state.lock().unwrap().active_zapret_engine = None;
     clear_owned_winws_marker();
 
-    refresh_status(state);
+    refresh_status(app, state);
     let status = state.lock().unwrap().app_state.zapret.clone();
     emit_state(app, state);
     Ok(status)
@@ -566,6 +680,7 @@ fn rewrite_winws_start_line(line: &str) -> Option<String> {
 }
 
 fn wait_for_owned_process(process_name: &str, before: &[u32]) -> Vec<u32> {
+    let before: std::collections::HashSet<u32> = before.iter().copied().collect();
     for _ in 0..20 {
         let current = system_process::image_pids(process_name);
         let owned: Vec<u32> = current
@@ -580,11 +695,66 @@ fn wait_for_owned_process(process_name: &str, before: &[u32]) -> Vec<u32> {
     Vec::new()
 }
 
+fn logged_start_failure(
+    app: &AppHandle,
+    state: &Mutex<RuntimeState>,
+    source: LogSource,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> String {
+    let message = format!("Startup failed during {stage}: {error}");
+    logging::push(app, state, source, &message);
+    message
+}
+
+fn describe_process_error(process_name: &str, error: &std::io::Error) -> String {
+    let hint = match error.kind() {
+        std::io::ErrorKind::NotFound => "the executable or one of its required paths was not found",
+        std::io::ErrorKind::PermissionDenied => {
+            "access was denied; run ZUI as administrator and check antivirus protection"
+        }
+        _ if error.raw_os_error() == Some(740) => {
+            "Windows requires elevation; run ZUI as administrator"
+        }
+        _ if error.raw_os_error() == Some(193) => {
+            "the executable is not a valid Windows binary for this system"
+        }
+        _ => "Windows could not create the process",
+    };
+    format!(
+        "could not start {process_name}: {error}; os_code={}; hint={hint}",
+        error
+            .raw_os_error()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    )
+}
+
+fn read_child_output(child: &mut Child) -> String {
+    let mut parts = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut text = String::new();
+        if stderr.read_to_string(&mut text).is_ok() && !text.trim().is_empty() {
+            parts.push(format!("stderr={}", text.trim()));
+        }
+    }
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut text = String::new();
+        if stdout.read_to_string(&mut text).is_ok() && !text.trim().is_empty() {
+            parts.push(format!("stdout={}", text.trim()));
+        }
+    }
+    parts.join("; ")
+}
+
 fn ensure_no_foreign_zapret_processes(state: &Mutex<RuntimeState>) -> Result<(), String> {
     let known = state.lock().unwrap().zapret_winws_pids.clone();
+    let processes = system_process::running_processes_by_names(&["winws.exe", "winws2.exe"]);
     for process_name in ["winws.exe", "winws2.exe"] {
-        let foreign: Vec<u32> = system_process::image_pids(process_name)
-            .into_iter()
+        let foreign: Vec<u32> = processes
+            .iter()
+            .filter(|process| process.image.eq_ignore_ascii_case(process_name))
+            .map(|process| process.pid)
             .filter(|pid| !known.contains(pid))
             .collect();
         if !foreign.is_empty() {
@@ -602,7 +772,7 @@ fn ensure_no_foreign_zapret_processes(state: &Mutex<RuntimeState>) -> Result<(),
     Ok(())
 }
 
-const ZAPRET2_ENGINE_VERSION: &str = "1.0.4";
+const ZAPRET2_ENGINE_VERSION: &str = "1.0.5";
 
 fn validate_zapret2_resources(root: &Path) -> Result<(), String> {
     for relative in [
@@ -651,7 +821,7 @@ pub fn start_tg_ws(
     port: u16,
     secret: String,
 ) -> Result<ServiceStatus, String> {
-    refresh_status(state);
+    refresh_status(app, state);
     if state
         .lock()
         .unwrap()
@@ -676,28 +846,54 @@ pub fn start_tg_ws(
         return Ok(status);
     }
 
-    if TcpListener::bind((&host[..], port)).is_err() {
-        return Err("tg-ws port is busy or unavailable".into());
+    if let Err(error) = TcpListener::bind((&host[..], port)) {
+        return Err(logged_start_failure(
+            app,
+            state,
+            LogSource::TgWs,
+            "listener preflight",
+            format!(
+                "cannot bind {host}:{port}: {error}; os_code={}; another process may be using the port or the address is not available",
+                error
+                    .raw_os_error()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        ));
     }
 
+    let mut profile = profiles::active_profile().map_err(|error| {
+        logged_start_failure(app, state, LogSource::TgWs, "profile loading", error)
+    })?;
+    profile.tg_ws_host = host;
+    profile.tg_ws_port = port;
+    profile.tg_ws_secret = secret;
+    logging::set_tg_ws_log_max_mb(profile.tg_ws_log_max_mb);
+    let config_summary = runtime::tg_ws::configuration_summary(&profile).map_err(|error| {
+        logged_start_failure(app, state, LogSource::TgWs, "configuration", error)
+    })?;
     logging::push(
         app,
         state,
         LogSource::TgWs,
         format!(
-            "Starting {} {} on {}:{}",
+            "Starting {} {}: {config_summary}; secret=configured-but-redacted",
             runtime::tg_ws::ENGINE_NAME,
             runtime::tg_ws::ENGINE_VERSION,
-            host,
-            port
         ),
     );
-    let mut profile = profiles::active_profile()?;
-    profile.tg_ws_host = host;
-    profile.tg_ws_port = port;
-    profile.tg_ws_secret = secret;
-    logging::set_tg_ws_log_max_mb(profile.tg_ws_log_max_mb);
-    let handle = runtime::tg_ws::spawn(&profile)?;
+    let handle = runtime::tg_ws::spawn(&profile).map_err(|error| {
+        logged_start_failure(app, state, LogSource::TgWs, "embedded runtime", error)
+    })?;
+    logging::push(
+        app,
+        state,
+        LogSource::TgWs,
+        format!(
+            "Listener ready on {}:{}; Telegram link generated (secret redacted)",
+            handle.host, handle.port
+        ),
+    );
 
     let status = ServiceStatus {
         service: ServiceName::TgWs,
@@ -732,25 +928,76 @@ pub fn stop_tg_ws(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servic
                 runtime_handle.port
             ),
         );
-        runtime_handle.stop()?;
+        if let Err(error) = runtime_handle.stop() {
+            logging::push(
+                app,
+                state,
+                LogSource::TgWs,
+                format!("Shutdown failed: {error}"),
+            );
+            return Err(error);
+        }
+        logging::push(app, state, LogSource::TgWs, "Shutdown completed");
     }
 
-    refresh_status(state);
+    refresh_status(app, state);
     let status = state.lock().unwrap().app_state.tg_ws.clone();
     emit_state(app, state);
     Ok(status)
 }
 
-pub fn refresh_status(state: &Mutex<RuntimeState>) {
+pub fn refresh_status(app: &AppHandle, state: &Mutex<RuntimeState>) {
+    let (tracked_pids, zapret_child_alive, zapret_exit, tg_ws_running, tg_ws_failure) = {
+        let mut runtime = state.lock().unwrap();
+        let (child_alive, child_exit) = match runtime.zapret_child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => (true, None),
+                Ok(Some(status)) => (false, Some(format!("process exited with {status}"))),
+                Err(error) => (
+                    false,
+                    Some(format!("could not query process status: {error}")),
+                ),
+            },
+            None => (false, None),
+        };
+        let tg_running = runtime
+            .tg_ws_runtime
+            .as_ref()
+            .map(|handle| handle.is_running())
+            .unwrap_or(false);
+        let tg_failure = runtime
+            .tg_ws_runtime
+            .as_ref()
+            .filter(|_| !tg_running)
+            .and_then(|handle| handle.failure())
+            .or_else(|| {
+                runtime
+                    .tg_ws_runtime
+                    .as_ref()
+                    .filter(|_| !tg_running)
+                    .map(|_| "tg-ws runtime stopped unexpectedly".to_string())
+            });
+        (
+            runtime.zapret_winws_pids.clone(),
+            child_alive,
+            child_exit,
+            tg_running,
+            tg_failure,
+        )
+    };
+
+    // tasklist can take hundreds of milliseconds on a busy Windows system.
+    // Run it without holding RuntimeState so UI/status commands remain responsive.
+    let running_pids: std::collections::HashSet<u32> = system_process::running_pids(&tracked_pids)
+        .into_iter()
+        .collect();
+
     let mut runtime = state.lock().unwrap();
-    let zapret_child_alive = runtime
-        .zapret_child
-        .as_mut()
-        .map(|child| child.try_wait().ok().flatten().is_none())
-        .unwrap_or(false);
+    let previous_zapret_error = runtime.app_state.zapret.error.clone();
+    let previous_tg_ws_error = runtime.app_state.tg_ws.error.clone();
     runtime
         .zapret_winws_pids
-        .retain(|pid| system_process::is_pid_running(*pid));
+        .retain(|pid| !tracked_pids.contains(pid) || running_pids.contains(pid));
     let winws_running = !runtime.zapret_winws_pids.is_empty();
     if !zapret_child_alive {
         runtime.zapret_child = None;
@@ -777,16 +1024,20 @@ pub fn refresh_status(state: &Mutex<RuntimeState>) {
             }),
             error: None,
         }
+    } else if let Some(error) = zapret_exit {
+        runtime.active_zapret_engine = None;
+        ServiceStatus {
+            service: ServiceName::Zapret,
+            state: ServiceState::Error,
+            pid: None,
+            message: None,
+            error: Some(format!("zapret stopped unexpectedly: {error}")),
+        }
     } else {
         runtime.active_zapret_engine = None;
         ServiceStatus::stopped(ServiceName::Zapret)
     };
 
-    let tg_ws_running = runtime
-        .tg_ws_runtime
-        .as_ref()
-        .map(|handle| handle.is_running())
-        .unwrap_or(false);
     if !tg_ws_running {
         runtime.tg_ws_runtime = None;
     }
@@ -802,15 +1053,47 @@ pub fn refresh_status(state: &Mutex<RuntimeState>) {
             message,
             error: None,
         }
+    } else if let Some(error) = tg_ws_failure {
+        ServiceStatus {
+            service: ServiceName::TgWs,
+            state: ServiceState::Error,
+            pid: None,
+            message: None,
+            error: Some(error),
+        }
     } else {
         ServiceStatus::stopped(ServiceName::TgWs)
     };
 
     runtime.app_state.status = if zapret_child_alive || winws_running || tg_ws_running {
         AppStatus::On
+    } else if matches!(runtime.app_state.zapret.state, ServiceState::Error)
+        || matches!(runtime.app_state.tg_ws.state, ServiceState::Error)
+    {
+        AppStatus::Error
     } else {
         AppStatus::Off
     };
+    runtime.app_state.last_error = runtime
+        .app_state
+        .zapret
+        .error
+        .clone()
+        .or_else(|| runtime.app_state.tg_ws.error.clone());
+    let zapret_error = runtime.app_state.zapret.error.clone();
+    let tg_ws_error = runtime.app_state.tg_ws.error.clone();
+    drop(runtime);
+
+    if zapret_error != previous_zapret_error {
+        if let Some(error) = zapret_error {
+            logging::push(app, state, LogSource::Zapret, error);
+        }
+    }
+    if tg_ws_error != previous_tg_ws_error {
+        if let Some(error) = tg_ws_error {
+            logging::push(app, state, LogSource::TgWs, error);
+        }
+    }
 }
 
 pub fn emit_state(app: &AppHandle, state: &Mutex<RuntimeState>) {
@@ -841,6 +1124,12 @@ pub fn set_error(
             None => {}
         }
     }
+    let source = match service {
+        Some(ServiceName::Zapret) => LogSource::Zapret,
+        Some(ServiceName::TgWs) => LogSource::TgWs,
+        None => LogSource::App,
+    };
+    logging::push(app, state, source, format!("Operation failed: {message}"));
     let _ = app.emit("operation_failed", message);
     emit_state(app, state);
 }

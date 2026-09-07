@@ -13,20 +13,26 @@ jobs:
     # published release with no binaries under it is worse than no release yet.
     # `publish-release` flips it once every asset has landed.
     #
-    # The body comes from the notes committed alongside the version bump, so a
-    # release cannot ship with the previous version's text or none at all --
-    # `allow-missing-changelog` stays false, which fails the release instead.
-    # The heading in that file must be a bare `# vX.Y.Z`: parse-changelog does
-    # not recognise a version heading carrying the crate name, with or without
-    # `prefix-format`. The name lives in `title` instead.
+    # The body comes from the base-version notes committed alongside the version
+    # bump, so a release cannot ship with the previous version's text or none at
+    # all. Beta tags reuse that file with a temporary tag-specific heading. The
+    # bare heading is required because parse-changelog does not recognise one
+    # carrying the crate name; the name lives in `title` instead.
     create-release:
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v6
+            - name: Prepare tag-specific release notes
+              id: release-notes
+              shell: bash
+              run: |
+                  output="${RUNNER_TEMP}/release-notes.md"
+                  .github/scripts/prepare-release-notes.sh "${GITHUB_REF_NAME}" "$output"
+                  echo "path=$output" >> "$GITHUB_OUTPUT"
             - uses: taiki-e/create-gh-release-action@v1
               with:
                   token: ${{ secrets.GITHUB_TOKEN }}
-                  changelog: docs/release-notes/$version.md
+                  changelog: ${{ steps.release-notes.outputs.path }}
                   title: tg-ws-proxy-rs $tag
                   draft: true
 
@@ -58,7 +64,22 @@ jobs:
         steps:
             - uses: actions/checkout@v6
 
-            # Default path (all targets except mipsel)
+            - name: Read pinned Rust toolchain
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              id: rust-toolchain
+              shell: bash
+              run: |
+                  toolchain="$(sed -n -E 's/^channel = "(.+)"/\1/p' rust-toolchain.toml)"
+                  test -n "$toolchain"
+                  echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
+            - name: Install pinned Rust
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
+
+            # Default path (all targets except the mips variants)
             - name: Build & upload (default)
               if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
               uses: taiki-e/upload-rust-binary-action@v1
@@ -133,8 +154,195 @@ jobs:
                   tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
                   gh release upload "$TAG" "${NAME}.tar.gz" --clobber
 
+    # Needs `create-release` and nothing else: the APKs share no artifact with
+    # the musl builds, so this runs beside `upload-assets` rather than behind
+    # it and costs the release roughly no extra wall clock. `publish-release`
+    # lists it, which is what makes a failure here leave a draft instead of a
+    # published release that silently shipped without an APK -- how 2.3.0 would
+    # otherwise have gone out.
+    android:
+        needs: create-release
+        runs-on: ubuntu-latest
+        env:
+            # A secret that does not exist expands to the empty string. Nothing
+            # below branches on these four directly: the step that opens the job
+            # collapses them into one all-or-none answer, `TG_ANDROID_SIGNED`.
+            # See docs/Android.md for the secrets a maintainer creates to turn
+            # this into a signed build.
+            TG_ANDROID_KEYSTORE_BASE64: ${{ secrets.TG_ANDROID_KEYSTORE_BASE64 }}
+            TG_ANDROID_STORE_PASSWORD: ${{ secrets.TG_ANDROID_STORE_PASSWORD }}
+            TG_ANDROID_KEY_ALIAS: ${{ secrets.TG_ANDROID_KEY_ALIAS }}
+            TG_ANDROID_KEY_PASSWORD: ${{ secrets.TG_ANDROID_KEY_PASSWORD }}
+        steps:
+            - uses: actions/checkout@v6
+
+            # ReleaseSigning calls signing configured only when all four of
+            # storeFile/storePassword/keyAlias/keyPassword are present and
+            # non-blank, so a partial set is not a mostly-signed build: AGP
+            # falls back to the `-unsigned` outputs, the staging loop below
+            # renames them honestly, the count assertion still passes, and the
+            # release goes out unsigned with nothing in the log to say so. One
+            # misspelled `TG_ANDROID_KEY_ALIAS` is enough. Decide here instead,
+            # once, and refuse the middle case rather than publish it.
+            #
+            # Only the names of the secrets are ever printed; presence is
+            # tested, content never is.
+            - name: Decide whether this is a signed build
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  present=()
+                  missing=()
+                  for name in TG_ANDROID_KEYSTORE_BASE64 TG_ANDROID_STORE_PASSWORD \
+                              TG_ANDROID_KEY_ALIAS TG_ANDROID_KEY_PASSWORD; do
+                      if [[ -n "${!name:-}" ]]; then
+                          present+=("$name")
+                      else
+                          missing+=("$name")
+                      fi
+                  done
+
+                  if [[ "${#missing[@]}" -eq 0 ]]; then
+                      echo "TG_ANDROID_SIGNED=1" >> "$GITHUB_ENV"
+                      echo "All four Android signing secrets are set; the APKs must come out signed." \
+                          >> "$GITHUB_STEP_SUMMARY"
+                  elif [[ "${#present[@]}" -eq 0 ]]; then
+                      echo "TG_ANDROID_SIGNED=0" >> "$GITHUB_ENV"
+                      echo "::warning::no Android signing secrets are set; this release will carry unsigned APKs"
+                      {
+                          echo "**This release carries unsigned Android APKs.**"
+                          echo "No signing secret is set, so the APKs are named \`-unsigned\` and"
+                          echo "Android will not install them without \`adb install\`."
+                          echo "See docs/Android.md for the four secrets that turn signing on."
+                      } >> "$GITHUB_STEP_SUMMARY"
+                  else
+                      echo "::error::Android signing is half-configured -- set: ${present[*]}; missing or blank: ${missing[*]}. Set all four secrets or none; anything between silently produces unsigned APKs."
+                      exit 1
+                  fi
+
+            - name: Set up JDK 17
+              uses: actions/setup-java@v5
+              with:
+                  distribution: temurin
+                  java-version: "17"
+
+            # Performs the Gradle wrapper JAR checksum validation, same as CI.
+            - name: Set up Gradle
+              uses: gradle/actions/setup-gradle@v4
+
+            # The runner images ship a single NDK and bump it without notice,
+            # which silently changes the toolchain the native library is built
+            # with. The version lives in android/gradle/libs.versions.toml and
+            # is read here, by the convention plugin, and by the F-Droid
+            # recipe.
+            - name: Install pinned Android NDK
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  ndk="$(sed -n -E 's/^ndk = "(.+)"/\1/p' android/gradle/libs.versions.toml)"
+                  "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk"
+                  echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+
+            - name: Read pinned Rust toolchain
+              id: rust-toolchain
+              shell: bash
+              run: |
+                  toolchain="$(sed -n -E 's/^channel = "(.+)"/\1/p' rust-toolchain.toml)"
+                  test -n "$toolchain"
+                  echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
+            - name: Set up Rust
+              uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
+
+            # A keystore is a binary file, so the secret carries it base64-encoded
+            # and only the path reaches Gradle. No `set -x` anywhere in this job:
+            # the trace would put the encoded keystore in the log.
+            - name: Decode the release keystore
+              if: ${{ env.TG_ANDROID_SIGNED == '1' }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  keystore="${RUNNER_TEMP}/release.jks"
+                  # Set before the redirection creates the file, so it is never
+                  # briefly world-readable on a shared runner.
+                  umask 077
+                  printf '%s' "$TG_ANDROID_KEYSTORE_BASE64" | base64 -d > "$keystore"
+                  echo "TG_ANDROID_STORE_FILE=${keystore}" >> "$GITHUB_ENV"
+
+            # Release only: the per-ABI plus universal APK set, R8-minified.
+            - name: Build the release APKs
+              working-directory: android
+              shell: bash
+              run: ./gradlew :app:assembleRelease
+
+            - name: Stage and upload the APKs
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version="${GITHUB_REF_NAME#v}"
+                  out=android/app/build/outputs/apk/release
+                  stage="$(mktemp -d)"
+                  count=0
+                  # AGP names the outputs after the module and appends -unsigned
+                  # when no keystore was configured, so read what it actually
+                  # wrote rather than guessing at the suffix -- that is what
+                  # lets the signed and unsigned shapes share one code path.
+                  # `-android-` in the released name because the OpenWrt LuCI
+                  # packages on the same release page are also called .apk.
+                  while read -r file; do
+                      abi="${file#app-}"
+                      abi="${abi%%-release*}"
+                      suffix=""
+                      [[ "$file" == *-unsigned.apk ]] && suffix="-unsigned"
+
+                      # The gate step already refused a half-configured secret
+                      # set, so what AGP wrote and what we asked for can only
+                      # disagree if AGP or ReleaseSigning changed under us --
+                      # and the whole point of that gate is that the disagreement
+                      # is invisible downstream. Say it here rather than upload.
+                      if [[ "$TG_ANDROID_SIGNED" == "1" && -n "$suffix" ]]; then
+                          echo "::error::${file}: AGP produced an unsigned APK although every signing secret was supplied"
+                          exit 1
+                      fi
+                      if [[ "$TG_ANDROID_SIGNED" == "0" && -z "$suffix" ]]; then
+                          echo "::error::${file}: AGP produced a signed APK although no signing secret was supplied"
+                          exit 1
+                      fi
+
+                      cp "$out/$file" "$stage/tg-ws-proxy-rs-android-${version}-${abi}${suffix}.apk"
+                      count=$((count + 1))
+                  done < <(jq -r '.elements[].outputFile' "$out/output-metadata.json")
+
+                  # Three ABIs plus the universal APK. CI's `android` job owns
+                  # the checks that each one carries the right .so and the right
+                  # JNI symbols; this only guards against uploading a set that
+                  # quietly shrank.
+                  if [[ "$count" -ne 4 ]]; then
+                      echo "::error::expected 4 release APKs, got ${count}"
+                      exit 1
+                  fi
+
+                  gh release upload "${GITHUB_REF_NAME}" "$stage"/*.apk \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+
+            # RUNNER_TEMP is wiped when the job ends, but only on a healthy
+            # runner; deleting the keystore explicitly does not depend on that.
+            - name: Remove the decoded keystore
+              if: ${{ always() }}
+              shell: bash
+              run: rm -f "${RUNNER_TEMP}/release.jks"
+
+    # Builds its two packages from the tree, not from the musl tarballs, so the
+    # only thing it needs is somewhere to upload them. It used to wait on
+    # `upload-assets` and `compress-assets` because it also built SHA256SUMS out
+    # of the assets they had uploaded; `checksums` owns that now, and this runs
+    # beside them again.
     openwrt-luci:
-        needs: [create-release, upload-assets, compress-assets]
+        needs: create-release
         runs-on: ubuntu-latest
         env:
             APK_VERSION: 25.12.5
@@ -205,24 +413,7 @@ jobs:
                       [[ "$#" -eq 1 && -f "$1" ]]
                   )
 
-            - name: Build shared release checksums
-              env:
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  final="${PWD}/dist/openwrt"
-                  gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-                      --pattern 'tg-ws-proxy-*-unknown-linux-musl*.tar.gz' --dir "$final"
-                  (
-                      cd "$final"
-                      set -- tg-ws-proxy-*-unknown-linux-musl*.tar.gz
-                      [[ "$#" -eq 10 ]]
-                      sha256sum -- *.tar.gz *.apk *.ipk > SHA256SUMS
-                      sha256sum -c SHA256SUMS
-                  )
-
-            - name: Upload LuCI packages and checksums
+            - name: Upload the LuCI packages
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               shell: bash
@@ -231,7 +422,6 @@ jobs:
                   gh release upload "${GITHUB_REF_NAME}" \
                       dist/openwrt/luci-app-tg-ws-proxy-rs-*.apk \
                       dist/openwrt/luci-app-tg-ws-proxy-rs_*.ipk \
-                      dist/openwrt/SHA256SUMS \
                       --repo "${GITHUB_REPOSITORY}" --clobber
 
     # Extra UPX-packed assets for flash-constrained devices (OpenWrt routers).
@@ -249,11 +439,19 @@ jobs:
     # tool, and packing a Mach-O invalidates its signature so arm64 macOS
     # refuses to run it at all.
     compress-assets:
-        needs: upload-assets
+        # `create-release` is already an ancestor through `upload-assets`; it is
+        # named here so the guard below can read its result.
+        needs: [create-release, upload-assets]
         # Not `success()`: upload-assets covers Windows and macOS too, and a
         # hiccup there should not silently drop every `-upx` asset. Each leg
         # below fails on its own if its plain asset never made it to the release.
-        if: ${{ !cancelled() }}
+        #
+        # A failed `create-release` is the one case worth skipping for. A
+        # skipped dependency is not a cancellation, so `!cancelled()` alone
+        # would start all five legs against a release that was never created
+        # and each would die on a raw `gh release download` error -- five red
+        # jobs whose logs point at `gh` rather than at the job that broke.
+        if: ${{ !cancelled() && needs.create-release.result == 'success' }}
         runs-on: ubuntu-latest
         strategy:
             fail-fast: false
@@ -311,12 +509,83 @@ jobs:
                   gh release upload "$TAG" "${NAME}-upx.tar.gz" \
                       --repo "${GITHUB_REPOSITORY}" --clobber
 
-    # Every asset job must succeed, so a target or OpenWrt package set that failed
-    # to build leaves the release a draft rather than publishing a half-populated
-    # one. Finish the job by hand (or re-run the failed leg) and the draft is
-    # still there.
+    # The release publishes exactly one checksum file, so it can only be built
+    # once the last asset has landed -- every job that uploads one is in `needs`,
+    # plus `create-release` so the guard below can read its result.
+    #
+    # This used to live inside `openwrt-luci`, which hashed the files in its own
+    # staging directory plus the musl tarballs it pulled down for that purpose.
+    # Anything uploaded by a job it did not wait on was therefore missing from
+    # SHA256SUMS: the macOS and Windows archives, and -- once the `android` job
+    # existed -- all four APKs. A sideloaded APK is exactly the asset where a
+    # user most needs an out-of-band hash to check, so it shipped without one.
+    #
+    # Hashing what the release serves rather than what each job built is the
+    # trick `compress-assets` already uses to reach the plain tarballs: read the
+    # still-draft release back. It needs no working tree, and it means the
+    # hashes cover the bytes a user actually downloads.
+    checksums:
+        needs: [create-release, upload-assets, compress-assets, openwrt-luci, android]
+        # Not `success()`: a failure in one packaging path should surface as a
+        # failing checksum job over a short asset set, not as a release whose
+        # other assets quietly lost their hashes. `publish-release` waits on
+        # this too, so either way the release stays a draft.
+        #
+        # `create-release` is excluded from that: with no draft there is nothing
+        # to read back and nothing to hash, so running would only add a raw `gh`
+        # error pointing away from the job that actually failed.
+        if: ${{ !cancelled() && needs.create-release.result == 'success' }}
+        runs-on: ubuntu-latest
+        steps:
+            - name: Hash every asset on the release
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  dir="$(mktemp -d)"
+                  gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                      --dir "$dir" --clobber
+                  cd "$dir"
+
+                  # A re-run finds the previous SHA256SUMS among the assets, and
+                  # a file cannot list its own hash.
+                  rm -f SHA256SUMS
+
+                  shopt -s nullglob
+                  all=(*)
+                  musl=(tg-ws-proxy-*-unknown-linux-musl*.tar.gz)
+                  apks=(tg-ws-proxy-rs-android-*.apk)
+                  luci=(luci-app-tg-ws-proxy-rs-*.apk luci-app-tg-ws-proxy-rs_*.ipk)
+
+                  # 9 archives from `upload-assets`, 5 `-upx` ones from
+                  # `compress-assets`, 2 LuCI packages, 4 APKs. The total is what
+                  # catches an asset from the four macOS/Windows targets going
+                  # missing without spelling out archive names this job never
+                  # chose; the per-group counts say which path came up short.
+                  if [[ "${#all[@]}" -ne 20 || "${#musl[@]}" -ne 10 ||
+                        "${#apks[@]}" -ne 4 || "${#luci[@]}" -ne 2 ]]; then
+                      echo "::error::release carries ${#all[@]} assets, expected 20: ${#musl[@]}/10 musl tarballs, ${#apks[@]}/4 APKs, ${#luci[@]}/2 LuCI packages"
+                      printf '%s\n' "${all[@]}"
+                      exit 1
+                  fi
+
+                  # Written elsewhere first: `> SHA256SUMS` would create the file
+                  # before `*` is expanded on some shells, and it would then hash
+                  # its own empty self.
+                  sha256sum -- * > "${RUNNER_TEMP}/SHA256SUMS"
+                  mv "${RUNNER_TEMP}/SHA256SUMS" SHA256SUMS
+                  sha256sum -c SHA256SUMS
+
+                  gh release upload "${GITHUB_REF_NAME}" SHA256SUMS \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+
+    # Every asset job must succeed, so a target, OpenWrt package set or Android
+    # APK that failed to build leaves the release a draft rather than publishing
+    # a half-populated one. Finish the job by hand (or re-run the failed leg) and
+    # the draft is still there.
     publish-release:
-        needs: [upload-assets, openwrt-luci, compress-assets]
+        needs: [upload-assets, openwrt-luci, compress-assets, android, checksums]
         runs-on: ubuntu-latest
         steps:
             - name: Publish the draft now that every asset is uploaded

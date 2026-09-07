@@ -93,7 +93,7 @@
   let updateInstalling = $state(false);
   let updateMessage = $state<string | null>(null);
   let updatePostponedVersion = $state<string | null>(null);
-  let appVersion = $state("2.1.1");
+  let appVersion = $state("2.2.0");
   let changingZapretEngine = $state(false);
   let engineTransition = $state<ZapretEngine | null>(null);
   let testSelectionOpen = $state(false);
@@ -763,6 +763,10 @@
     return message?.match(/tg:\/\/proxy\?\S+/)?.[0] ?? null;
   }
 
+  function redactProxySecret(value: string) {
+    return value.replace(/([?&]secret=)[^&\s]+/gi, "$1<redacted>");
+  }
+
   function extractTgProxySecret(link?: string | null) {
     if (!link) return null;
     try {
@@ -818,7 +822,7 @@
       `lastError=${appSnapshot.lastError ?? ""}`,
       `activeProfileId=${appSnapshot.activeProfileId}`,
       `zapret=${appSnapshot.zapret.state} pid=${appSnapshot.zapret.pid ?? ""} message=${appSnapshot.zapret.message ?? ""}`,
-      `tgWs=${appSnapshot.tgWs.state} message=${appSnapshot.tgWs.message ?? ""}`,
+      `tgWs=${appSnapshot.tgWs.state} message=${redactProxySecret(appSnapshot.tgWs.message ?? "")}`,
       "",
       "[Settings]",
       `theme=${settingsSnapshot.theme}`,
@@ -848,7 +852,7 @@
       "[Recent logs]",
       ...logSnapshot.slice(-25).map((line) => `[${line.timestamp}] ${line.source}: ${line.message}`)
     ];
-    return lines.filter((line) => line !== "").join("\n");
+    return redactProxySecret(lines.filter((line) => line !== "").join("\n"));
   }
 
   async function openReport() {
@@ -1140,6 +1144,18 @@
                   onchange={(event) => updateSettings({ startWithWindows: event.currentTarget.checked })}
                 />
                 {$t("settings.startWithWindows")}
+              </label>
+              <label class="check-row startup-tray-option" class:disabled={!$settingsStore.startWithWindows}>
+                <input
+                  type="checkbox"
+                  checked={$settingsStore.startWithWindowsInTray}
+                  disabled={!$settingsStore.startWithWindows}
+                  onchange={(event) => updateSettings({ startWithWindowsInTray: event.currentTarget.checked })}
+                />
+                <span>
+                  {$t("settings.startWithWindowsInTray")}
+                  <small>{$t("settings.startWithWindowsInTrayHint")}</small>
+                </span>
               </label>
               <label class="check-row">
                 <input

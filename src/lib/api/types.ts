@@ -28,6 +28,7 @@ export type Settings = {
   minimizeBehavior: MinimizeBehavior;
   minimizeDontAsk: boolean;
   startWithWindows: boolean;
+  startWithWindowsInTray: boolean;
   autoStartActiveProfileOnLaunch: boolean;
   checkUpdatesOnLaunch: boolean;
   customPresetRoots: string[];

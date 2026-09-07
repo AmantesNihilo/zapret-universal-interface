@@ -10,6 +10,14 @@ name: Release dry run
 # killed the first attempt, is exercised separately below against a draft
 # release -- a draft does not create the git tag, so nothing leaks even if the
 # cleanup step is skipped.
+#
+# `android-release` covers the release-only shell around the APKs. It does not
+# build them: ci.yml already runs `:app:assembleRelease` and inspects the result
+# on every push, so what is untested until a tag is the shell -- the signing
+# gate, the keystore decode, the staging/rename loop, the asset-count assertion.
+# It lifts those `run:` bodies straight out of release.yml rather than copying
+# them, so it rehearses the code that will actually run. Everything it adds is
+# shell and finishes in about a minute, well inside the `pack` jobs' shadow.
 
 on:
     workflow_dispatch:
@@ -25,6 +33,29 @@ permissions:
     contents: read
 
 jobs:
+    release-notes:
+        name: rehearse stable and beta release notes
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Prepare stable and beta notes from one source
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+                  work="$(mktemp -d)"
+                  .github/scripts/prepare-release-notes.sh "v${version}" "$work/stable.md"
+                  .github/scripts/prepare-release-notes.sh "v${version}-beta.1" "$work/beta.md"
+                  head -n 1 "$work/stable.md" | grep -Fx "# v${version}"
+                  head -n 1 "$work/beta.md" | grep -Fx "# v${version}-beta.1"
+                  tail -n +2 "$work/stable.md" > "$work/stable-body.md"
+                  tail -n +2 "$work/beta.md" > "$work/beta-body.md"
+                  cmp "$work/stable-body.md" "$work/beta-body.md"
+                  if .github/scripts/prepare-release-notes.sh "v${version}-beta.0" "$work/invalid.md"; then
+                      echo '::error::beta.0 tag was accepted'
+                      exit 1
+                  fi
+
     pack:
         name: pack ${{ matrix.target }}
         runs-on: ubuntu-latest
@@ -53,9 +84,20 @@ jobs:
               with:
                   components: rust-src
 
-            - name: Install stable Rust
+            - name: Read pinned Rust toolchain
               if: ${{ !matrix.build_std }}
-              uses: dtolnay/rust-toolchain@stable
+              id: rust-toolchain
+              shell: bash
+              run: |
+                  toolchain="$(sed -n -E 's/^channel = "(.+)"/\1/p' rust-toolchain.toml)"
+                  test -n "$toolchain"
+                  echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
+            - name: Install pinned Rust
+              if: ${{ !matrix.build_std }}
+              uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
 
             - name: Install cross
               run: cargo install cross --locked
@@ -107,6 +149,223 @@ jobs:
                   path: target/${{ matrix.target }}/release/tg-ws-proxy
                   if-no-files-found: error
 
+    android-release:
+        name: rehearse the android release job
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            # For keytool, below. release.yml pins the same JDK.
+            - name: Set up JDK 17
+              uses: actions/setup-java@v5
+              with:
+                  distribution: temurin
+                  java-version: "17"
+
+            # Rehearsing a transcribed copy of these steps would only prove the
+            # copy works, so read release.yml and run the real thing. A renamed
+            # step fails here instead of quietly rehearsing nothing.
+            - name: Lift the android job's shell steps out of release.yml
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  # PyYAML ships preinstalled on the GitHub-hosted runner
+                  # images, which is the only place this workflow runs. There
+                  # is deliberately no pip fallback: those images are PEP 668
+                  # environments, so `pip install` refuses with
+                  # `externally-managed-environment` and would fail the step
+                  # anyway -- only with an error about pip rather than about
+                  # the missing module. If an image ever drops PyYAML, the
+                  # heredoc below says `ModuleNotFoundError: yaml` and the fix
+                  # is to install it here explicitly.
+                  mkdir -p "${RUNNER_TEMP}/steps"
+                  python3 - <<'PY'
+                  import os, pathlib, yaml
+
+                  wanted = {
+                      "Decide whether this is a signed build": "gate.sh",
+                      "Decode the release keystore": "decode.sh",
+                      "Stage and upload the APKs": "stage.sh",
+                  }
+                  steps = yaml.safe_load(
+                      pathlib.Path(".github/workflows/release.yml").read_text()
+                  )["jobs"]["android"]["steps"]
+                  found = {s["name"]: s["run"] for s in steps if s.get("name") in wanted}
+                  absent = sorted(set(wanted) - set(found))
+                  if absent:
+                      raise SystemExit(
+                          f"::error::the android job in release.yml has no step named {absent}; "
+                          "release-dryrun.yml rehearses these by name and must be updated with them"
+                      )
+                  out = pathlib.Path(os.environ["RUNNER_TEMP"], "steps")
+                  for name, body in found.items():
+                      (out / wanted[name]).write_text(body)
+                  PY
+
+            # The case this is really here for is the third one: a maintainer
+            # who sets three secrets and misspells the fourth used to get four
+            # unsigned APKs on a published release and no warning anywhere.
+            - name: Rehearse the signing gate
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  fail=0
+
+                  # check <label> <expected TG_ANDROID_SIGNED, or `fail`> [NAME=VALUE ...]
+                  check() {
+                      local label="$1" want="$2" got status=0 env_file log
+                      shift 2
+                      env_file="$(mktemp)"
+                      log="$(mktemp)"
+                      # The gate prints `::error::` when it refuses; keep that
+                      # off stdout so an expected refusal does not annotate this
+                      # run as broken.
+                      env "$@" GITHUB_ENV="$env_file" GITHUB_STEP_SUMMARY="$(mktemp)" \
+                          bash "${RUNNER_TEMP}/steps/gate.sh" >"$log" 2>&1 || status=$?
+                      if [[ "$status" -ne 0 ]]; then
+                          got=fail
+                      else
+                          got="$(grep -m1 '^TG_ANDROID_SIGNED=' "$env_file" | cut -d= -f2- || true)"
+                      fi
+                      if [[ "$got" != "$want" ]]; then
+                          echo "::error::signing gate, ${label}: expected ${want}, got ${got:-nothing}"
+                          cat "$log"
+                          fail=1
+                      else
+                          echo "signing gate, ${label}: ${got}"
+                      fi
+                  }
+
+                  check "all four secrets" 1 \
+                      TG_ANDROID_KEYSTORE_BASE64=x TG_ANDROID_STORE_PASSWORD=x \
+                      TG_ANDROID_KEY_ALIAS=x TG_ANDROID_KEY_PASSWORD=x
+                  check "no secrets at all" 0
+                  check "key alias forgotten" fail \
+                      TG_ANDROID_KEYSTORE_BASE64=x TG_ANDROID_STORE_PASSWORD=x \
+                      TG_ANDROID_KEY_PASSWORD=x
+                  check "key alias set but blank" fail \
+                      TG_ANDROID_KEYSTORE_BASE64=x TG_ANDROID_STORE_PASSWORD=x \
+                      TG_ANDROID_KEY_ALIAS= TG_ANDROID_KEY_PASSWORD=x
+                  check "keystore only" fail TG_ANDROID_KEYSTORE_BASE64=x
+
+                  exit "$fail"
+
+            # The real keystore secret cannot be reached from a pull request, so
+            # make one here: the step's contract is the same either way, and a
+            # throwaway keystore proves base64 round-trips into something
+            # keytool -- and therefore Gradle -- can still open.
+            - name: Rehearse the keystore decode
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  src="${RUNNER_TEMP}/dryrun-source.p12"
+                  keytool -genkeypair -keystore "$src" -storetype PKCS12 \
+                      -alias dryrun -storepass dryrun-password -keypass dryrun-password \
+                      -keyalg RSA -keysize 2048 -validity 1 \
+                      -dname "CN=release dry run, O=tg-ws-proxy-rs" 2>/dev/null
+
+                  env_file="${RUNNER_TEMP}/decode-env"
+                  : > "$env_file"
+                  TG_ANDROID_KEYSTORE_BASE64="$(base64 -w0 "$src")" \
+                      GITHUB_ENV="$env_file" \
+                      bash "${RUNNER_TEMP}/steps/decode.sh"
+
+                  store="$(grep -m1 '^TG_ANDROID_STORE_FILE=' "$env_file" | cut -d= -f2-)"
+                  test -f "$store"
+                  # umask 077 before the redirection is the point of that step.
+                  mode="$(stat -c '%a' "$store")"
+                  if [[ "$mode" != 600 ]]; then
+                      echo "::error::decoded keystore is mode ${mode}, expected 600"
+                      exit 1
+                  fi
+                  keytool -list -keystore "$store" -storepass dryrun-password >/dev/null
+                  rm -f "$src" "$store"
+
+            # AGP writes output-metadata.json and the staging loop reads it, so
+            # a fabricated one drives the real loop over both APK shapes without
+            # an NDK or a Gradle run anywhere in sight.
+            - name: Rehearse the staging loop and the count assertion
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  out=android/app/build/outputs/apk/release
+                  args="${RUNNER_TEMP}/gh-args"
+                  log="${RUNNER_TEMP}/stage-log"
+                  fail=0
+
+                  # The loop ends in the one call that cannot happen here --
+                  # there is no release to upload to -- so record it instead.
+                  # `upload-rehearsal` below makes the real multi-file call.
+                  mkdir -p "${RUNNER_TEMP}/bin"
+                  cat > "${RUNNER_TEMP}/bin/gh" <<'SH'
+                  #!/usr/bin/env bash
+                  printf '%s\n' "$@" > "${DRYRUN_GH_ARGS}"
+                  SH
+                  chmod +x "${RUNNER_TEMP}/bin/gh"
+                  export PATH="${RUNNER_TEMP}/bin:${PATH}"
+                  export GITHUB_REF_NAME=v9.9.9 GH_TOKEN=dryrun DRYRUN_GH_ARGS="$args"
+
+                  signed=(app-arm64-v8a-release.apk app-armeabi-v7a-release.apk
+                          app-x86_64-release.apk app-universal-release.apk)
+                  unsigned=("${signed[@]/-release.apk/-release-unsigned.apk}")
+
+                  # rehearse <label> <TG_ANDROID_SIGNED> <expected staged names, or `fail`> <APK...>
+                  rehearse() {
+                      local label="$1" signed_env="$2" want="$3" status=0 got json=""
+                      shift 3
+                      rm -rf "$out"
+                      mkdir -p "$out"
+                      local name
+                      for name in "$@"; do
+                          : > "$out/$name"
+                          json+="{\"outputFile\":\"${name}\"},"
+                      done
+                      printf '{"elements":[%s]}' "${json%,}" > "$out/output-metadata.json"
+
+                      : > "$args"
+                      TG_ANDROID_SIGNED="$signed_env" \
+                          bash "${RUNNER_TEMP}/steps/stage.sh" >"$log" 2>&1 || status=$?
+
+                      if [[ "$status" -ne 0 ]]; then
+                          got=fail
+                      else
+                          got="$( (grep '\.apk$' "$args" || true) | sed 's|.*/||' | sort | tr '\n' ' ')"
+                          got="${got% }"
+                      fi
+                      if [[ "$got" != "$want" ]]; then
+                          echo "::error::staging, ${label}: expected [${want}], got [${got}]"
+                          cat "$log"
+                          fail=1
+                      else
+                          echo "staging, ${label}: ${got}"
+                      fi
+                  }
+
+                  base=tg-ws-proxy-rs-android-9.9.9
+                  rehearse "signed build" 1 \
+                      "${base}-arm64-v8a.apk ${base}-armeabi-v7a.apk ${base}-universal.apk ${base}-x86_64.apk" \
+                      "${signed[@]}"
+                  rehearse "unsigned build" 0 \
+                      "${base}-arm64-v8a-unsigned.apk ${base}-armeabi-v7a-unsigned.apk ${base}-universal-unsigned.apk ${base}-x86_64-unsigned.apk" \
+                      "${unsigned[@]}"
+
+                  # The recorded call is the other half of the contract: the tag,
+                  # the repository and --clobber all have to reach gh. Checked
+                  # here, while $args still holds a run that got that far.
+                  for expected in v9.9.9 --repo --clobber; do
+                      if ! grep -qxF -- "$expected" "$args"; then
+                          echo "::error::the upload call release.yml makes is missing ${expected}: $(tr '\n' ' ' <"$args")"
+                          fail=1
+                      fi
+                  done
+
+                  rehearse "secrets set but AGP wrote unsigned APKs" 1 fail "${unsigned[@]}"
+                  rehearse "no secrets but AGP wrote signed APKs" 0 fail "${signed[@]}"
+                  rehearse "the APK set quietly shrank" 1 fail "${signed[@]:0:3}"
+
+                  rm -rf "$out"
+                  exit "$fail"
+
     upload-rehearsal:
         name: rehearse gh release upload
         # A fork PR only gets a read-only GITHUB_TOKEN, so this cannot run there.
@@ -157,6 +416,35 @@ jobs:
                   # same resolution path.
                   gh release edit "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
                       --title "dry run ${{ github.run_id }} (edited)"
+
+            # The android job uploads its whole staging directory in one call,
+            # by glob rather than by name. `android-release` above records that
+            # call; this is the half that has to reach GitHub.
+            - name: Upload an APK set the way the android job does
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  stage="$(mktemp -d)"
+                  for abi in arm64-v8a armeabi-v7a x86_64 universal; do
+                      echo "placeholder" > "${stage}/tg-ws-proxy-rs-android-0.0.0-${abi}.apk"
+                  done
+                  gh release upload "$DRY_TAG" "$stage"/*.apk \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+                  gh release view "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --json assets --jq '.assets[].name' | tee apk-assets.txt
+                  test "$(grep -c '^tg-ws-proxy-rs-android-0\.0\.0-' apk-assets.txt)" -eq 4
+
+            # `checksums` hashes what the release serves rather than what any
+            # job built, so it downloads every asset with no --pattern -- a
+            # different gh path from the filtered download above, and one that
+            # likewise has to work against a draft.
+            - name: Download every asset the way `checksums` does
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  gh release download "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --dir every-asset --clobber
+                  test "$(find every-asset -type f | wc -l)" -eq 5
 
             - name: Delete the draft
               if: always()

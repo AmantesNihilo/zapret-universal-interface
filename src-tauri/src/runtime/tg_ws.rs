@@ -1,29 +1,20 @@
 use crate::models::{Profile, TgWsConnectivityKind, TgWsConnectivityProbe, TgWsConnectivityReport};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tauri::Manager;
-use tg_ws_proxy_rs::{
-    check,
-    config::Config,
-    default_domains,
-    limits::{auto_max_connections, soft_nofile_limit},
-    pool::WsPool,
-    proxy,
-    runtime::Runtime,
-};
-use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Semaphore};
+use tg_ws_proxy_rs::{check, config::Config, default_domains, server};
+use tokio::sync::oneshot;
 use tracing_subscriber::fmt::MakeWriter;
 
 pub const ENGINE_NAME: &str = "tg-ws-proxy-rs";
-pub const ENGINE_VERSION: &str = "2.2.5-zui.1";
+pub const ENGINE_VERSION: &str = tg_ws_proxy_rs::VERSION;
 
-static TG_WS_TRACE_SENDER: OnceLock<std::sync::mpsc::Sender<String>> = OnceLock::new();
+static TG_WS_TRACE_SENDER: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
 static TG_WS_VERBOSE: AtomicBool = AtomicBool::new(false);
+static TG_WS_DROPPED_LOG_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct TgWsMakeWriter;
 
@@ -53,7 +44,20 @@ impl Drop for TgWsTraceWriter {
         let message = String::from_utf8_lossy(&self.bytes).trim().to_string();
         if !message.is_empty() {
             if let Some(sender) = TG_WS_TRACE_SENDER.get() {
-                let _ = sender.send(message);
+                match sender.try_send(message) {
+                    Ok(()) => {
+                        let dropped = TG_WS_DROPPED_LOG_LINES.swap(0, Ordering::Relaxed);
+                        if dropped > 0 {
+                            let _ = sender.try_send(format!(
+                                "tg-ws log queue recovered; {dropped} verbose lines were dropped to protect application memory"
+                            ));
+                        }
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        TG_WS_DROPPED_LOG_LINES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                }
             }
         }
     }
@@ -86,7 +90,7 @@ pub fn install_logging(app: tauri::AppHandle) {
     if TG_WS_TRACE_SENDER.get().is_some() {
         return;
     }
-    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(2048);
     if TG_WS_TRACE_SENDER.set(sender).is_err() {
         return;
     }
@@ -111,6 +115,7 @@ pub fn install_logging(app: tauri::AppHandle) {
 pub struct TgWsRuntimeHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     thread: JoinHandle<()>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
     pub host: String,
     pub port: u16,
     pub link: String,
@@ -121,9 +126,22 @@ impl TgWsRuntimeHandle {
         !self.thread.is_finished()
     }
 
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
     pub fn stop(mut self) -> Result<(), String> {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !self.thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !self.thread.is_finished() {
+            return Err(
+                "tg-ws runtime did not stop within 5 seconds; its thread was detached".to_string(),
+            );
         }
         self.thread
             .join()
@@ -135,17 +153,11 @@ pub fn spawn(profile: &Profile) -> Result<TgWsRuntimeHandle, String> {
     TG_WS_VERBOSE.store(profile.tg_ws_verbose, Ordering::Relaxed);
     let config = config_from_profile(profile)?;
     let host = config.bind_host();
-    let port = config.port;
-    let secret = config.link_secret();
-    let link_host = config.link_host();
-    let link = format!(
-        "tg://proxy?server={}&port={}&secret={}",
-        link_host, config.port, secret
-    );
-
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<server::ListenInfo, String>>();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let thread_config = config.clone();
+    let failure = Arc::new(std::sync::Mutex::new(None::<String>));
+    let thread_failure = Arc::clone(&failure);
 
     let thread = std::thread::Builder::new()
         .name("zui-tg-ws-runtime".into())
@@ -157,38 +169,126 @@ pub fn spawn(profile: &Profile) -> Result<TgWsRuntimeHandle, String> {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = ready_tx.send(Err(error.to_string()));
+                    let message = format!("could not create Tokio runtime: {error}");
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(message.clone());
+                    }
+                    let _ = ready_tx.send(Err(message));
                     return;
                 }
             };
 
             runtime.block_on(async move {
-                let result = run_proxy(thread_config, ready_tx, shutdown_rx).await;
+                let ready_tx = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
+                let listen_tx = Arc::clone(&ready_tx);
+                let result = server::run_with_listen(
+                    thread_config,
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    move |info| {
+                        if let Some(sender) = listen_tx.lock().ok().and_then(|mut tx| tx.take()) {
+                            let _ = sender.send(Ok(info));
+                        }
+                    },
+                )
+                .await;
+
                 if let Err(error) = result {
-                    tracing::error!("tg-ws runtime stopped with error: {}", error);
+                    let message = format!("tg-ws server stopped with error: {error}");
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(message.clone());
+                    }
+                    tracing::error!(error = %error, "tg-ws runtime stopped with error");
+                    if let Some(sender) = ready_tx.lock().ok().and_then(|mut tx| tx.take()) {
+                        let _ = sender.send(Err(message));
+                    }
+                } else {
+                    let pending_sender = ready_tx.lock().ok().and_then(|mut tx| tx.take());
+                    let message = if pending_sender.is_some() {
+                        "tg-ws stopped before the listener became ready".to_string()
+                    } else {
+                        "tg-ws server stopped unexpectedly".to_string()
+                    };
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(message.clone());
+                    }
+                    if let Some(sender) = pending_sender {
+                        let _ = sender.send(Err(message));
+                    }
                 }
             });
         })
         .map_err(|error| error.to_string())?;
 
-    match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => Ok(TgWsRuntimeHandle {
+    match ready_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(Ok(info)) => Ok(TgWsRuntimeHandle {
             shutdown_tx: Some(shutdown_tx),
             thread,
+            failure,
             host,
-            port,
-            link,
+            port: info.addr.port(),
+            link: info.tg_link,
         }),
         Ok(Err(error)) => {
             let _ = thread.join();
-            Err(error)
+            Err(format!("tg-ws listener startup failed: {error}"))
         }
         Err(error) => {
             let _ = shutdown_tx.send(());
-            let _ = thread.join();
-            Err(format!("tg-ws runtime did not start: {error}"))
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let cleanup = if thread.is_finished() {
+                let _ = thread.join();
+                "runtime stopped"
+            } else {
+                "runtime did not stop within 5 seconds and was detached"
+            };
+            Err(format!(
+                "tg-ws listener did not become ready within 30 seconds: {error}; {cleanup}"
+            ))
         }
     }
+}
+
+pub fn configuration_summary(profile: &Profile) -> Result<String, String> {
+    let config = config_from_profile(profile)?;
+    let cf_mode = if !profile.tg_ws_cf_proxy_enabled {
+        "disabled".to_string()
+    } else if profile.tg_ws_cf_custom_enabled {
+        format!("custom({})", config.cf_domains.join(","))
+    } else if config.default_domains {
+        "automatic-default-domains".to_string()
+    } else {
+        "enabled-without-domains".to_string()
+    };
+    let workers = if config.cf_worker_domains().is_empty() {
+        "disabled".to_string()
+    } else {
+        config.cf_worker_domains().join(",")
+    };
+    Ok(format!(
+        "listen={}:{}, dc_routes={}, cf_proxy={}, cf_workers={}, fronting={}, priority={}, balance={}, pool_size={}, socket_buffer_kib={}, force_test_dc={}, verbose={}",
+        config.bind_host(),
+        config.port,
+        config
+            .dc_ip
+            .iter()
+            .map(|(dc, ip)| format!("{dc}:{ip}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        cf_mode,
+        workers,
+        config.fronting_domain.as_deref().unwrap_or("disabled"),
+        config.cf_priority,
+        config.cf_balance,
+        config.pool_size,
+        config.buf_kb,
+        config.force_test_dc,
+        config.verbose,
+    ))
 }
 
 pub(crate) fn config_from_profile(profile: &Profile) -> Result<Config, String> {
@@ -226,50 +326,60 @@ pub(crate) fn config_from_profile(profile: &Profile) -> Result<Config, String> {
 
     let dc_ip = parse_dc_ip_list(&profile.tg_ws_dc_ips)?;
 
-    Ok(Config {
-        port: profile.tg_ws_port,
-        host: Some(profile.tg_ws_host.clone()),
-        secrets: vec![secret],
-        listen_faketls_domain: None,
-        dc_ip,
-        buf_kb: profile.tg_ws_buf_kb.max(4),
-        pool_size: profile.tg_ws_pool_size,
-        force_test_dc: profile.tg_ws_force_test_dc,
-        max_connections: None,
-        verbose: profile.tg_ws_verbose,
-        skip_tls_verify: false,
-        quiet: !profile.tg_ws_verbose,
-        log_file: None,
-        mtproto_proxies: Vec::new(),
-        link_ip: Some(advertised_link_host(&profile.tg_ws_host)),
-        cf_domains,
-        cf_worker_domains,
-        cf_priority: profile.tg_ws_cf_priority,
-        cf_balance: profile.tg_ws_cf_balance,
-        ws_connect_timeout: 10,
-        ws_fail_probe_timeout: 2,
-        ws_fail_cooldown: 30,
-        ws_redirect_cooldown: 300,
-        ip_fail_cooldown: 3600,
-        handshake_timeout: 10,
-        tcp_fallback_timeout: 10,
-        upstream_connect_timeout: 5,
-        upstream_fail_cooldown: 60,
-        cf_connect_timeout: 10,
-        cf_fail_cooldown: 60,
-        fronting_domain,
-        fronting_cooldown: 1800,
-        fronting_fail_cooldown: 60,
-        pool_max_age: 55,
-        check: false,
-        default_domains: profile.tg_ws_cf_proxy_enabled
-            && !profile.tg_ws_cf_custom_enabled
-            && profile.tg_ws_default_domains,
-        outbound_proxy: None,
-        no_outbound_proxy: true,
-        no_proxy: None,
+    let mut args = vec![
+        "tg-ws-proxy".to_string(),
+        "--port".to_string(),
+        profile.tg_ws_port.to_string(),
+        "--host".to_string(),
+        profile.tg_ws_host.clone(),
+        "--secret".to_string(),
+        secret,
+        "--buf-kb".to_string(),
+        profile.tg_ws_buf_kb.max(4).to_string(),
+        "--pool-size".to_string(),
+        profile.tg_ws_pool_size.to_string(),
+        "--link-ip".to_string(),
+        advertised_link_host(&profile.tg_ws_host),
+        "--no-outbound-proxy".to_string(),
+    ];
+    for (dc, ip) in dc_ip {
+        args.push("--dc-ip".to_string());
+        args.push(format!("{dc}:{ip}"));
     }
-    .with_defaults())
+    for domain in cf_domains {
+        args.push("--cf-domain".to_string());
+        args.push(domain);
+    }
+    for domain in cf_worker_domains {
+        args.push("--cf-worker-domain".to_string());
+        args.push(domain);
+    }
+    if let Some(domain) = fronting_domain {
+        args.push("--fronting-domain".to_string());
+        args.push(domain);
+    }
+    if profile.tg_ws_force_test_dc {
+        args.push("--force-test-dc".to_string());
+    }
+    if profile.tg_ws_verbose {
+        args.push("--verbose".to_string());
+    } else {
+        args.push("--quiet".to_string());
+    }
+    if profile.tg_ws_cf_priority {
+        args.push("--cf-priority".to_string());
+    }
+    if profile.tg_ws_cf_balance {
+        args.push("--cf-balance".to_string());
+    }
+    if profile.tg_ws_cf_proxy_enabled
+        && !profile.tg_ws_cf_custom_enabled
+        && profile.tg_ws_default_domains
+    {
+        args.push("--default-domains".to_string());
+    }
+
+    Config::try_from_args(args).map_err(|error| format!("invalid tg-ws configuration: {error}"))
 }
 
 fn normalize_domain(value: &str) -> String {
@@ -437,90 +547,6 @@ fn advertised_link_host(bind_host: &str) -> String {
         "0.0.0.0" | "::" => "127.0.0.1".to_string(),
         host => host.to_string(),
     }
-}
-
-async fn run_proxy(
-    mut config: Config,
-    ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) -> Result<(), String> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let outbound = config.outbound_connector()?;
-    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
-        config.fronting_domain.clone(),
-        Duration::from_secs(config.fronting_cooldown),
-    ));
-
-    if config.default_domains {
-        let fetched =
-            default_domains::fetch_default_domains_with_outbound(runtime.outbound()).await;
-        config.cf_domains.extend(fetched);
-    }
-
-    let bind_host = config.bind_host();
-    let addr: SocketAddr = format!("{}:{}", bind_host, config.port)
-        .parse::<SocketAddr>()
-        .map_err(|error| error.to_string())?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|error| format!("cannot bind {addr}: {error}"))?;
-
-    let fd_limit = soft_nofile_limit();
-    let dc_buckets = config.dc_redirects().len().max(1) * 2;
-    let max_connections = config
-        .max_connections
-        .unwrap_or_else(|| auto_max_connections(fd_limit, config.pool_size, dc_buckets));
-    let pool = Arc::new(WsPool::with_runtime(
-        config.pool_size,
-        Duration::from_secs(config.pool_max_age),
-        Arc::clone(&runtime),
-    ));
-    let config = Arc::new(config);
-
-    {
-        let pool = pool.clone();
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            pool.warmup(&config).await;
-        });
-    }
-
-    let _ = ready_tx.send(Ok(()));
-    let semaphore = Arc::new(Semaphore::new(max_connections));
-
-    loop {
-        let permit = tokio::select! {
-            _ = &mut shutdown_rx => break,
-            permit = Arc::clone(&semaphore).acquire_owned() => {
-                permit.map_err(|_| "tg-ws runtime semaphore closed".to_string())?
-            }
-        };
-
-        let accepted = tokio::select! {
-            _ = &mut shutdown_rx => break,
-            accepted = listener.accept() => accepted,
-        };
-
-        match accepted {
-            Ok((stream, peer_addr)) => {
-                let config = Arc::clone(&config);
-                let pool = pool.clone();
-                let runtime = Arc::clone(&runtime);
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    proxy::handle_client_with_runtime(stream, peer_addr, config, pool, runtime)
-                        .await;
-                });
-            }
-            Err(error) => {
-                tracing::warn!("tg-ws accept error: {}", error);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn normalize_secret(raw: &str) -> String {

@@ -36,17 +36,46 @@ stray="$(find "$ROOT/openwrt/luci-app" -name '*tg-ws-proxy*' ! -name '*tg-ws-pro
 [[ -z "$stray" ]] || fail "packaged path collides with the upstream tg-ws-proxy package: $stray"
 
 cargo_version="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$ROOT/Cargo.toml")"
-grep -Fq ",$cargo_version)" "$makefile" || fail "LuCI default version does not match Cargo $cargo_version"
+# shellcheck disable=SC2016 # Match literal OpenWrt make variables.
+grep -Fq 'PKG_VERSION:=$(TG_PACKAGE_VERSION)' "$makefile" || fail 'LuCI recipe does not use the supplied package version'
+if grep -Eq '^PKG_VERSION:.*[0-9]+\.[0-9]+\.[0-9]+' "$makefile"; then
+    fail 'LuCI recipe duplicates the Cargo package version'
+fi
+builder="$ROOT/openwrt/build-luci-package.sh"
+grep -Fq 'tomllib.load(open(sys.argv[1], "rb"))["package"]["version"]' "$builder" || \
+    fail 'LuCI builder does not default to the Cargo package version'
+# shellcheck disable=SC2016 # Match the literal exported shell variable.
+grep -Fq 'export TG_PACKAGE_VERSION="$VERSION"' "$builder" || \
+    fail 'LuCI builder does not supply its version to every SDK make invocation'
 [[ -f "$ROOT/docs/release-notes/$cargo_version.md" ]] || fail "release notes for $cargo_version are missing"
 # shellcheck disable=SC2016 # Match a literal Bash parameter expansion.
-grep -Fq 'output_name="${output_name//\~/.}"' "$ROOT/openwrt/build-luci-package.sh" || \
+grep -Fq 'output_name="${output_name//\~/.}"' "$builder" || \
     fail 'beta IPK release filename is not normalized before checksums'
 
 workflow="$ROOT/.github/workflows/release.yml"
 grep -Fq 'openwrt/build-luci-package.sh' "$workflow" || fail 'release does not build LuCI through the SDK recipe'
 grep -Fq -- '--format apk' "$workflow" || fail 'release misses LuCI APK build'
 grep -Fq -- '--format ipk' "$workflow" || fail 'release misses LuCI IPK build'
-grep -Fq 'sha256sum -- *.tar.gz *.apk *.ipk > SHA256SUMS' "$workflow" || fail 'release checksums do not cover binaries and LuCI packages'
+# SHA256SUMS used to be built inside `openwrt-luci`, from the musl tarballs it
+# downloaded plus its own two packages -- so this contract could be a grep for
+# that one command line. It has its own job now, which hashes what the draft
+# release actually serves; what has to hold is that the job waits for the LuCI
+# packages and the binaries to be uploaded before it reads the release back,
+# and that nothing publishes ahead of it.
+job_needs() {
+    awk -v job="$1" \
+        '$0 ~ "^[[:space:]]*" job ":[[:space:]]*$" { found = 1 }
+         found && /needs:/ { print; exit }' "$workflow"
+}
+checksums_needs="$(job_needs checksums)"
+[[ -n "$checksums_needs" ]] || fail 'release has no checksums job'
+for upstream in upload-assets openwrt-luci; do
+    grep -Fq "$upstream" <<<"$checksums_needs" || \
+        fail "checksums does not wait on $upstream, so its assets would ship unhashed"
+done
+grep -Fq 'SHA256SUMS' "$workflow" || fail 'release does not publish SHA256SUMS'
+grep -Fq checksums <<<"$(job_needs publish-release)" || \
+    fail 'release can publish before SHA256SUMS is uploaded'
 if grep -Eq 'build-package\.sh|release-architectures|dist/openwrt/tg-ws-proxy_|set -- tg-ws-proxy_' "$workflow"; then
     fail 'release workflow still builds core OpenWrt packages'
 fi

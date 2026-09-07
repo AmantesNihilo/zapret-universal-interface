@@ -73,7 +73,7 @@ pub fn load_profiles() -> Result<ProfilesFile, String> {
 pub fn save_profiles(profiles: &ProfilesFile) -> Result<(), String> {
     paths::ensure_data_layout().map_err(|error| error.to_string())?;
     let text = serde_json::to_string_pretty(profiles).map_err(|error| error.to_string())?;
-    std::fs::write(paths::profiles_path(), text).map_err(|error| error.to_string())
+    json_storage::write_atomic(&paths::profiles_path(), text.as_bytes())
 }
 
 pub fn save_profile(mut profile: Profile) -> Result<ProfilesFile, String> {
@@ -98,26 +98,6 @@ fn ensure_secret(profile: &mut Profile) -> bool {
     }
     profile.tg_ws_secret = generate_secret();
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_legacy_secret_is_generated_once() {
-        let mut profile = Profile {
-            tg_ws_secret: String::new(),
-            ..Profile::default()
-        };
-
-        assert!(ensure_secret(&mut profile));
-        let generated = profile.tg_ws_secret.clone();
-        assert_eq!(generated.len(), 32);
-        assert!(generated.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert!(!ensure_secret(&mut profile));
-        assert_eq!(profile.tg_ws_secret, generated);
-    }
 }
 
 pub fn set_active_profile(profile_id: String) -> Result<ProfilesFile, String> {
@@ -157,4 +137,24 @@ pub fn active_profile() -> Result<Profile, String> {
         .into_iter()
         .find(|profile| profile.id == file.active_profile_id)
         .ok_or_else(|| "Active profile not found".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_legacy_secret_is_generated_once() {
+        let mut profile = Profile {
+            tg_ws_secret: String::new(),
+            ..Profile::default()
+        };
+
+        assert!(ensure_secret(&mut profile));
+        let generated = profile.tg_ws_secret.clone();
+        assert_eq!(generated.len(), 32);
+        assert!(generated.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!ensure_secret(&mut profile));
+        assert_eq!(profile.tg_ws_secret, generated);
+    }
 }

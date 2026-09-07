@@ -1,6 +1,64 @@
 use super::*;
 
+use clap::Parser;
+
 use crate::crypto::HANDSHAKE_LEN;
+
+#[test]
+fn faketls_pending_uses_an_offset_and_releases_its_record() {
+    let mut pending = PendingData::from_record(vec![10, 11, 12, 13, 14], 2);
+    let original_ptr = pending.data.as_ptr();
+    let mut first = [0u8; 2];
+
+    assert_eq!(pending.read(&mut first), Some(2));
+    assert_eq!(first, [12, 13]);
+    assert_eq!(pending.data.as_ptr(), original_ptr);
+
+    let mut last = [0u8; 2];
+    assert_eq!(pending.read(&mut last), Some(1));
+    assert_eq!(last[0], 14);
+    assert!(pending.data.is_empty());
+    assert_eq!(pending.data.capacity(), 0);
+    assert_eq!(pending.read(&mut last), None);
+}
+
+#[tokio::test]
+async fn client_handler_future_stays_compact() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, peer) = listener.accept().await.unwrap();
+
+    let config = Arc::new(
+        Config::try_parse_from([
+            "tg-ws-proxy",
+            "--secret",
+            "00112233445566778899aabbccddeeff",
+            "--pool-size",
+            "0",
+            "--no-outbound-proxy",
+        ])
+        .unwrap(),
+    );
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let handler = handle_client_with_runtime(server, peer, config, pool, runtime);
+    let future_size = std::mem::size_of_val(&handler);
+    eprintln!("per-client future size: {future_size} bytes");
+
+    assert!(
+        future_size <= 4 * 1024,
+        "the per-client future grew to {future_size} bytes"
+    );
+
+    drop(handler);
+    drop(client);
+}
 
 #[test]
 fn balanced_rotates_the_starting_domain() {
@@ -12,16 +70,28 @@ fn balanced_rotates_the_starting_domain() {
     ];
 
     assert_eq!(
-        balanced(&workers, &counter),
-        ["w1", "w2", "w3"].map(|w| format!("{w}.example.workers.dev"))
+        domain_order(&workers, balance_offset(&workers, true, &counter)).collect::<Vec<_>>(),
+        [
+            "w1.example.workers.dev",
+            "w2.example.workers.dev",
+            "w3.example.workers.dev"
+        ]
     );
     assert_eq!(
-        balanced(&workers, &counter),
-        ["w2", "w3", "w1"].map(|w| format!("{w}.example.workers.dev"))
+        domain_order(&workers, balance_offset(&workers, true, &counter)).collect::<Vec<_>>(),
+        [
+            "w2.example.workers.dev",
+            "w3.example.workers.dev",
+            "w1.example.workers.dev"
+        ]
     );
     assert_eq!(
-        balanced(&workers, &counter),
-        ["w3", "w1", "w2"].map(|w| format!("{w}.example.workers.dev"))
+        domain_order(&workers, balance_offset(&workers, true, &counter)).collect::<Vec<_>>(),
+        [
+            "w3.example.workers.dev",
+            "w1.example.workers.dev",
+            "w2.example.workers.dev"
+        ]
     );
 }
 
@@ -30,25 +100,22 @@ fn balanced_leaves_short_lists_untouched() {
     let counter = AtomicUsize::new(0);
     let single = vec!["only.example".to_string()];
 
-    assert_eq!(balanced(&[], &counter), Vec::<String>::new());
-    assert_eq!(balanced(&single, &counter), single);
+    assert_eq!(balance_offset(&[], true, &counter), 0);
+    assert_eq!(balance_offset(&single, true, &counter), 0);
     // A list that cannot be rotated must not consume a counter tick either.
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
 #[test]
-fn balance_order_borrows_when_balancing_is_disabled() {
+fn domain_order_borrows_without_cloning() {
     let counter = AtomicUsize::new(0);
     let domains = vec!["a.example".to_string(), "b.example".to_string()];
 
-    assert!(matches!(
-        balance_order(&domains, false, &counter),
-        Cow::Borrowed(_)
-    ));
-    assert!(matches!(
-        balance_order(&domains, true, &counter),
-        Cow::Owned(_)
-    ));
+    let ordered =
+        domain_order(&domains, balance_offset(&domains, false, &counter)).collect::<Vec<_>>();
+    assert!(std::ptr::eq(ordered[0], domains[0].as_str()));
+    assert!(std::ptr::eq(ordered[1], domains[1].as_str()));
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -105,33 +172,24 @@ fn human_bytes_scales_through_the_units() {
 
 #[tokio::test]
 async fn an_aborted_direction_still_reports_the_bytes_it_moved() {
-    // Regression test: the directions used to return their total, and
-    // `join_bridge` cancels whichever one is still running — so the cancelled
-    // side's count was lost and every session logged one direction as zero.
-    let counters = Arc::new(BridgeCounters::default());
-
+    let bytes_up = Arc::new(StdMutex::new(0));
+    let mut bytes_down = 0;
     let upload = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = UploadCounter::new(Arc::clone(&bytes_up));
         async move {
-            counters.add_up(4096);
-            // Finishes first, which is what triggers the abort below.
+            bytes.add(4096);
+            tokio::task::yield_now().await;
         }
     });
-
-    let download = tokio::spawn({
-        let counters = Arc::clone(&counters);
-        async move {
-            counters.add_down(1024);
-            // Still running when the peer finishes, so this task is aborted
-            // partway — exactly the case that used to lose the count.
-            std::future::pending::<()>().await;
-            counters.add_down(999_999);
-        }
-    });
+    let download = async {
+        bytes_down += 1024;
+        std::future::pending::<()>().await;
+        bytes_down += 999_999;
+    };
 
     let closed_by = join_bridge(upload, download).await;
 
-    assert_eq!(counters.totals(), (4096, 1024));
+    assert_eq!((*bytes_up.lock().unwrap(), bytes_down), (4096, 1024));
     // The upload direction ran out first, which means the client stopped.
     assert!(matches!(closed_by, ClosedBy::Client));
 }
@@ -142,30 +200,18 @@ async fn the_side_that_stops_first_is_the_one_reported() {
     // up; this is what tells a client-side timeout apart from an upstream
     // that dropped us right after the handshake.
     let upload = tokio::spawn(std::future::pending::<()>());
-    let download = tokio::spawn(async {});
+    let download = async {};
     assert!(matches!(
         join_bridge(upload, download).await,
         ClosedBy::Upstream
     ));
 
     let upload = tokio::spawn(async {});
-    let download = tokio::spawn(std::future::pending::<()>());
+    let download = std::future::pending::<()>();
     assert!(matches!(
         join_bridge(upload, download).await,
         ClosedBy::Client
     ));
-}
-
-#[test]
-fn bridge_counters_accumulate_across_many_chunks() {
-    let counters = BridgeCounters::default();
-
-    for _ in 0..10 {
-        counters.add_up(100);
-        counters.add_down(250);
-    }
-
-    assert_eq!(counters.totals(), (1000, 2500));
 }
 
 // ─── WebSocket framing ───────────────────────────────────────────────────────
@@ -208,7 +254,7 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
     let clients_addr = clients.local_addr().unwrap();
     let mut client = TcpStream::connect(clients_addr).await.unwrap();
     let (server, _) = clients.accept().await.unwrap();
-    let (reader, writer) = tokio::io::split(server);
+    let (reader, writer) = server.into_split();
 
     let relay_init = generate_relay_init(ProtoTag::PaddedIntermediate, 2);
     let ciphers = build_connection_ciphers(&[0u8; 48], &[0u8; 32], &relay_init);
@@ -218,7 +264,7 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
             ClientReader::Plain(reader),
             ClientWriter::Plain(writer),
             WsBridgeParams {
-                label: "test",
+                label: "127.0.0.1:1".parse().unwrap(),
                 ws,
                 framing,
                 relay_init,

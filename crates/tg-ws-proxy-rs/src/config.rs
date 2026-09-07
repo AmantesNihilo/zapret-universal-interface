@@ -5,7 +5,9 @@
 //! That makes Docker / systemd deployments trivial without a config file.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::net::UdpSocket;
+use std::sync::OnceLock;
 
 use clap::Parser;
 
@@ -75,6 +77,18 @@ pub struct MtProtoProxy {
     /// `ee` = FakeTLS.  The prefix byte is stripped before key derivation —
     /// only the trailing 16 bytes are used as the actual cryptographic key.
     pub secret: String,
+    secret_key: Vec<u8>,
+    faketls_hostname: Option<String>,
+}
+
+impl MtProtoProxy {
+    pub fn secret_key(&self) -> &[u8] {
+        &self.secret_key
+    }
+
+    pub fn faketls_hostname(&self) -> Option<&str> {
+        self.faketls_hostname.as_deref()
+    }
 }
 
 /// Parse a `HOST:PORT:SECRET` triplet.
@@ -94,9 +108,22 @@ fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
         .map_err(|_| format!("invalid port {:?}", parts[1]))?;
     let host = parts[2].to_string();
 
-    hex::decode(&secret).map_err(|_| format!("invalid hex secret {:?}", secret))?;
+    let raw_secret =
+        hex::decode(&secret).map_err(|_| format!("invalid hex secret {:?}", secret))?;
+    let secret_key = crypto::secret_key(&raw_secret).to_vec();
+    let faketls_hostname = crypto::faketls_hostname(&raw_secret)
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| "FakeTLS secret hostname must be valid UTF-8".to_string())?
+        .map(ToOwned::to_owned);
 
-    Ok(MtProtoProxy { host, port, secret })
+    Ok(MtProtoProxy {
+        host,
+        port,
+        secret,
+        secret_key,
+        faketls_hostname,
+    })
 }
 
 // ─── CLI / env-var configuration ─────────────────────────────────────────────
@@ -234,7 +261,7 @@ pub struct Config {
     ///
     /// Setup: add `kws1`–`kws5` A records in your Cloudflare DNS pointing to
     /// the respective Telegram DC IPs, enable the orange-cloud proxy, and set
-    /// SSL/TLS mode to **Flexible**.  See docs/CfProxy.md for full instructions.
+    /// SSL/TLS mode to **Flexible**.
     ///
     /// Multiple domains can be specified as a comma-separated list.  They are
     /// tried in the order given (first domain has highest priority).
@@ -500,12 +527,104 @@ pub struct Config {
     /// Standard `NO_PROXY` / `no_proxy` variables are honored when omitted.
     #[arg(long = "no-proxy", value_name = "LIST", env = "TG_NO_PROXY")]
     pub no_proxy: Option<String>,
+
+    #[arg(skip)]
+    normalized_secrets: OnceLock<Vec<Vec<u8>>>,
+
+    #[arg(skip)]
+    normalized_listen_faketls_domain: OnceLock<Option<String>>,
+}
+
+/// Split a shell-style argument line into tokens.
+///
+/// Understands single and double quotes and backslash escapes outside single
+/// quotes.  Used by the Android embedder (and anything else that has a text
+/// field rather than a real argv) so the same flags the binary accepts can
+/// be typed as one string.
+pub fn split_cli_args(line: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = line.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if started {
+                    args.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            '\\' if !in_single => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                    started = true;
+                } else {
+                    return Err("trailing backslash in argument list".into());
+                }
+            }
+            other => {
+                cur.push(other);
+                started = true;
+            }
+        }
+    }
+
+    if in_single || in_double {
+        return Err("unclosed quote in argument list".into());
+    }
+    if started {
+        args.push(cur);
+    }
+    Ok(args)
 }
 
 impl Config {
     /// Parse configuration from CLI arguments.
     pub fn from_args() -> Self {
         Self::parse().with_defaults()
+    }
+
+    /// Parse configuration from an explicit argument iterator.
+    ///
+    /// This is the preferred entry point for embedders: it preserves argument
+    /// boundaries and applies the same post-parse normalization as the CLI.
+    pub fn try_from_args<I, T>(args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Self::try_parse_from(args)
+            .map(Self::with_defaults)
+            .map_err(|error| error.render().to_string())
+    }
+
+    /// Parse a single command-line string the same way the binary parses argv.
+    ///
+    /// A leading token that does not start with `-` is treated as the program
+    /// name (so `./tg-ws --port 9050` works).  Otherwise `tg-ws-proxy` is
+    /// prepended as argv0.
+    pub fn try_from_cli_line(line: &str) -> Result<Self, String> {
+        let tokens = split_cli_args(line.trim())?;
+        let args = match tokens.first() {
+            Some(first) if !first.starts_with('-') => tokens,
+            _ => {
+                let mut args = vec!["tg-ws-proxy".to_string()];
+                args.extend(tokens);
+                args
+            }
+        };
+        Self::try_from_args(args)
     }
 
     /// Fill in the values that can only be defaulted after parsing.
@@ -528,6 +647,14 @@ impl Config {
             let bytes: [u8; 16] = rand::random();
             self.secrets.push(hex::encode(bytes));
         }
+        let normalized_secrets: Vec<Vec<u8>> = self
+            .secrets
+            .iter()
+            .map(|secret| decode_secret_key(secret))
+            .collect();
+        let normalized_listen_faketls_domain = self.derive_listen_faketls_domain();
+        self.normalized_secrets = OnceLock::from(normalized_secrets);
+        self.normalized_listen_faketls_domain = OnceLock::from(normalized_listen_faketls_domain);
 
         // If no --dc-ip was given, use the built-in defaults — unless a CF
         // domain is configured or --default-domains was requested (in which
@@ -550,28 +677,41 @@ impl Config {
 
     /// The proxy secret as raw bytes (decoded from hex).
     pub fn secret_bytes(&self) -> Vec<u8> {
-        decode_secret_key(self.primary_secret())
+        self.normalized_secrets()
+            .first()
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// All configured proxy secrets as raw bytes.
     pub fn secret_bytes_list(&self) -> Vec<Vec<u8>> {
-        self.secrets
-            .iter()
-            .map(|secret| decode_secret_key(secret))
-            .collect()
+        self.normalized_secrets().to_vec()
+    }
+
+    /// All configured proxy secrets in the process-lifetime representation.
+    pub fn normalized_secrets(&self) -> &[Vec<u8>] {
+        self.normalized_secrets
+            .get_or_init(|| {
+                self.secrets
+                    .iter()
+                    .map(|secret| decode_secret_key(secret))
+                    .collect()
+            })
+            .as_slice()
     }
 
     /// Inbound FakeTLS domain, either from `--listen-faketls-domain` or from
     /// an `ee<key><domainhex>` secret.
     pub fn listen_faketls_domain(&self) -> Option<String> {
-        if let Some(domain) = &self.listen_faketls_domain {
-            return Some(domain.clone());
-        }
+        self.normalized_listen_faketls_domain()
+            .map(ToOwned::to_owned)
+    }
 
-        let raw = hex::decode(self.primary_secret()).ok()?;
-        let hostname = crypto::faketls_hostname(&raw)?;
-
-        std::str::from_utf8(hostname).ok().map(ToOwned::to_owned)
+    /// Borrow the normalized inbound FakeTLS domain without allocating.
+    pub fn normalized_listen_faketls_domain(&self) -> Option<&str> {
+        self.normalized_listen_faketls_domain
+            .get_or_init(|| self.derive_listen_faketls_domain())
+            .as_deref()
     }
 
     /// Full secret value for the generated Telegram link.
@@ -591,6 +731,16 @@ impl Config {
         } else {
             format!("dd{}", secret)
         }
+    }
+
+    fn derive_listen_faketls_domain(&self) -> Option<String> {
+        if let Some(domain) = &self.listen_faketls_domain {
+            return Some(domain.clone());
+        }
+
+        let raw = hex::decode(self.primary_secret()).ok()?;
+        let hostname = crypto::faketls_hostname(&raw)?;
+        std::str::from_utf8(hostname).ok().map(ToOwned::to_owned)
     }
 
     /// Map of DC ID → target IP from `--dc-ip` flags.

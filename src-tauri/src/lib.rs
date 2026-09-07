@@ -86,8 +86,10 @@ pub fn run() {
             runtime::tg_ws::install_logging(app.handle().clone());
             paths::ensure_data_layout()?;
             let settings = settings::load_settings().unwrap_or_default();
+            let windows_startup = settings::is_windows_startup_launch();
             let layout_orientation = settings.layout_orientation.clone();
             let launch_minimized = settings.launch_minimized;
+            let start_with_windows_in_tray = settings.start_with_windows_in_tray;
             let auto_start_active_profile_on_launch = settings.auto_start_active_profile_on_launch;
             let profiles = profiles::load_profiles().unwrap_or_default();
             let active_profile_id = profiles.active_profile_id.clone();
@@ -101,25 +103,38 @@ pub fn run() {
             let runtime_state = app.state::<Mutex<RuntimeState>>();
             let mut runtime = runtime_state.lock().unwrap();
             runtime.app_state.active_profile_id = active_profile_id;
-            runtime.settings = settings;
+            runtime.settings = settings.clone();
             drop(runtime);
             logging::push(
                 app.handle(),
                 &runtime_state,
                 models::LogSource::App,
                 format!(
-                    "ZUI {} started in {} mode",
+                    "ZUI {} started in {} mode (windows_startup={}, tray_start={})",
                     env!("CARGO_PKG_VERSION"),
-                    paths::distribution_mode()
+                    paths::distribution_mode(),
+                    windows_startup,
+                    windows_startup && start_with_windows_in_tray,
                 ),
             );
-            services::restore_owned_processes(app.handle(), &runtime_state);
-            tray::setup(app)?;
-            windowing::apply_layout(app.handle(), &layout_orientation).ok();
-            if launch_minimized {
-                tray::hide_main_window(app.handle());
+            if let Err(error) = settings::sync_startup_registration(&settings) {
+                logging::push(
+                    app.handle(),
+                    &runtime_state,
+                    models::LogSource::App,
+                    format!("Windows startup registration could not be refreshed: {error}"),
+                );
             }
-            if restore_last_power_state
+            services::restore_owned_processes(app.handle(), &runtime_state);
+            tray::setup(app, &settings.language)?;
+            windowing::apply_layout(app.handle(), &layout_orientation).ok();
+            if launch_minimized || (windows_startup && start_with_windows_in_tray) {
+                tray::hide_main_window(app.handle());
+            } else {
+                tray::show_main_window(app.handle());
+            }
+            if windows_startup
+                || restore_last_power_state
                 || auto_start_active_profile_on_launch
                 || active_profile_autostart
             {

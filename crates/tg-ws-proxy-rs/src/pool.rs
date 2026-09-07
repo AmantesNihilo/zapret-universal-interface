@@ -18,12 +18,14 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, stream};
 
 use crate::config::Config;
 use crate::outbound::OutboundConnector;
@@ -42,6 +44,11 @@ use crate::ws_client::{
 /// *next* connection, not a burst.  Upstream settled on the same number for its
 /// Worker pool in v1.9.1.
 const CF_POOL_MAX: usize = 1;
+
+/// Keep startup and refill latency bounded without making a large
+/// `--pool-size` fan out into an equally large TCP/TLS handshake burst.
+const POOL_CONNECT_CONCURRENCY: usize = 2;
+const WARMUP_BUCKET_CONCURRENCY: usize = 2;
 
 /// Which Cloudflare tier a pooled connection belongs to.  Pooled separately
 /// because the two are not interchangeable at the far end: a Worker is a raw
@@ -100,8 +107,9 @@ impl CfTarget {
 }
 
 type CfKey = (CfTier, u32, bool);
+type PoolKey = (u32, bool);
 type Bucket = Vec<PoolEntry>;
-type PoolMap = HashMap<(u32, bool), Bucket>;
+type PoolMap = HashMap<PoolKey, Bucket>;
 
 pub struct WsPool {
     pool_size: usize,
@@ -114,13 +122,16 @@ pub struct WsPool {
     cf_refilling: StdMutex<HashSet<CfKey>>,
     /// Tracks which (dc, is_media) buckets currently have a refill in flight.
     /// Prevents a stampede of concurrent refill tasks when many clients arrive
-    /// simultaneously — each `pool.get()` call spawns a refill, and without
-    /// this guard they all open `pool_size` connections at once, exhausting FDs.
+    /// simultaneously by reserving a bucket before spawning its refill task.
     ///
     /// Uses a standard (non-async) mutex because the critical section is tiny
     /// (a single HashSet insert/remove) and never holds the lock across an
     /// await point, which enables a simple Drop-based cleanup guard.
-    refilling: StdMutex<HashSet<(u32, bool)>>,
+    refilling: StdMutex<HashSet<PoolKey>>,
+    #[cfg(test)]
+    refill_task_spawns: AtomicUsize,
+    #[cfg(test)]
+    cf_refill_task_spawns: AtomicUsize,
 }
 
 /// RAII guard that removes a bucket key from a `refilling` set when dropped,
@@ -154,6 +165,10 @@ impl WsPool {
             cf_idle: Mutex::new(HashMap::new()),
             cf_refilling: StdMutex::new(HashSet::new()),
             refilling: StdMutex::new(HashSet::new()),
+            #[cfg(test)]
+            refill_task_spawns: AtomicUsize::new(0),
+            #[cfg(test)]
+            cf_refill_task_spawns: AtomicUsize::new(0),
         }
     }
 
@@ -170,7 +185,7 @@ impl WsPool {
         self: &Arc<Self>,
         dc: u32,
         is_media: bool,
-        target_ip: String,
+        target_ip: &str,
         skip_tls_verify: bool,
         allow_refill: bool,
     ) -> Option<TgWsStream> {
@@ -211,10 +226,7 @@ impl WsPool {
 
             // Schedule a background task to refill the bucket.
             if allow_refill {
-                let pool = Arc::clone(self);
-                tokio::spawn(async move {
-                    pool.refill(dc, is_media, target_ip, skip_tls_verify).await;
-                });
+                self.schedule_refill(dc, is_media, target_ip, skip_tls_verify);
             }
 
             return Some(entry.ws);
@@ -224,10 +236,7 @@ impl WsPool {
         drop(lock);
 
         if allow_refill {
-            let pool = Arc::clone(self);
-            tokio::spawn(async move {
-                pool.refill(dc, is_media, target_ip, skip_tls_verify).await;
-            });
+            self.schedule_refill(dc, is_media, target_ip, skip_tls_verify);
         }
 
         None
@@ -285,10 +294,21 @@ impl WsPool {
     /// Worker (or a network that cannot reach Cloudflare at all) is not
     /// dialled again behind the user's back on every client connection.
     pub fn cf_prefetch(self: &Arc<Self>, target: CfTarget) {
+        if self.pool_size == 0 {
+            return;
+        }
+
+        let key = target.key();
+        if !self.reserve_cf_refill(key) {
+            return;
+        }
+
         let pool = Arc::clone(self);
+        #[cfg(test)]
+        self.cf_refill_task_spawns.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
-            pool.cf_refill(target).await;
+            pool.cf_refill_reserved(target).await;
         });
     }
 
@@ -298,20 +318,29 @@ impl WsPool {
         let skip_tls = config.skip_tls_verify;
         let pool_size = self.pool_size;
 
-        for (dc, ip) in dc_redirects {
-            for is_media in [false, true] {
-                let new_conns = self
+        let jobs = dc_redirects.into_iter().flat_map(|(dc, ip)| {
+            [false, true]
+                .into_iter()
+                .map(move |is_media| (dc, ip.clone(), is_media))
+        });
+        let mut batches = stream::iter(jobs)
+            .map(|(dc, ip, is_media)| async move {
+                let connections = self
                     .connect_batch(&ip, dc, is_media, skip_tls, pool_size)
                     .await;
-                let mut lock = self.idle.lock().await;
-                let bucket = lock.entry((dc, is_media)).or_default();
+                (dc, is_media, connections)
+            })
+            .buffer_unordered(WARMUP_BUCKET_CONCURRENCY);
 
-                for ws in new_conns {
-                    bucket.push(PoolEntry {
-                        ws,
-                        created: Instant::now(),
-                    });
-                }
+        while let Some((dc, is_media, new_conns)) = batches.next().await {
+            let mut lock = self.idle.lock().await;
+            let bucket = lock.entry((dc, is_media)).or_default();
+
+            for ws in new_conns {
+                bucket.push(PoolEntry {
+                    ws,
+                    created: Instant::now(),
+                });
             }
         }
 
@@ -320,16 +349,30 @@ impl WsPool {
 
     // ── Internal ─────────────────────────────────────────────────────────
 
-    async fn refill(&self, dc: u32, is_media: bool, target_ip: String, skip_tls: bool) {
-        // Ensure only one refill runs at a time per (dc, is_media) key.
-        // Without this, a burst of simultaneous pool.get() calls spawns N
-        // refill tasks that each open pool_size connections concurrently,
-        // exhausting file descriptors well beyond the intended pool budget.
-        let registered = self.refilling.lock().unwrap().insert((dc, is_media));
-        if !registered {
-            return; // another refill is already in progress for this key
+    fn schedule_refill(self: &Arc<Self>, dc: u32, is_media: bool, target_ip: &str, skip_tls: bool) {
+        if self.pool_size == 0 || !self.reserve_refill((dc, is_media)) {
+            return;
         }
 
+        let pool = Arc::clone(self);
+        let target_ip = target_ip.to_string();
+        #[cfg(test)]
+        self.refill_task_spawns.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            pool.refill_reserved(dc, is_media, target_ip, skip_tls)
+                .await;
+        });
+    }
+
+    fn reserve_refill(&self, key: PoolKey) -> bool {
+        self.refilling.lock().unwrap().insert(key)
+    }
+
+    fn reserve_cf_refill(&self, key: CfKey) -> bool {
+        self.cf_refilling.lock().unwrap().insert(key)
+    }
+
+    async fn refill_reserved(&self, dc: u32, is_media: bool, target_ip: String, skip_tls: bool) {
         // The guard removes the key from `refilling` when it goes out of scope,
         // covering all exit paths (normal return, early return, or panic).
         let _guard = RefillGuard {
@@ -375,18 +418,13 @@ impl WsPool {
         }
     }
 
-    async fn cf_refill(&self, target: CfTarget) {
+    async fn cf_refill_reserved(&self, target: CfTarget) {
         let key = target.key();
-        if !self.cf_refilling.lock().unwrap().insert(key) {
-            return; // another refill is already in progress for this key
-        }
         let _guard = RefillGuard {
             set: &self.cf_refilling,
             key,
         };
 
-        // `--pool-size 0` disables pooling outright, exactly as it does for
-        // the direct pool — which an empty bucket must not talk its way out of.
         let budget = CF_POOL_MAX.min(self.pool_size);
         if self.cf_idle.lock().await.get(&key).map_or(0, Vec::len) >= budget {
             return;
@@ -473,19 +511,22 @@ impl WsPool {
             .then(|| self.runtime.fronting_domain())
             .flatten();
 
-        for _ in 0..count {
-            match connect_ws_for_dc_with_outbound(
-                ip,
-                dc,
-                is_media,
-                skip_tls,
-                timeout,
-                self.runtime.outbound(),
-                fronting_domain,
-            )
-            .await
-            .ws
-            {
+        let mut attempts = stream::iter(0..count)
+            .map(|_| {
+                connect_ws_for_dc_with_outbound(
+                    ip,
+                    dc,
+                    is_media,
+                    skip_tls,
+                    timeout,
+                    self.runtime.outbound(),
+                    fronting_domain,
+                )
+            })
+            .buffer_unordered(POOL_CONNECT_CONCURRENCY);
+
+        while let Some(attempt) = attempts.next().await {
+            match attempt.ws {
                 Some(ws) => results.push(ws),
                 None => {
                     warn!(
@@ -501,3 +542,6 @@ impl WsPool {
         results
     }
 }
+
+#[cfg(test)]
+mod tests;

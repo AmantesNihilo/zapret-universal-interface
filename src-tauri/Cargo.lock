@@ -2916,16 +2916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proxyvars"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7285bf1ae9f4d28cd9b1100c9a3aab55263ec0aa44e4d439593e528fc1dc1e05"
-dependencies = [
- "http",
- "ipnet",
-]
-
-[[package]]
 name = "quick-xml"
 version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4226,7 +4216,7 @@ dependencies = [
 
 [[package]]
 name = "tg-ws-proxy-rs"
-version = "2.2.5-zui.1"
+version = "2.3.4-zui.1"
 dependencies = [
  "aes",
  "async-http-proxy",
@@ -4239,7 +4229,6 @@ dependencies = [
  "httparse",
  "ipnet",
  "percent-encoding",
- "proxyvars",
  "rand 0.9.4",
  "rustls",
  "rustls-pki-types",
@@ -5973,7 +5962,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zui"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "hex",
  "rand 0.9.4",
@@ -5990,6 +5979,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

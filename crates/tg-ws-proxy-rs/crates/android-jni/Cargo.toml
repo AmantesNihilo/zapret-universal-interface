@@ -1,0 +1,47 @@
+[package]
+name = "tg-ws-proxy-jni"
+# Deliberately not the root version: the root Cargo.toml's `package.version` is
+# the repo's single source of truth (CI's release-version job and the Android
+# versionName both parse it), and a second number to bump would only drift.
+version = "0.0.0"
+edition = "2024"
+description = "JNI shim that runs tg-ws-proxy-rs inside the Android app"
+license = "MIT"
+publish = false
+
+[lib]
+# The .so filename the app loads: keep in sync with `System.loadLibrary` in
+# NativeProxy.kt and LIBRARY_FILE in CargoNdkBuildTask.kt. It must differ from
+# the root crate's `tg_ws_proxy_rs`: cargo does not reject two lib targets with
+# the same name in one workspace, they silently overwrite each other's `.d`
+# file (rust-lang/cargo#6313).
+name = "tg_ws_proxy_jni"
+crate-type = ["cdylib"]
+
+[dependencies]
+tg-ws-proxy-rs = { path = "../.." }
+
+# Everything below is used only by `src/android.rs`, which lib.rs gates on
+# `cfg(target_os = "android")` — so the manifest gates it too. That keeps a
+# host `cargo fmt` / `cargo metadata` / `-p` build resolving this crate without
+# an NDK (`jni` is unbuildable off Android) and stops it compiling a runtime
+# and a subscriber into what is, off Android, an empty cdylib.
+#
+# A path dependency's own dependencies are not in this crate's extern prelude,
+# so tokio and tracing-subscriber have to be named here even though
+# tg-ws-proxy-rs already pulls them in. Features are what android.rs itself
+# reaches for; cargo unifies them with the root crate's, but relying on that
+# would leave the manifest lying about what this code needs.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", default-features = false }
+# `sync` for the shutdown `watch` channel, `rt-multi-thread` for
+# `Builder::new_multi_thread`, `net` + `time` because `enable_all()` only
+# starts the drivers that are compiled in.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
+# `registry` because the reload layer is registered on a bare `Registry`;
+# `env-filter` and `fmt` for the layers themselves.
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "fmt",
+    "registry",
+] }

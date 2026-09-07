@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use tokio::net::{TcpStream, lookup_host};
 use tokio_socks::TargetAddr;
 use tokio_socks::tcp::Socks5Stream;
 
-use super::config::{OutboundConfig, ProxyConfig, ProxyKind, authority, http_host, target_url};
+use super::config::{OutboundConfig, ProxyConfig, ProxyKind};
 
 /// Why an outbound connect failed.
 ///
@@ -121,7 +122,7 @@ impl OutboundConnector {
         self.config
             .no_proxy
             .as_ref()
-            .is_some_and(|no_proxy| no_proxy.matches(&target_url(target_host, target_port)))
+            .is_some_and(|no_proxy| no_proxy.matches(target_host, target_port))
     }
 }
 
@@ -159,7 +160,11 @@ async fn connect_http_proxy(
     target_port: u16,
 ) -> Result<TcpStream, String> {
     let mut stream = connect_tcp(&proxy.host, proxy.port).await?;
-    let target_host = http_host(target_host);
+    let target_host = if target_host.contains(':') && !target_host.starts_with('[') {
+        Cow::Owned(format!("[{target_host}]"))
+    } else {
+        Cow::Borrowed(target_host)
+    };
 
     if let Some(username) = proxy.username.as_deref() {
         http_connect_tokio_with_basic_auth(
@@ -184,19 +189,19 @@ async fn connect_socks5_proxy(
     target_port: u16,
     remote_dns: bool,
 ) -> Result<TcpStream, String> {
-    let proxy_addr = authority(&proxy.host, proxy.port);
     let target = socks5_target(target_host, target_port, remote_dns).await?;
+    let proxy_addr = (proxy.host.as_str(), proxy.port);
 
     let stream = if let Some(username) = proxy.username.as_deref() {
         Socks5Stream::connect_with_password(
-            proxy_addr.as_str(),
+            proxy_addr,
             target,
             username,
             proxy.password.as_deref().unwrap_or(""),
         )
         .await
     } else {
-        Socks5Stream::connect(proxy_addr.as_str(), target).await
+        Socks5Stream::connect(proxy_addr, target).await
     }
     .map_err(|e| e.to_string())?;
 
@@ -204,21 +209,21 @@ async fn connect_socks5_proxy(
 }
 
 async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
-    TcpStream::connect(authority(host, port))
+    TcpStream::connect((host, port))
         .await
         .map_err(|e| format!("TCP connect: {e}"))
 }
 
-async fn socks5_target(
-    host: &str,
+async fn socks5_target<'a>(
+    host: &'a str,
     port: u16,
     remote_dns: bool,
-) -> Result<TargetAddr<'static>, String> {
+) -> Result<TargetAddr<'a>, String> {
     if remote_dns {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(TargetAddr::Ip((ip, port).into()));
         }
-        return Ok(TargetAddr::Domain(host.to_string().into(), port));
+        return Ok(TargetAddr::Domain(Cow::Borrowed(host), port));
     }
 
     lookup_host((host, port))

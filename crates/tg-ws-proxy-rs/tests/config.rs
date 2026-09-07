@@ -305,6 +305,36 @@ fn a_random_secret_is_generated_only_when_none_was_given() {
     assert_eq!(explicit.secrets, vec![key.to_string()]);
 }
 
+#[test]
+fn normalized_secrets_and_faketls_domain_reuse_startup_storage() {
+    let first = "11111111111111111111111111111111";
+    let second = "22222222222222222222222222222222";
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        first,
+        "--secret",
+        second,
+        "--listen-faketls-domain",
+        "www.yandex.ru",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let secrets = cfg.normalized_secrets();
+    assert_eq!(secrets.len(), 2);
+    assert_eq!(secrets[0], hex::decode(first).unwrap());
+    assert_eq!(secrets[1], hex::decode(second).unwrap());
+    assert_eq!(secrets.as_ptr(), cfg.normalized_secrets().as_ptr());
+
+    let domain = cfg.normalized_listen_faketls_domain().unwrap();
+    assert_eq!(domain, "www.yandex.ru");
+    assert_eq!(
+        domain.as_ptr(),
+        cfg.normalized_listen_faketls_domain().unwrap().as_ptr()
+    );
+}
+
 // ─── Upstream MTProto proxies ────────────────────────────────────────────────
 
 #[test]
@@ -321,8 +351,38 @@ fn mtproto_proxy_triplets_are_parsed() {
     assert_eq!(cfg.mtproto_proxies[0].host, "proxy.example");
     assert_eq!(cfg.mtproto_proxies[0].port, 443);
     assert_eq!(cfg.mtproto_proxies[0].secret, secret);
+    assert_eq!(
+        cfg.mtproto_proxies[0].secret_key(),
+        hex::decode(secret).unwrap()
+    );
+    assert_eq!(cfg.mtproto_proxies[0].faketls_hostname(), None);
     assert_eq!(cfg.mtproto_proxies[1].host, "1.2.3.4");
     assert_eq!(cfg.mtproto_proxies[1].port, 8888);
+    assert_eq!(
+        cfg.mtproto_proxies[1].secret_key(),
+        hex::decode(secret).unwrap()
+    );
+}
+
+#[test]
+fn mtproto_proxy_faketls_data_is_normalized_during_parsing() {
+    let key = "00112233445566778899aabbccddeeff";
+    let hostname = "proxy.example";
+    let secret = format!("ee{key}{}", hex::encode(hostname));
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--mtproto-proxy",
+        &format!("127.0.0.1:443:{secret}"),
+    ])
+    .unwrap();
+
+    let proxy = &cfg.mtproto_proxies[0];
+    assert_eq!(proxy.secret_key(), hex::decode(key).unwrap());
+    assert_eq!(proxy.faketls_hostname(), Some(hostname));
+    assert_eq!(
+        proxy.faketls_hostname().unwrap().as_ptr(),
+        proxy.faketls_hostname().unwrap().as_ptr()
+    );
 }
 
 #[test]
@@ -411,6 +471,64 @@ fn version_flag_prints_the_crate_version() {
         );
     }
 }
+
+#[test]
+fn try_from_cli_line_accepts_the_termux_flags() {
+    let cfg = Config::try_from_cli_line(
+        "--default-domains --host 127.0.0.1 --port 9050 --dc-ip 4:149.154.167.220 --link-ip 127.0.0.1",
+    )
+    .unwrap();
+
+    assert!(cfg.default_domains);
+    assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(cfg.port, 9050);
+    assert_eq!(cfg.link_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(cfg.dc_ip, vec![(4, "149.154.167.220".to_string())]);
+}
+
+#[test]
+fn try_from_cli_line_strips_a_leading_binary_name() {
+    let cfg = Config::try_from_cli_line("./tg-ws --port 9050").unwrap();
+    assert_eq!(cfg.port, 9050);
+}
+
+#[test]
+fn try_from_cli_line_keeps_quoted_values() {
+    let cfg = Config::try_from_cli_line("--host '127.0.0.1' --port \"9050\"").unwrap();
+    assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(cfg.port, 9050);
+}
+
+#[test]
+fn try_from_cli_line_rejects_unclosed_quotes() {
+    let err = Config::try_from_cli_line("--host '127.0.0.1").unwrap_err();
+    assert!(err.contains("unclosed quote"), "{err}");
+}
+
+#[test]
+fn split_cli_args_handles_backslash_escapes() {
+    let tokens = tg_ws_proxy_rs::config::split_cli_args(r#"--secret a\ b"#).unwrap();
+    assert_eq!(tokens, vec!["--secret", "a b"]);
+}
+
+#[test]
+fn split_cli_args_keeps_empty_quoted_tokens() {
+    let tokens = tg_ws_proxy_rs::config::split_cli_args(r#"--secret "" --port 9050"#).unwrap();
+    assert_eq!(tokens, vec!["--secret", "", "--port", "9050"]);
+}
+
+#[test]
+fn split_cli_args_keeps_empty_quoted_single_tokens() {
+    let tokens = tg_ws_proxy_rs::config::split_cli_args("''").unwrap();
+    assert_eq!(tokens, vec![""]);
+}
+
+#[test]
+fn split_cli_args_rejects_trailing_backslash() {
+    let err = tg_ws_proxy_rs::config::split_cli_args(r"--secret abc\").unwrap_err();
+    assert!(err.contains("trailing backslash"), "{err}");
+}
+
 #[test]
 fn force_test_dc_flag_parses() {
     let config =

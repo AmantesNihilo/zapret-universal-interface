@@ -25,14 +25,6 @@ fn media_tag_marks_only_media_dcs() {
 }
 
 #[test]
-fn websocket_messages_use_the_flowseal_size_limit() {
-    let config = websocket_config();
-
-    assert_eq!(config.max_message_size, Some(16 * 1024 * 1024));
-    assert_eq!(config.max_frame_size, Some(16 * 1024 * 1024));
-}
-
-#[test]
 fn base_cf_record_strips_only_the_dash_one_label() {
     assert_eq!(
         base_cf_record("kws2-1.example.net").as_deref(),
@@ -96,6 +88,7 @@ fn ordered_records_put_the_preferred_variant_first() {
 /// certificate verification is skipped for fronted connections, since a real
 /// cert can never match a spoofed SNI).
 #[tokio::test]
+#[allow(clippy::result_large_err)]
 async fn sni_override_presents_fronted_sni_but_keeps_real_host() {
     install_rustls_provider();
 
@@ -228,6 +221,15 @@ fn tls_client_configs_are_built_once_and_shared() {
     assert!(!Arc::ptr_eq(&first, &first_no_verify));
 }
 
+#[test]
+fn websocket_buffers_are_bounded_for_many_connections() {
+    let config = ws_config();
+
+    assert_eq!(config.write_buffer_size, 16 * 1024);
+    assert_eq!(config.max_frame_size, Some(4 * 1024 * 1024));
+    assert_eq!(config.max_message_size, Some(4 * 1024 * 1024));
+}
+
 /// Regression test for TLS session resumption.
 ///
 /// The shared `ClientConfig` owns the session cache, so a config rebuilt per
@@ -319,7 +321,8 @@ fn a_missing_dash_one_record_buys_the_base_record_a_second_attempt() {
     // Regression test: deduplicating this retry away measurably pushed
     // connections into the TCP fallback (see CfAttempts' docs). For a
     // non-media DC the base record must be attempted twice.
-    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], false));
+    let domains = ["example.net".to_string()];
+    let mut attempts = CfAttempts::new(2, &domains, false);
 
     assert_eq!(
         drain(&mut attempts, true),
@@ -339,7 +342,8 @@ fn a_media_dc_gets_the_same_two_attempts_as_everything_else() {
     // base record's own turn would then be skipped as already-tried and media
     // would get half the attempts — which is what made video the thing that
     // kept failing to load first time.
-    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], true));
+    let domains = ["example.net".to_string()];
+    let mut attempts = CfAttempts::new(2, &domains, true);
 
     assert_eq!(
         drain(&mut attempts, true),
@@ -351,7 +355,7 @@ fn a_media_dc_gets_the_same_two_attempts_as_everything_else() {
 fn both_orderings_attempt_the_base_record_the_same_number_of_times() {
     let domains = ["example.net".to_string()];
     let count = |is_media| {
-        let mut attempts = CfAttempts::new(cf_ws_domains(2, &domains, is_media));
+        let mut attempts = CfAttempts::new(2, &domains, is_media);
         drain(&mut attempts, true)
             .into_iter()
             .filter(|d| d == "kws2.example.net")
@@ -366,7 +370,8 @@ fn both_orderings_attempt_the_base_record_the_same_number_of_times() {
 fn a_record_that_timed_out_is_not_retried() {
     // Retrying a record that ran out the clock just buys another full connect
     // timeout before the fallback chain can move on.
-    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], false));
+    let domains = ["example.net".to_string()];
+    let mut attempts = CfAttempts::new(2, &domains, false);
 
     assert_eq!(attempts.next_domain().as_deref(), Some("kws2.example.net"));
     attempts.note_timed_out("kws2.example.net");
@@ -384,7 +389,7 @@ fn records_present_in_dns_are_each_attempted_once() {
     // With both records resolving, nothing is retried and nothing repeats,
     // across several domains.
     let domains = ["a.example".to_string(), "b.example".to_string()];
-    let mut attempts = CfAttempts::new(cf_ws_domains(2, &domains, false));
+    let mut attempts = CfAttempts::new(2, &domains, false);
 
     assert_eq!(
         drain(&mut attempts, false),
@@ -398,10 +403,44 @@ fn records_present_in_dns_are_each_attempted_once() {
 }
 
 #[test]
+fn lazy_attempts_rotate_domains_without_rebuilding_the_list() {
+    let domains = [
+        "a.example".to_string(),
+        "b.example".to_string(),
+        "c.example".to_string(),
+    ];
+    let mut attempts = CfAttempts::with_offset(2, &domains, false, 1);
+
+    assert_eq!(
+        drain(&mut attempts, false),
+        [
+            "kws2.b.example",
+            "kws2-1.b.example",
+            "kws2.c.example",
+            "kws2-1.c.example",
+            "kws2.a.example",
+            "kws2-1.a.example",
+        ]
+    );
+}
+
+#[test]
+fn lazy_attempts_preserve_duplicate_domain_deduplication() {
+    let domains = ["a.example".to_string(), "a.example".to_string()];
+    let mut attempts = CfAttempts::new(2, &domains, false);
+
+    assert_eq!(
+        drain(&mut attempts, false),
+        ["kws2.a.example", "kws2-1.a.example"]
+    );
+}
+
+#[test]
 fn a_forced_retry_is_not_itself_retried_forever() {
     // The queued base record has no `-1.` label, so it cannot queue another
     // retry — the loop is guaranteed to terminate.
-    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], false));
+    let domains = ["example.net".to_string()];
+    let mut attempts = CfAttempts::new(2, &domains, false);
     let order = drain(&mut attempts, true);
 
     assert_eq!(order.len(), 3);

@@ -1,45 +1,64 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static EXE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+static PROJECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+static ZAPRET_RESOURCES: OnceLock<PathBuf> = OnceLock::new();
+static ZAPRET2_RESOURCES: OnceLock<PathBuf> = OnceLock::new();
 
 fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+    EXE_DIR
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+        })
+        .clone()
 }
 
 pub fn project_root() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    PROJECT_ROOT
+        .get_or_init(|| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    for dir in cwd.ancestors() {
-        if dir.join("src-tauri").join("tauri.conf.json").exists() {
-            return dir.to_path_buf();
-        }
-        if dir.join("tauri.conf.json").exists() {
-            return dir.parent().unwrap_or(dir).to_path_buf();
-        }
-    }
+            for dir in cwd.ancestors() {
+                if dir.join("src-tauri").join("tauri.conf.json").exists() {
+                    return dir.to_path_buf();
+                }
+                if dir.join("tauri.conf.json").exists() {
+                    return dir.parent().unwrap_or(dir).to_path_buf();
+                }
+            }
 
-    if let Some(exe_dir) = exe_dir() {
-        if has_entries(&exe_dir.join("resources").join("zapret")) {
-            return exe_dir;
-        }
-    }
+            if let Some(exe_dir) = exe_dir() {
+                if has_entries(&exe_dir.join("resources").join("zapret")) {
+                    return exe_dir;
+                }
+            }
 
-    cwd
+            cwd
+        })
+        .clone()
 }
 
 pub fn data_dir() -> PathBuf {
-    let root = project_root();
-    if let Some(exe_dir) = exe_dir() {
-        if exe_dir.join("portable.flag").exists() {
-            return exe_dir.join("data");
-        }
-    }
+    DATA_DIR
+        .get_or_init(|| {
+            let root = project_root();
+            if let Some(exe_dir) = exe_dir() {
+                if exe_dir.join("portable.flag").exists() {
+                    return exe_dir.join("data");
+                }
+            }
 
-    if is_development_tree(&root) {
-        return root.join("data");
-    }
+            if is_development_tree(&root) {
+                return root.join("data");
+            }
 
-    installed_data_dir().unwrap_or_else(|| root.join("data"))
+            installed_data_dir().unwrap_or_else(|| root.join("data"))
+        })
+        .clone()
 }
 
 pub fn distribution_mode() -> &'static str {
@@ -93,41 +112,50 @@ pub fn preset_preferences_path() -> PathBuf {
 }
 
 pub fn resources_zapret_dir() -> PathBuf {
-    if let Some(exe_dir) = exe_dir() {
-        let bundled = exe_dir.join("resources").join("zapret");
-        if has_entries(&bundled) {
-            return bundled;
-        }
-    }
+    ZAPRET_RESOURCES
+        .get_or_init(|| {
+            if let Some(exe_dir) = exe_dir() {
+                let bundled = exe_dir.join("resources").join("zapret");
+                if has_entries(&bundled) {
+                    return bundled;
+                }
+            }
 
-    let local = project_root().join("resources").join("zapret");
-    if has_entries(&local) {
-        return local;
-    }
+            let root = project_root();
+            let local = root.join("resources").join("zapret");
+            if has_entries(&local) {
+                return local;
+            }
 
-    let sibling = project_root()
-        .parent()
-        .unwrap_or(&project_root())
-        .join("zapret_preset_");
-    if sibling.exists() {
-        return sibling;
-    }
+            let sibling = root
+                .parent()
+                .unwrap_or(root.as_path())
+                .join("zapret_preset_");
+            if sibling.exists() {
+                return sibling;
+            }
 
-    local
+            local
+        })
+        .clone()
 }
 
 pub fn resources_zapret2_dir() -> PathBuf {
-    if let Some(exe_dir) = exe_dir() {
-        let bundled = exe_dir.join("resources").join("zapret2");
-        if has_entries(&bundled) {
-            return bundled;
-        }
-    }
+    ZAPRET2_RESOURCES
+        .get_or_init(|| {
+            if let Some(exe_dir) = exe_dir() {
+                let bundled = exe_dir.join("resources").join("zapret2");
+                if has_entries(&bundled) {
+                    return bundled;
+                }
+            }
 
-    project_root().join("resources").join("zapret2")
+            project_root().join("resources").join("zapret2")
+        })
+        .clone()
 }
 
-fn has_entries(path: &PathBuf) -> bool {
+fn has_entries(path: &Path) -> bool {
     std::fs::read_dir(path)
         .map(|mut entries| {
             entries.any(|entry| {

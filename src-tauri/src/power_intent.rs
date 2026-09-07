@@ -1,4 +1,4 @@
-use crate::paths;
+use crate::{json_storage, paths};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,7 +31,7 @@ fn remember_started_at(path: &std::path::Path, profile_id: &str) -> Result<(), S
         profile_id: profile_id.to_string(),
     };
     let text = serde_json::to_string_pretty(&intent).map_err(|error| error.to_string())?;
-    std::fs::write(path, text).map_err(|error| error.to_string())
+    json_storage::write_atomic(path, text.as_bytes())
 }
 
 pub fn clear() -> Result<(), String> {

@@ -78,103 +78,70 @@ pub struct FakeTlsClientHello {
 /// The `session_id` is 32 random bytes (the upstream proxy ignores it for auth).
 /// The SNI extension carries the `hostname` from the decoded secret.
 pub fn build_faketls_client_hello(hostname: &str) -> Vec<u8> {
-    // ── Extensions ────────────────────────────────────────────────────────
-    let mut exts: Vec<u8> = Vec::new();
-
-    // server_name (SNI)
-    let host_b = hostname.as_bytes();
-    let host_len = host_b.len() as u16;
-    let sni_entry_len = 1u16 + 2 + host_len; // type(1) + name_len(2) + name
-    let sni_list_len = sni_entry_len;
-    let sni_data_len = 2u16 + sni_list_len; // list_length(2) + entry
-    exts.extend_from_slice(&0x0000u16.to_be_bytes()); // ext type: server_name
-    exts.extend_from_slice(&sni_data_len.to_be_bytes());
-    exts.extend_from_slice(&sni_list_len.to_be_bytes());
-    exts.push(0x00); // name_type: host_name
-    exts.extend_from_slice(&host_len.to_be_bytes());
-    exts.extend_from_slice(host_b);
-
-    // extended_master_secret (empty)
-    exts.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
-
-    // renegotiation_info (empty)
-    exts.extend_from_slice(&[0xff, 0x01, 0x00, 0x01, 0x00]);
-
-    // supported_groups: x25519, secp256r1, secp384r1, secp521r1
     #[rustfmt::skip]
-    exts.extend_from_slice(&[
+    const FIXED_EXTENSIONS: &[u8] = &[
+        // extended_master_secret, renegotiation_info
+        0x00, 0x17, 0x00, 0x00,
+        0xff, 0x01, 0x00, 0x01, 0x00,
+        // supported_groups: x25519, secp256r1, secp384r1, secp521r1
         0x00, 0x0a, 0x00, 0x0a, 0x00, 0x08,
         0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00, 0x19,
-    ]);
-
-    // ec_point_formats: uncompressed only
-    exts.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
-
-    // session_ticket (empty = requesting a ticket)
-    exts.extend_from_slice(&[0x00, 0x23, 0x00, 0x00]);
-
-    // signature_algorithms
-    #[rustfmt::skip]
-    exts.extend_from_slice(&[
+        // ec_point_formats, session_ticket
+        0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
+        0x00, 0x23, 0x00, 0x00,
+        // signature_algorithms
         0x00, 0x0d, 0x00, 0x14, 0x00, 0x12,
         0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
         0x05, 0x03, 0x08, 0x05, 0x05, 0x01,
         0x08, 0x06, 0x06, 0x01, 0x02, 0x01,
-    ]);
-
-    // ── Cipher suites ─────────────────────────────────────────────────────
+    ];
     #[rustfmt::skip]
-    let cipher_suites: &[u8] = &[
-        0x13, 0x01,  // TLS_AES_128_GCM_SHA256
-        0x13, 0x02,  // TLS_AES_256_GCM_SHA384
-        0x13, 0x03,  // TLS_CHACHA20_POLY1305_SHA256
-        0xc0, 0x2b,  // ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-        0xc0, 0x2f,  // ECDHE_RSA_WITH_AES_128_GCM_SHA256
-        0xc0, 0x2c,  // ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-        0xc0, 0x30,  // ECDHE_RSA_WITH_AES_256_GCM_SHA384
-        0xcc, 0xa9,  // ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-        0xcc, 0xa8,  // ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-        0xc0, 0x13,  // ECDHE_RSA_WITH_AES_128_CBC_SHA
-        0xc0, 0x14,  // ECDHE_RSA_WITH_AES_256_CBC_SHA
-        0x00, 0x9c,  // RSA_WITH_AES_128_GCM_SHA256
-        0x00, 0x9d,  // RSA_WITH_AES_256_GCM_SHA384
-        0x00, 0x2f,  // RSA_WITH_AES_128_CBC_SHA
-        0x00, 0x35,  // RSA_WITH_AES_256_CBC_SHA
-        0x00, 0x0a,  // RSA_WITH_3DES_EDE_CBC_SHA
+    const CIPHER_SUITES: &[u8] = &[
+        0x13, 0x01, 0x13, 0x02, 0x13, 0x03,
+        0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30,
+        0xcc, 0xa9, 0xcc, 0xa8,
+        0xc0, 0x13, 0xc0, 0x14,
+        0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
     ];
 
-    // ── Random session_id (32 bytes) ──────────────────────────────────────
+    let host_b = hostname.as_bytes();
+    let host_len = host_b.len() as u16;
+    let sni_list_len = 3u16 + host_len;
+    let sni_data_len = 2u16 + sni_list_len;
+    let extensions_len = 4 + sni_data_len as usize + FIXED_EXTENSIONS.len();
+    let hello_len = 2 + 32 + 1 + 32 + 2 + CIPHER_SUITES.len() + 2 + 2 + extensions_len;
+    let handshake_len = 4 + hello_len;
+
     let mut session_id = [0u8; 32];
     rand::rng().fill_bytes(&mut session_id);
 
-    // ── ClientHello body ──────────────────────────────────────────────────
-    let mut hello: Vec<u8> = Vec::new();
-    hello.extend_from_slice(&TLS_VERSION_12); // version: TLS 1.2
-    hello.extend_from_slice(&[0u8; 32]); // random: zeroed (will be filled with HMAC)
-    hello.push(0x20); // session_id length = 32
-    hello.extend_from_slice(&session_id);
-    hello.extend_from_slice(&(cipher_suites.len() as u16).to_be_bytes());
-    hello.extend_from_slice(cipher_suites);
-    hello.push(0x01); // compression_methods length: 1
-    hello.push(0x00); // null compression
-    hello.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-    hello.extend_from_slice(&exts);
-
-    // ── Handshake message ─────────────────────────────────────────────────
-    let hello_len = hello.len() as u32;
-    let mut handshake: Vec<u8> = Vec::with_capacity(4 + hello.len());
-    handshake.push(0x01); // HandshakeType: ClientHello
-    handshake.push((hello_len >> 16) as u8);
-    handshake.push((hello_len >> 8) as u8);
-    handshake.push(hello_len as u8);
-    handshake.extend_from_slice(&hello);
-
-    // ── TLS record ────────────────────────────────────────────────────────
-    let mut record: Vec<u8> = Vec::with_capacity(5 + handshake.len());
+    let mut record = Vec::with_capacity(5 + handshake_len);
     record.push(TLS_RECORD_HANDSHAKE);
     record.extend_from_slice(&TLS_RECORD_VERSION);
-    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-    record.extend_from_slice(&handshake);
+    record.extend_from_slice(&(handshake_len as u16).to_be_bytes());
+    record.push(TLS_HANDSHAKE_CLIENT_HELLO);
+    record.extend_from_slice(&[
+        (hello_len >> 16) as u8,
+        (hello_len >> 8) as u8,
+        hello_len as u8,
+    ]);
+    record.extend_from_slice(&TLS_VERSION_12);
+    record.extend_from_slice(&[0u8; 32]);
+    record.push(session_id.len() as u8);
+    record.extend_from_slice(&session_id);
+    record.extend_from_slice(&(CIPHER_SUITES.len() as u16).to_be_bytes());
+    record.extend_from_slice(CIPHER_SUITES);
+    record.extend_from_slice(&[0x01, 0x00]);
+    record.extend_from_slice(&(extensions_len as u16).to_be_bytes());
+    record.extend_from_slice(&0x0000u16.to_be_bytes());
+    record.extend_from_slice(&sni_data_len.to_be_bytes());
+    record.extend_from_slice(&sni_list_len.to_be_bytes());
+    record.push(0x00);
+    record.extend_from_slice(&host_len.to_be_bytes());
+    record.extend_from_slice(host_b);
+    record.extend_from_slice(FIXED_EXTENSIONS);
+
+    debug_assert_eq!(record.len(), 5 + handshake_len);
 
     record
 }
@@ -325,39 +292,38 @@ fn parse_sni_extension(mut extensions: &[u8]) -> Option<String> {
 }
 
 pub fn build_faketls_server_hello(secret: &[u8], hello: &FakeTlsClientHello) -> Vec<u8> {
-    let mut server_body = Vec::new();
-    server_body.extend_from_slice(&TLS_VERSION_12);
-    server_body.extend_from_slice(&[0u8; TLS_DIGEST_LEN]);
-    server_body.push(hello.session_id.len() as u8);
-    server_body.extend_from_slice(&hello.session_id);
-    server_body.extend_from_slice(&hello.cipher_suite);
-    server_body.extend_from_slice(&[
-        0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d,
-        0x00, 0x20,
-    ]);
     let mut rng = rand::rng();
     let mut key_share = [0u8; 32];
     rng.fill_bytes(&mut key_share);
-    server_body.extend_from_slice(&key_share);
+    let cert_len = 1024 + (rng.next_u32() as usize % 3092);
+    let server_body_len = 86 + hello.session_id.len();
+    let handshake_len = 4 + server_body_len;
+    let mut packet = Vec::with_capacity(5 + handshake_len + 6 + 5 + cert_len);
 
-    let mut handshake = Vec::with_capacity(4 + server_body.len());
-    handshake.push(TLS_HANDSHAKE_SERVER_HELLO);
-    handshake.push(((server_body.len() >> 16) & 0xff) as u8);
-    handshake.push(((server_body.len() >> 8) & 0xff) as u8);
-    handshake.push((server_body.len() & 0xff) as u8);
-    handshake.extend_from_slice(&server_body);
+    push_tls_record_header(&mut packet, TLS_RECORD_HANDSHAKE, handshake_len);
+    packet.push(TLS_HANDSHAKE_SERVER_HELLO);
+    packet.extend_from_slice(&[
+        (server_body_len >> 16) as u8,
+        (server_body_len >> 8) as u8,
+        server_body_len as u8,
+    ]);
+    packet.extend_from_slice(&TLS_VERSION_12);
+    packet.extend_from_slice(&[0u8; TLS_DIGEST_LEN]);
+    packet.push(hello.session_id.len() as u8);
+    packet.extend_from_slice(&hello.session_id);
+    packet.extend_from_slice(&hello.cipher_suite);
+    packet.extend_from_slice(&[
+        0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d,
+        0x00, 0x20,
+    ]);
+    packet.extend_from_slice(&key_share);
 
-    let mut packet = Vec::new();
-    push_tls_record(&mut packet, TLS_RECORD_HANDSHAKE, &handshake);
-    push_tls_record(
-        &mut packet,
-        TLS_RECORD_CHANGE_CIPHER_SPEC,
-        &[TLS_CHANGE_CIPHER_SPEC_VALUE],
-    );
-
-    let mut cert = vec![0u8; 1024 + (rng.next_u32() as usize % 3092)];
-    rng.fill_bytes(&mut cert);
-    push_tls_record(&mut packet, TLS_RECORD_APPLICATION_DATA, &cert);
+    push_tls_record_header(&mut packet, TLS_RECORD_CHANGE_CIPHER_SPEC, 1);
+    packet.push(TLS_CHANGE_CIPHER_SPEC_VALUE);
+    push_tls_record_header(&mut packet, TLS_RECORD_APPLICATION_DATA, cert_len);
+    let cert_start = packet.len();
+    packet.resize(cert_start + cert_len, 0);
+    rng.fill_bytes(&mut packet[cert_start..]);
 
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
     mac.update(&hello.random);
@@ -369,11 +335,10 @@ pub fn build_faketls_server_hello(secret: &[u8], hello: &FakeTlsClientHello) -> 
     packet
 }
 
-fn push_tls_record(out: &mut Vec<u8>, record_type: u8, payload: &[u8]) {
+fn push_tls_record_header(out: &mut Vec<u8>, record_type: u8, payload_len: usize) {
     out.push(record_type);
     out.extend_from_slice(&TLS_VERSION_12);
-    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    out.extend_from_slice(payload);
+    out.extend_from_slice(&(payload_len as u16).to_be_bytes());
 }
 
 pub async fn read_tls_record<R: AsyncRead + Unpin>(
@@ -391,6 +356,25 @@ pub async fn read_tls_record<R: AsyncRead + Unpin>(
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload).await?;
     Ok(Some((header[0], [header[1], header[2]], payload)))
+}
+
+pub(crate) async fn read_tls_record_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_payload_len: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut header = [0u8; 5];
+    if reader.read_exact(&mut header).await.is_err() {
+        return Ok(None);
+    }
+    let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if payload_len > max_payload_len {
+        return Ok(None);
+    }
+    let mut record = Vec::with_capacity(5 + payload_len);
+    record.extend_from_slice(&header);
+    record.resize(5 + payload_len, 0);
+    reader.read_exact(&mut record[5..]).await?;
+    Ok(Some(record))
 }
 
 // ─── Server handshake draining ──────────────────────────────────────────────
@@ -515,8 +499,7 @@ pub async fn read_tls_appdata(
             TLS_RECORD_CHANGE_CIPHER_SPEC => {
                 // Discard CCS records (shouldn't appear in data phase but
                 // handle gracefully).
-                let mut discard = vec![0u8; payload_len];
-                if reader.read_exact(&mut discard).await.is_err() {
+                if reader.read_exact(&mut buf[..payload_len]).await.is_err() {
                     return Ok(0);
                 }
                 continue;

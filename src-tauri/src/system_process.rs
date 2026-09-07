@@ -8,6 +8,10 @@ pub struct ProcessInfo {
 }
 
 pub fn is_running(image_name: &str) -> bool {
+    !image_pids(image_name).is_empty()
+}
+
+pub fn image_pids(image_name: &str) -> Vec<u32> {
     #[cfg(windows)]
     {
         let output = Command::new("tasklist")
@@ -23,14 +27,15 @@ pub fn is_running(image_name: &str) -> bool {
             .creation_flags(0x08000000)
             .output();
 
-        return output
+        output
             .ok()
             .map(|output| {
                 String::from_utf8_lossy(&output.stdout)
-                    .to_lowercase()
-                    .contains(&format!("\"{}\"", image_name.to_lowercase()))
+                    .lines()
+                    .filter_map(|line| parse_csv_line(line).get(1)?.parse::<u32>().ok())
+                    .collect()
             })
-            .unwrap_or(false);
+            .unwrap_or_default()
     }
 
     #[cfg(not(windows))]
@@ -38,26 +43,33 @@ pub fn is_running(image_name: &str) -> bool {
         Command::new("pgrep")
             .arg(image_name)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .output()
+            .ok()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
-pub fn image_pids(image_name: &str) -> Vec<u32> {
-    running_processes_by_names(&[image_name])
-        .into_iter()
-        .map(|process| process.pid)
-        .collect()
+pub fn is_pid_running(pid: u32) -> bool {
+    !running_pids(&[pid]).is_empty()
 }
 
-pub fn is_pid_running(pid: u32) -> bool {
+pub fn running_pids(pids: &[u32]) -> Vec<u32> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
     #[cfg(windows)]
     {
-        return Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        let wanted: std::collections::HashSet<u32> = pids.iter().copied().collect();
+        Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .creation_flags(0x08000000)
@@ -65,27 +77,29 @@ pub fn is_pid_running(pid: u32) -> bool {
             .ok()
             .map(|output| {
                 let text = String::from_utf8_lossy(&output.stdout);
-                text.lines().any(|line| {
-                    parse_csv_line(line)
-                        .get(1)
-                        .and_then(|value| value.parse::<u32>().ok())
-                        .map(|value| value == pid)
-                        .unwrap_or(false)
-                })
+                text.lines()
+                    .filter_map(|line| parse_csv_line(line).get(1)?.parse::<u32>().ok())
+                    .filter(|pid| wanted.contains(pid))
+                    .collect()
             })
-            .unwrap_or(false);
+            .unwrap_or_default()
     }
 
     #[cfg(not(windows))]
     {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        pids.iter()
+            .copied()
+            .filter(|pid| {
+                Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 }
 
@@ -153,7 +167,7 @@ pub fn running_processes_by_names(image_names: &[&str]) -> Vec<ProcessInfo> {
 pub fn kill_pid(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        return Command::new("taskkill")
+        Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -161,7 +175,7 @@ pub fn kill_pid(pid: u32) -> bool {
             .creation_flags(0x08000000)
             .status()
             .map(|status| status.success())
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
 
     #[cfg(not(windows))]

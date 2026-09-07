@@ -16,7 +16,6 @@
 //! used — matching the Python reference implementation which always passes
 //! `verify_mode = CERT_NONE`.
 
-use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -33,23 +32,15 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     client_async_with_config,
-    tungstenite::{client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig},
+    tungstenite::{client::IntoClientRequest, http::HeaderValue},
 };
 use tracing::{debug, warn};
 use tungstenite::Error as WsError;
 use tungstenite::Message;
+use tungstenite::protocol::WebSocketConfig;
 
 /// A live WebSocket connection to a Telegram DC.
 pub type TgWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-const MAX_WS_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-
-fn websocket_config() -> WebSocketConfig {
-    WebSocketConfig {
-        max_message_size: Some(MAX_WS_MESSAGE_SIZE),
-        ..WebSocketConfig::default()
-    }
-}
 
 /// Suffix that marks a media DC in log lines (`DC2` vs `DC2m`).
 ///
@@ -318,12 +309,35 @@ where
         client_async_with_config(
             request,
             MaybeTlsStream::Rustls(tls_stream),
-            Some(websocket_config()),
+            Some(ws_config()),
         )
         .await
     } else {
         let connector = build_tls_connector(skip_tls_verify);
-        client_async_tls_with_config(request, tcp, Some(websocket_config()), Some(connector)).await
+        client_async_tls_with_config(request, tcp, Some(ws_config()), Some(connector)).await
+    }
+}
+
+/// Ceiling for one incoming WebSocket frame and its reassembled message.
+///
+/// Tungstenite otherwise permits 16 MiB frames and 64 MiB messages, while its
+/// input buffer retains the largest capacity reached by a connection. Telegram
+/// media parts are at most 1 MiB, so 4 MiB leaves protocol headroom without
+/// letting one unusual frame park tens of megabytes for the session lifetime.
+const WS_MAX_FRAME: usize = 4 * 1024 * 1024;
+
+/// Target size of tungstenite's per-connection write buffer.
+///
+/// Every send in the bridge is awaited and flushed before the next message, so
+/// the default 128 KiB batching target only increases the retained footprint.
+const WS_WRITE_BUFFER: usize = 16 * 1024;
+
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig {
+        write_buffer_size: WS_WRITE_BUFFER,
+        max_frame_size: Some(WS_MAX_FRAME),
+        max_message_size: Some(WS_MAX_FRAME),
+        ..WebSocketConfig::default()
     }
 }
 
@@ -547,46 +561,74 @@ fn base_cf_record(domain: &str) -> Option<String> {
 /// showed exactly that asymmetry — 61 base attempts against 61 `-1` attempts
 /// on media, versus 99 against 11 elsewhere — while video was the thing that
 /// kept failing to load first time.
-struct CfAttempts {
-    queue: VecDeque<CfAttempt>,
-    tried: HashSet<String>,
+struct CfAttempts<'a> {
+    dc: u32,
+    domains: &'a [String],
+    is_media: bool,
+    first_domain: usize,
+    next_record: usize,
+    forced_base: Option<usize>,
+    last_record: Option<(usize, CfRecord)>,
     /// Records whose attempt ran out the clock. Retrying one of these just
     /// buys another full connect timeout, so the forced retry skips them.
-    timed_out: HashSet<String>,
+    timed_out: Vec<bool>,
 }
 
-struct CfAttempt {
-    domain: String,
-    /// Queued by the `-1` fallback: runs even if already tried, and does not
-    /// use up the record's own turn later in the list.
-    forced: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CfRecord {
+    Base,
+    DashOne,
 }
 
-impl CfAttempts {
-    fn new(domains: Vec<String>) -> Self {
+impl<'a> CfAttempts<'a> {
+    #[cfg(test)]
+    fn new(dc: u32, domains: &'a [String], is_media: bool) -> Self {
+        Self::with_offset(dc, domains, is_media, 0)
+    }
+
+    fn with_offset(dc: u32, domains: &'a [String], is_media: bool, first_domain: usize) -> Self {
         Self {
-            queue: domains
-                .into_iter()
-                .map(|domain| CfAttempt {
-                    domain,
-                    forced: false,
-                })
-                .collect(),
-            tried: HashSet::new(),
-            timed_out: HashSet::new(),
+            dc,
+            domains,
+            is_media,
+            first_domain: if domains.is_empty() {
+                0
+            } else {
+                first_domain % domains.len()
+            },
+            next_record: 0,
+            forced_base: None,
+            last_record: None,
+            timed_out: vec![false; domains.len() * 2],
         }
     }
 
     /// The next record to attempt, skipping ones already tried unless they
     /// were queued as a forced retry.
     fn next_domain(&mut self) -> Option<String> {
-        while let Some(attempt) = self.queue.pop_front() {
-            if attempt.forced {
-                return Some(attempt.domain);
+        if let Some(domain_index) = self.forced_base.take() {
+            self.last_record = Some((domain_index, CfRecord::Base));
+            return Some(self.hostname(domain_index, CfRecord::Base));
+        }
+
+        while self.next_record < self.domains.len() * 2 {
+            let ordinal = self.next_record;
+            self.next_record += 1;
+            let logical_index = ordinal / 2;
+            let domain_index = (self.first_domain + logical_index) % self.domains.len();
+            if (0..logical_index).any(|prior| {
+                self.domains[(self.first_domain + prior) % self.domains.len()]
+                    == self.domains[domain_index]
+            }) {
+                continue;
             }
-            if self.tried.insert(attempt.domain.clone()) {
-                return Some(attempt.domain);
-            }
+
+            let record = match (self.is_media, ordinal % 2) {
+                (false, 0) | (true, 1) => CfRecord::Base,
+                _ => CfRecord::DashOne,
+            };
+            self.last_record = Some((domain_index, record));
+            return Some(self.hostname(domain_index, record));
         }
 
         None
@@ -594,23 +636,39 @@ impl CfAttempts {
 
     /// Record that `domain`'s attempt hit the connect timeout.
     fn note_timed_out(&mut self, domain: &str) {
-        self.timed_out.insert(domain.to_string());
+        if let Some((domain_index, record)) = self.last_record {
+            debug_assert_eq!(domain, self.hostname(domain_index, record));
+            self.timed_out[Self::record_index(domain_index, record)] = true;
+        }
     }
 
     /// Queue the base record for `domain` as a forced retry, if `domain` is a
     /// `-1` record whose base is worth attempting again. Returns the queued
     /// record.
     fn retry_base_of(&mut self, domain: &str) -> Option<String> {
-        let base = base_cf_record(domain)?;
-        if self.timed_out.contains(&base) {
+        let (domain_index, record) = self.last_record?;
+        if record != CfRecord::DashOne {
             return None;
         }
-        self.queue.push_front(CfAttempt {
-            domain: base.clone(),
-            forced: true,
-        });
+        let base = base_cf_record(domain)?;
+        debug_assert_eq!(base, self.hostname(domain_index, CfRecord::Base));
+        if self.timed_out[Self::record_index(domain_index, CfRecord::Base)] {
+            return None;
+        }
+        self.forced_base = Some(domain_index);
 
         Some(base)
+    }
+
+    fn hostname(&self, domain_index: usize, record: CfRecord) -> String {
+        match record {
+            CfRecord::Base => format!("kws{}.{}", self.dc, self.domains[domain_index]),
+            CfRecord::DashOne => format!("kws{}-1.{}", self.dc, self.domains[domain_index]),
+        }
+    }
+
+    fn record_index(domain_index: usize, record: CfRecord) -> usize {
+        domain_index * 2 + usize::from(record == CfRecord::DashOne)
     }
 }
 
@@ -656,9 +714,30 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
+    connect_cf_ws_for_dc_with_outbound_ordered(
+        dc,
+        cf_domains,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        0,
+    )
+    .await
+}
+
+pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
+    dc: u32,
+    cf_domains: &[String],
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    first_domain: usize,
+) -> (Option<TgWsStream>, Option<String>, bool) {
     let media = media_tag(is_media);
     let mut all_redirects = true;
-    let mut attempts = CfAttempts::new(cf_ws_domains(dc, cf_domains, is_media));
+    let mut attempts = CfAttempts::with_offset(dc, cf_domains, is_media, first_domain);
 
     while let Some(domain) = attempts.next_domain() {
         debug!("CF WS trying DC{}{} → {}", dc, media, domain);

@@ -77,13 +77,13 @@ pub fn load_results() -> Result<Vec<TestResult>, String> {
 pub fn save_results(results: &[TestResult]) -> Result<(), String> {
     paths::ensure_data_layout().map_err(|error| error.to_string())?;
     let text = serde_json::to_string_pretty(results).map_err(|error| error.to_string())?;
-    std::fs::write(paths::test_results_path(), text).map_err(|error| error.to_string())
+    json_storage::write_atomic(&paths::test_results_path(), text.as_bytes())
 }
 
 pub fn export_results(path: String) -> Result<(), String> {
     let results = load_results()?;
     let text = serde_json::to_string_pretty(&results).map_err(|error| error.to_string())?;
-    std::fs::write(path, text).map_err(|error| error.to_string())
+    json_storage::write_atomic(std::path::Path::new(&path), text.as_bytes())
 }
 
 pub fn import_results(path: String) -> Result<Vec<TestResult>, String> {
@@ -632,7 +632,7 @@ fn http_client(
     let builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(4))
-        .user_agent("ZUI/2.0");
+        .user_agent(concat!("ZUI/", env!("CARGO_PKG_VERSION")));
     configure(builder).build()
 }
 
@@ -871,6 +871,7 @@ fn host_from_url(value: &str) -> Option<String> {
         .and_then(|url| url.host_str().map(str::to_string))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_result(
     id: String,
     preset_id: String,
@@ -934,11 +935,7 @@ fn build_result(
 
     let ok = services.iter().map(|service| service.ok).sum::<u32>();
     let total = services.iter().map(|service| service.total).sum::<u32>();
-    let score = if total == 0 {
-        0
-    } else {
-        ((ok * 100) / total) as u8
-    };
+    let score = ok.saturating_mul(100).checked_div(total).unwrap_or(0) as u8;
     let recommendation = recommendation_for(score, &services);
 
     TestResult {

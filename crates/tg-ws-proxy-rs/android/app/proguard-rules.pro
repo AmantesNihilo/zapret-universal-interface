@@ -1,0 +1,1 @@
+-keep class io.github.valnesfjord.tgwsproxyrs.NativeProxy { *; }

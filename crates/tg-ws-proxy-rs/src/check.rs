@@ -255,13 +255,8 @@ async fn probe_mtproto_proxy(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> ProbeStatus {
-    let secret = match hex::decode(&proxy.secret) {
-        Ok(b) => b,
-        Err(e) => return ProbeStatus::Fail(format!("invalid hex secret: {}", e)),
-    };
-
-    let key_bytes = crypto::secret_key(&secret);
-    let faketls_hostname = crypto::faketls_hostname(&secret);
+    let key_bytes = proxy.secret_key();
+    let faketls_hostname = proxy.faketls_hostname();
 
     let start = Instant::now();
 
@@ -275,14 +270,10 @@ async fn probe_mtproto_proxy(
     // Use DC index 2 (non-media) as a representative test target.
     let (handshake, _enc, _dec) =
         generate_client_handshake(key_bytes, 2, ProtoTag::PaddedIntermediate);
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     if let Some(hostname) = faketls_hostname {
         // ── FakeTLS path ──────────────────────────────────────────────────
-        let Ok(hostname) = std::str::from_utf8(hostname) else {
-            return ProbeStatus::Fail("FakeTLS secret contains non-UTF-8 hostname".to_string());
-        };
-
         let mut client_hello = faketls::build_faketls_client_hello(hostname);
         faketls::sign_faketls_client_hello(&mut client_hello, key_bytes);
 
