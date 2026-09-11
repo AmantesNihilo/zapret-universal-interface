@@ -24,6 +24,33 @@ fn cloudflare_refill_is_reserved_before_a_task_can_be_spawned() {
     assert_eq!(pool.cf_refilling.lock().unwrap().len(), 1);
 }
 
+#[test]
+fn failed_refill_backs_off_until_a_success_resets_it() {
+    let pool = WsPool::new(4, Duration::from_secs(120));
+    let key = (4, false);
+
+    pool.report_refill_failure(key);
+    assert!(!pool.reserve_refill(key));
+
+    pool.report_success(key.0, key.1);
+    assert!(pool.reserve_refill(key));
+}
+
+#[test]
+fn refill_backoff_is_capped_at_one_hour() {
+    let pool = WsPool::new(4, Duration::from_secs(120));
+    let key = (2, true);
+
+    for _ in 0..32 {
+        pool.report_refill_failure(key);
+    }
+
+    let remaining =
+        pool.refill_after.lock().unwrap()[&key].saturating_duration_since(Instant::now());
+    assert!(remaining <= REFILL_BACKOFF_MAX);
+    assert!(remaining > Duration::from_secs(3500));
+}
+
 #[tokio::test]
 async fn a_direct_miss_burst_spawns_one_refill_task() {
     let pool = Arc::new(WsPool::new(4, Duration::from_secs(60)));

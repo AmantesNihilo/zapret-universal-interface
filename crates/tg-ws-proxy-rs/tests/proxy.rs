@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use tg_ws_proxy_rs::config::Config;
 use tg_ws_proxy_rs::crypto::{ProtoTag, generate_client_handshake};
@@ -360,6 +360,30 @@ async fn a_client_with_the_wrong_secret_is_dropped_without_dialling_out() {
 }
 
 #[tokio::test]
+async fn proxy_protocol_v1_header_is_consumed_before_mtproto_handshake() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    let config = proxy_config(&format!("http://{proxy_addr}"), &["--proxy-protocol"]);
+    let secret = config.secret_bytes();
+    let (mut client, handler) = start_proxy_connection(config).await;
+
+    client
+        .write_all(b"PROXY TCP4 192.0.2.10 127.0.0.1 54321 1443\r\n")
+        .await
+        .unwrap();
+    let (handshake, _, _) = generate_client_handshake(&secret, 2, ProtoTag::PaddedIntermediate);
+    client.write_all(&handshake).await.unwrap();
+    drop(client);
+
+    await_proxy_handler(handler).await;
+
+    let request = await_proxy_request(proxy_task).await;
+    assert!(
+        request.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1"),
+        "the PROXY header must be stripped before MTProto parsing"
+    );
+}
+
+#[tokio::test]
 async fn inbound_faketls_handshake_is_accepted_and_routed() {
     let domain = "example.com";
     let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
@@ -511,7 +535,7 @@ async fn inbound_faketls_tolerates_a_slightly_oversized_record() {
 }
 
 #[tokio::test]
-async fn inbound_faketls_rejects_a_client_hello_for_another_hostname() {
+async fn inbound_faketls_masks_a_client_hello_for_another_hostname() {
     let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
     let config = proxy_config(
         &format!("http://{proxy_addr}"),
@@ -528,10 +552,27 @@ async fn inbound_faketls_rejects_a_client_hello_for_another_hostname() {
 
     await_proxy_handler(handler).await;
 
+    let request = await_proxy_request(proxy_task).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), proxy_task)
-            .await
-            .is_err(),
-        "an SNI mismatch must not trigger an outbound connection"
+        request.starts_with("CONNECT example.com:443 HTTP/1.1"),
+        "an unrecognized TLS client must be forwarded to the configured masking site"
     );
+}
+
+#[tokio::test]
+async fn inbound_faketls_redirects_non_tls_scanners_to_masking_site() {
+    let config = proxy_config("direct", &["--listen-faketls-domain", "example.com"]);
+    let (mut client, handler) = start_proxy_connection(config).await;
+    client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+        .await
+        .expect("redirect arrives")
+        .unwrap();
+    await_proxy_handler(handler).await;
+
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 301 Moved Permanently"));
+    assert!(response.contains("Location: https://example.com/"));
 }

@@ -93,7 +93,7 @@
   let updateInstalling = $state(false);
   let updateMessage = $state<string | null>(null);
   let updatePostponedVersion = $state<string | null>(null);
-  let appVersion = $state("2.2.0");
+  let appVersion = $state("2.2.1");
   let changingZapretEngine = $state(false);
   let engineTransition = $state<ZapretEngine | null>(null);
   let testSelectionOpen = $state(false);

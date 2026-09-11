@@ -106,3 +106,17 @@ fn zero_cooldown_expires_immediately() {
     std::thread::sleep(Duration::from_millis(1));
     assert!(!runtime.fronting_active());
 }
+
+#[test]
+fn cloudflare_domain_pool_can_be_replaced_live() {
+    let runtime = Runtime::new(OutboundConnector::direct());
+    assert!(!runtime.has_cf_domains());
+
+    assert!(runtime.replace_cf_domains(vec!["one.example".to_string()]));
+    assert!(runtime.has_cf_domains());
+    assert_eq!(runtime.cf_domains().as_ref(), &vec!["one.example"]);
+
+    assert!(!runtime.replace_cf_domains(vec!["one.example".to_string()]));
+    assert!(runtime.replace_cf_domains(vec!["two.example".to_string()]));
+    assert_eq!(runtime.cf_domains().as_ref(), &vec!["two.example"]);
+}

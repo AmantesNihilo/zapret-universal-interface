@@ -10,6 +10,7 @@ pub mod proxy;
 pub mod runtime;
 pub mod server;
 pub mod splitter;
+pub mod stats;
 pub mod ws_client;
 
 /// Version of the embedded engine, kept in one place for library consumers.

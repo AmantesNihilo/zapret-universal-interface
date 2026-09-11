@@ -157,8 +157,34 @@ fn cooldown_keys_include_the_media_flag() {
 }
 
 #[test]
+fn route_health_reset_clears_process_wide_cooldowns() {
+    IP_FAIL.set("149.154.167.220".to_string(), Duration::from_secs(3600));
+    WS_FAIL.set((4, false), Duration::from_secs(300));
+    assert!(IP_FAIL.active("149.154.167.220"));
+    assert!(WS_FAIL.active(&(4, false)));
+
+    reset_route_health();
+
+    assert!(!IP_FAIL.active("149.154.167.220"));
+    assert!(!WS_FAIL.active(&(4, false)));
+}
+
+#[test]
 fn upstream_key_joins_host_and_port() {
     assert_eq!(upstream_key("proxy.example", 443), "proxy.example:443");
+}
+
+#[test]
+fn proxy_protocol_v1_extracts_ipv4_and_ipv6_sources() {
+    assert_eq!(
+        parse_proxy_protocol_v1("PROXY TCP4 192.0.2.10 198.51.100.20 45678 443"),
+        Some("192.0.2.10:45678".parse().unwrap())
+    );
+    assert_eq!(
+        parse_proxy_protocol_v1("PROXY TCP6 2001:db8::1 2001:db8::2 1234 443"),
+        Some("[2001:db8::1]:1234".parse().unwrap())
+    );
+    assert_eq!(parse_proxy_protocol_v1("GET / HTTP/1.1"), None);
 }
 
 #[test]

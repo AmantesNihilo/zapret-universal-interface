@@ -419,7 +419,7 @@ fn timeout_and_cooldown_defaults_match_the_documented_values() {
     assert_eq!(cfg.cf_fail_cooldown, 60);
     assert_eq!(cfg.fronting_fail_cooldown, 60);
     assert_eq!(cfg.pool_size, 4);
-    assert_eq!(cfg.pool_max_age, 55);
+    assert_eq!(cfg.pool_max_age, 120);
     assert_eq!(cfg.port, 1443);
 }
 
@@ -535,4 +535,20 @@ fn force_test_dc_flag_parses() {
         Config::try_parse_from(["tg-ws-proxy", "--force-test-dc"]).expect("force test DC flag");
 
     assert!(config.force_test_dc);
+}
+
+#[test]
+fn flowseal_compatible_proxy_protocol_and_faketls_flags_parse() {
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        "--proxy-protocol",
+        "--fake-tls-domain",
+        "mask.example",
+    ])
+    .unwrap();
+
+    assert!(cfg.proxy_protocol);
+    assert_eq!(cfg.listen_faketls_domain.as_deref(), Some("mask.example"));
 }

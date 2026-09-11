@@ -9,7 +9,7 @@ use tg_ws_proxy_rs::{check, config::Config, default_domains, server};
 use tokio::sync::oneshot;
 use tracing_subscriber::fmt::MakeWriter;
 
-pub const ENGINE_NAME: &str = "tg-ws-proxy-rs";
+pub const ENGINE_NAME: &str = "ZUI tg-ws engine";
 pub const ENGINE_VERSION: &str = tg_ws_proxy_rs::VERSION;
 
 static TG_WS_TRACE_SENDER: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
@@ -43,6 +43,7 @@ impl Drop for TgWsTraceWriter {
         }
         let message = String::from_utf8_lossy(&self.bytes).trim().to_string();
         if !message.is_empty() {
+            let message = censor_tg_ws_log_domains(&redact_tg_ws_log_secrets(&message));
             if let Some(sender) = TG_WS_TRACE_SENDER.get() {
                 match sender.try_send(message) {
                     Ok(()) => {
@@ -61,6 +62,102 @@ impl Drop for TgWsTraceWriter {
             }
         }
     }
+}
+
+fn redact_tg_ws_log_secrets(message: &str) -> String {
+    if let Some(index) = message.find("Secret:") {
+        return format!("{}Secret: [REDACTED]", &message[..index]);
+    }
+
+    let mut redacted = message.to_string();
+    let mut search_from = 0;
+    while let Some(relative) = redacted[search_from..].find("secret=") {
+        let value_start = search_from + relative + "secret=".len();
+        let value_len = redacted[value_start..]
+            .find(|character: char| character.is_whitespace() || character == '&')
+            .unwrap_or(redacted.len() - value_start);
+        redacted.replace_range(value_start..value_start + value_len, "[REDACTED]");
+        search_from = value_start + "[REDACTED]".len();
+    }
+    redacted
+}
+
+fn censor_tg_ws_log_domains(message: &str) -> String {
+    let mut result = String::with_capacity(message.len());
+    let mut token = String::new();
+
+    let flush = |result: &mut String, token: &mut String| {
+        if is_log_domain(token) && !is_uncensored_log_domain(token) {
+            let domain = token.trim_end_matches('.');
+            let trailing_dots = token.len() - domain.len();
+            let parts = domain.split('.').collect::<Vec<_>>();
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    result.push('.');
+                }
+                if index + 1 == parts.len() {
+                    result.push_str(part);
+                } else {
+                    let keep = part.len() / 2;
+                    result.push_str(&part[..keep]);
+                    result.extend(std::iter::repeat_n('*', part.len() - keep));
+                }
+            }
+            result.extend(std::iter::repeat_n('.', trailing_dots));
+        } else {
+            result.push_str(token);
+        }
+        token.clear();
+    };
+
+    for character in message.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '.') {
+            token.push(character);
+        } else {
+            flush(&mut result, &mut token);
+            result.push(character);
+        }
+    }
+    flush(&mut result, &mut token);
+    result
+}
+
+fn is_log_domain(value: &str) -> bool {
+    let value = value.trim_end_matches('.');
+    let mut labels = value.split('.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    if first.is_empty() {
+        return false;
+    }
+    let labels = std::iter::once(first).chain(labels).collect::<Vec<_>>();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+        && labels
+            .last()
+            .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|byte| byte.is_ascii_alphabetic()))
+}
+
+fn is_uncensored_log_domain(value: &str) -> bool {
+    let normalized = value.trim_end_matches('.').to_ascii_lowercase();
+    normalized == "telegram.org"
+        || normalized.ends_with(".telegram.org")
+        || normalized.ends_with(".log")
 }
 
 impl<'a> MakeWriter<'a> for TgWsMakeWriter {
@@ -114,6 +211,7 @@ pub fn install_logging(app: tauri::AppHandle) {
 
 pub struct TgWsRuntimeHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_requested: Arc<AtomicBool>,
     thread: JoinHandle<()>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     pub host: String,
@@ -131,6 +229,7 @@ impl TgWsRuntimeHandle {
     }
 
     pub fn stop(mut self) -> Result<(), String> {
+        self.shutdown_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
@@ -158,6 +257,8 @@ pub fn spawn(profile: &Profile) -> Result<TgWsRuntimeHandle, String> {
     let thread_config = config.clone();
     let failure = Arc::new(std::sync::Mutex::new(None::<String>));
     let thread_failure = Arc::clone(&failure);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let thread_shutdown_requested = Arc::clone(&shutdown_requested);
 
     let thread = std::thread::Builder::new()
         .name("zui-tg-ws-runtime".into())
@@ -205,25 +306,48 @@ pub fn spawn(profile: &Profile) -> Result<TgWsRuntimeHandle, String> {
                     }
                 } else {
                     let pending_sender = ready_tx.lock().ok().and_then(|mut tx| tx.take());
-                    let message = if pending_sender.is_some() {
-                        "tg-ws stopped before the listener became ready".to_string()
+                    if thread_shutdown_requested.load(Ordering::Acquire) {
+                        // A user-initiated stop is the normal terminal state,
+                        // not a runtime failure to surface on the next status
+                        // poll.  Keep startup cancellation actionable for the
+                        // caller that is still waiting on the ready channel.
+                        if let Some(sender) = pending_sender {
+                            let _ =
+                                sender
+                                    .send(Err("tg-ws stopped before the listener became ready"
+                                        .to_string()));
+                        }
                     } else {
-                        "tg-ws server stopped unexpectedly".to_string()
-                    };
-                    if let Ok(mut failure) = thread_failure.lock() {
-                        *failure = Some(message.clone());
-                    }
-                    if let Some(sender) = pending_sender {
-                        let _ = sender.send(Err(message));
+                        let message = if pending_sender.is_some() {
+                            "tg-ws stopped before the listener became ready".to_string()
+                        } else {
+                            "tg-ws server stopped unexpectedly".to_string()
+                        };
+                        if let Ok(mut failure) = thread_failure.lock() {
+                            *failure = Some(message.clone());
+                        }
+                        if let Some(sender) = pending_sender {
+                            let _ = sender.send(Err(message));
+                        }
                     }
                 }
             });
+
+            // Dropping a multi-thread Tokio runtime waits indefinitely for
+            // blocking tasks (notably Windows DNS resolution) that cannot be
+            // cancelled. During a busy proxy shutdown that made the owning
+            // thread miss ZUI's five-second stop deadline even though the
+            // server accept loop had already stopped. Bound that final drain;
+            // ordinary async tasks are cancelled immediately, while an
+            // in-flight OS resolver is allowed to finish in the background.
+            runtime.shutdown_timeout(Duration::from_secs(1));
         })
         .map_err(|error| error.to_string())?;
 
     match ready_rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Ok(info)) => Ok(TgWsRuntimeHandle {
             shutdown_tx: Some(shutdown_tx),
+            shutdown_requested,
             thread,
             failure,
             host,
@@ -235,6 +359,7 @@ pub fn spawn(profile: &Profile) -> Result<TgWsRuntimeHandle, String> {
             Err(format!("tg-ws listener startup failed: {error}"))
         }
         Err(error) => {
+            shutdown_requested.store(true, Ordering::Release);
             let _ = shutdown_tx.send(());
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while !thread.is_finished() && std::time::Instant::now() < deadline {
@@ -593,6 +718,32 @@ mod tests {
     }
 
     #[test]
+    fn redacts_banner_secret_from_engine_logs() {
+        assert_eq!(
+            redact_tg_ws_log_secrets(" INFO   Secret:        0123456789abcdef0123456789abcdef"),
+            " INFO   Secret: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redacts_secret_inside_telegram_links() {
+        assert_eq!(
+            redact_tg_ws_log_secrets("tg://proxy?server=127.0.0.1&port=1443&secret=deadbeef next"),
+            "tg://proxy?server=127.0.0.1&port=1443&secret=[REDACTED] next"
+        );
+    }
+
+    #[test]
+    fn censors_non_telegram_domains_like_flowseal_1_10_2() {
+        assert_eq!(
+            censor_tg_ws_log_domains(
+                "CF kws4.pclead.co.uk failed; Telegram kws4.web.telegram.org; 149.154.167.220"
+            ),
+            "CF kw**.pcl***.c*.uk failed; Telegram kws4.web.telegram.org; 149.154.167.220"
+        );
+    }
+
+    #[test]
     fn builds_direct_dc_config_by_default() {
         let profile = Profile::default();
         let config = config_from_profile(&profile).expect("profile config");
@@ -744,5 +895,60 @@ mod tests {
         assert_eq!(config.pool_size, 7);
         assert!(config.verbose);
         assert!(!config.quiet);
+    }
+
+    #[test]
+    fn embedded_runtime_stops_with_an_active_client_before_ui_deadline() {
+        let profile = Profile {
+            tg_ws_port: 0,
+            tg_ws_pool_size: 0,
+            tg_ws_cf_proxy_enabled: false,
+            ..Profile::default()
+        };
+        let handle = spawn(&profile).expect("embedded tg-ws starts");
+        let _client =
+            std::net::TcpStream::connect(("127.0.0.1", handle.port)).expect("client connects");
+        let failure = Arc::clone(&handle.failure);
+
+        let started = std::time::Instant::now();
+        handle.stop().expect("embedded tg-ws stops cleanly");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "shutdown must finish before the five-second UI deadline"
+        );
+        assert_eq!(
+            failure.lock().expect("failure lock").as_deref(),
+            None,
+            "a requested stop must not be reported as an unexpected crash"
+        );
+    }
+
+    #[test]
+    fn embedded_runtime_stops_while_pool_and_domain_refresh_are_active() {
+        let profile = Profile {
+            tg_ws_port: 0,
+            // Keep the production defaults enabled: the pool starts direct
+            // WS handshakes while the CF list refresh resolves GitHub. These
+            // were the uncancellable tasks behind the reported five-second
+            // shutdown failure on Windows.
+            tg_ws_pool_size: 4,
+            tg_ws_cf_proxy_enabled: true,
+            tg_ws_default_domains: true,
+            ..Profile::default()
+        };
+        let handle = spawn(&profile).expect("embedded tg-ws starts without waiting for refresh");
+        let failure = Arc::clone(&handle.failure);
+
+        let started = std::time::Instant::now();
+        handle
+            .stop()
+            .expect("embedded tg-ws stops while background I/O is active");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "background DNS and pool work must not outlive the UI deadline"
+        );
+        assert_eq!(failure.lock().expect("failure lock").as_deref(), None);
     }
 }

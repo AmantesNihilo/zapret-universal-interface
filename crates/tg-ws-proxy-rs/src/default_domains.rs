@@ -12,6 +12,9 @@
 
 mod http;
 
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use tracing::warn;
 
 use crate::outbound::OutboundConnector;
@@ -19,6 +22,7 @@ use http::https_get;
 
 const DOMAINS_URL_HOST: &str = "raw.githubusercontent.com";
 const DOMAINS_URL_PATH: &str = "/Flowseal/tg-ws-proxy/refs/heads/main/.github/cfproxy-domains.txt";
+const MIN_VALID_DOMAINS: usize = 3;
 
 /// The real TLD suffix that the encoded `.com` maps back to.
 const REAL_SUFFIX: &str = ".co.uk";
@@ -32,6 +36,21 @@ static FALLBACK_ENCODED: &[&str] = &[
     "mkuosckvso.com",
     "zaewayzmplad.com",
     "twdmbzcm.com",
+    "awzwsldi.com",
+    "clngqrflngqin.com",
+    "tjacxbqtj.com",
+    "bxaxtxmrw.com",
+    "dmohrsgmohcrwb.com",
+    "vwbmtmoi.com",
+    "khgrre.com",
+    "ulihssf.com",
+    "tmhqsdqmfpmk.com",
+    "xwuwoqbm.com",
+    "orgcnunpj.com",
+    "zhkuldz.com",
+    "zypoljnslxa.com",
+    "efabnxaowuzs.com",
+    "zaftuzsftqdq.com",
 ];
 
 /// Deobfuscate a single encoded domain.
@@ -65,18 +84,50 @@ pub fn deobfuscate(s: &str) -> Option<String> {
 /// Parse a plain-text domain list (one domain per line; `#` comments ignored).
 /// Each line is deobfuscated before being included.
 fn parse_domain_list(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(deobfuscate)
+    normalize_domains(
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(deobfuscate),
+    )
+}
+
+pub(crate) fn fallback_domains() -> Vec<String> {
+    normalize_domains(FALLBACK_ENCODED.iter().filter_map(|s| deobfuscate(s)))
+}
+
+fn normalize_domains(domains: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    domains
+        .into_iter()
+        .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|domain| is_valid_domain(domain))
+        .filter(|domain| seen.insert(domain.clone()))
         .collect()
 }
 
-fn fallback_domains() -> Vec<String> {
-    FALLBACK_ENCODED
-        .iter()
-        .filter_map(|s| deobfuscate(s))
-        .collect()
+fn is_valid_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
+pub(crate) fn merge_domain_pools(primary: &[String], refreshed: &[String]) -> Vec<String> {
+    normalize_domains(primary.iter().chain(refreshed).cloned())
 }
 
 /// Fetch the default CF-proxy domain list using a direct outbound connection.
@@ -93,16 +144,8 @@ pub async fn fetch_default_domains() -> Vec<String> {
 /// connector, deobfuscate it, and return the decoded domains. Falls back to
 /// the embedded list on any error.
 pub async fn fetch_default_domains_with_outbound(outbound: &OutboundConnector) -> Vec<String> {
-    match https_get(DOMAINS_URL_HOST, DOMAINS_URL_PATH, outbound).await {
-        Ok(body) => {
-            let domains = parse_domain_list(&body);
-            if domains.is_empty() {
-                warn!("Default domain list from GitHub was empty; using built-in fallback");
-                fallback_domains()
-            } else {
-                domains
-            }
-        }
+    match fetch_default_domains_candidate_with_outbound(outbound).await {
+        Ok(domains) => domains,
         Err(e) => {
             warn!(
                 "Failed to fetch default CF domain list ({}); using built-in fallback",
@@ -111,6 +154,29 @@ pub async fn fetch_default_domains_with_outbound(outbound: &OutboundConnector) -
             fallback_domains()
         }
     }
+}
+
+/// Fetch a candidate for a live refresh. Errors are returned to the caller so
+/// it can retain the last known-good pool instead of replacing it with stale
+/// fallback data every hour.
+pub(crate) async fn fetch_default_domains_candidate_with_outbound(
+    outbound: &OutboundConnector,
+) -> Result<Vec<String>, String> {
+    let cache_buster = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = format!("{DOMAINS_URL_PATH}?zui_refresh={cache_buster}");
+    let body = https_get(DOMAINS_URL_HOST, &path, outbound).await?;
+    let domains = parse_domain_list(&body);
+    if domains.len() < MIN_VALID_DOMAINS {
+        return Err(format!(
+            "low-quality domain list: {} valid, at least {} required",
+            domains.len(),
+            MIN_VALID_DOMAINS
+        ));
+    }
+    Ok(domains)
 }
 
 #[cfg(test)]

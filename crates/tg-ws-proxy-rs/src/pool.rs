@@ -30,6 +30,7 @@ use futures_util::{FutureExt, StreamExt, stream};
 use crate::config::Config;
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
+use crate::stats::STATS;
 use crate::ws_client::{
     TgWsStream, connect_cf_record_with_outbound, connect_cf_worker_ws_for_dc_with_outbound,
     connect_ws_for_dc_with_outbound, media_tag,
@@ -44,6 +45,10 @@ use crate::ws_client::{
 /// *next* connection, not a burst.  Upstream settled on the same number for its
 /// Worker pool in v1.9.1.
 const CF_POOL_MAX: usize = 1;
+const CF_POOL_MAX_AGE: Duration = Duration::from_secs(100);
+const POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+const REFILL_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const REFILL_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
 /// Keep startup and refill latency bounded without making a large
 /// `--pool-size` fan out into an equally large TCP/TLS handshake burst.
@@ -128,6 +133,8 @@ pub struct WsPool {
     /// (a single HashSet insert/remove) and never holds the lock across an
     /// await point, which enables a simple Drop-based cleanup guard.
     refilling: StdMutex<HashSet<PoolKey>>,
+    refill_failures: StdMutex<HashMap<PoolKey, u32>>,
+    refill_after: StdMutex<HashMap<PoolKey, Instant>>,
     #[cfg(test)]
     refill_task_spawns: AtomicUsize,
     #[cfg(test)]
@@ -165,6 +172,8 @@ impl WsPool {
             cf_idle: Mutex::new(HashMap::new()),
             cf_refilling: StdMutex::new(HashSet::new()),
             refilling: StdMutex::new(HashSet::new()),
+            refill_failures: StdMutex::new(HashMap::new()),
+            refill_after: StdMutex::new(HashMap::new()),
             #[cfg(test)]
             refill_task_spawns: AtomicUsize::new(0),
             #[cfg(test)]
@@ -223,6 +232,8 @@ impl WsPool {
                 media_tag(is_media),
                 remaining
             );
+            self.report_success(dc, is_media);
+            STATS.pool_hit();
 
             // Schedule a background task to refill the bucket.
             if allow_refill {
@@ -238,6 +249,8 @@ impl WsPool {
         if allow_refill {
             self.schedule_refill(dc, is_media, target_ip, skip_tls_verify);
         }
+
+        STATS.pool_miss();
 
         None
     }
@@ -256,10 +269,14 @@ impl WsPool {
     ) -> Option<(TgWsStream, String)> {
         let now = Instant::now();
         let mut lock = self.cf_idle.lock().await;
-        let bucket = lock.get_mut(&(tier, dc, is_media))?;
+        let Some(bucket) = lock.get_mut(&(tier, dc, is_media)) else {
+            drop(lock);
+            STATS.cf_pool_miss();
+            return None;
+        };
 
         while let Some(mut entry) = bucket.pop() {
-            if now.saturating_duration_since(entry.created) > self.max_age
+            if now.saturating_duration_since(entry.created) > CF_POOL_MAX_AGE
                 || entry.ws.next().now_or_never().is_some()
             {
                 debug!(
@@ -282,9 +299,12 @@ impl WsPool {
                 connect_timeout: entry.connect_timeout,
             });
 
+            STATS.cf_pool_hit();
+
             return Some((entry.ws, entry.domain));
         }
 
+        STATS.cf_pool_miss();
         None
     }
 
@@ -347,6 +367,56 @@ impl WsPool {
         debug!("WS pool warmup complete");
     }
 
+    /// Keep idle sockets fresh even when Telegram has not consumed them yet.
+    /// Flowseal rotates the pool every five seconds; without this maintenance
+    /// pass a connection could sit dead for hours and only be discovered on a
+    /// user request, adding a full reconnect delay to that request.
+    pub async fn maintain(self: &Arc<Self>, config: &Config) {
+        if self.pool_size == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        let redirects = config.dc_redirects();
+        let mut refill = Vec::new();
+        {
+            let mut idle = self.idle.lock().await;
+            for (dc, ip) in redirects {
+                for is_media in [false, true] {
+                    let bucket = idle.entry((dc, is_media)).or_default();
+                    bucket.retain_mut(|entry| {
+                        now.saturating_duration_since(entry.created) <= self.max_age
+                            && entry.ws.next().now_or_never().is_none()
+                    });
+                    if bucket.len() < self.pool_size {
+                        refill.push((dc, is_media, ip.clone()));
+                    }
+                }
+            }
+        }
+
+        for (dc, is_media, ip) in refill {
+            self.schedule_refill(dc, is_media, &ip, config.skip_tls_verify);
+        }
+    }
+
+    pub async fn run_maintenance(self: Arc<Self>, config: Arc<Config>) {
+        let mut interval = tokio::time::interval(POOL_MAINTENANCE_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            self.maintain(&config).await;
+        }
+    }
+
+    /// A successful foreground or pooled connection resets exponential refill
+    /// backoff for this DC bucket.
+    pub fn report_success(&self, dc: u32, is_media: bool) {
+        let key = (dc, is_media);
+        self.refill_failures.lock().unwrap().remove(&key);
+        self.refill_after.lock().unwrap().remove(&key);
+    }
+
     // ── Internal ─────────────────────────────────────────────────────────
 
     fn schedule_refill(self: &Arc<Self>, dc: u32, is_media: bool, target_ip: &str, skip_tls: bool) {
@@ -365,6 +435,13 @@ impl WsPool {
     }
 
     fn reserve_refill(&self, key: PoolKey) -> bool {
+        let now = Instant::now();
+        let mut refill_after = self.refill_after.lock().unwrap();
+        if refill_after.get(&key).is_some_and(|after| now < *after) {
+            return false;
+        }
+        refill_after.remove(&key);
+        drop(refill_after);
         self.refilling.lock().unwrap().insert(key)
     }
 
@@ -394,7 +471,10 @@ impl WsPool {
         let new_conns = self
             .connect_batch(&target_ip, dc, is_media, skip_tls, needed)
             .await;
-        if !new_conns.is_empty() {
+        if new_conns.is_empty() {
+            self.report_refill_failure((dc, is_media));
+        } else {
+            self.report_success(dc, is_media);
             let mut lock = self.idle.lock().await;
             let bucket = lock.entry((dc, is_media)).or_default();
 
@@ -416,6 +496,31 @@ impl WsPool {
                 lock.get(&(dc, is_media)).map_or(0, |b| b.len())
             );
         }
+    }
+
+    fn report_refill_failure(&self, key: PoolKey) {
+        let failures = {
+            let mut failures = self.refill_failures.lock().unwrap();
+            let value = failures.entry(key).or_default();
+            *value = value.saturating_add(1);
+            *value
+        };
+        let exponent = failures.saturating_sub(1).min(12);
+        let seconds = REFILL_BACKOFF_INITIAL
+            .as_secs()
+            .saturating_mul(1u64 << exponent)
+            .min(REFILL_BACKOFF_MAX.as_secs());
+        let delay = Duration::from_secs(seconds);
+        self.refill_after
+            .lock()
+            .unwrap()
+            .insert(key, Instant::now() + delay);
+        debug!(
+            "pool refill failed for DC{}{}, retry in {}s",
+            key.0,
+            media_tag(key.1),
+            delay.as_secs()
+        );
     }
 
     async fn cf_refill_reserved(&self, target: CfTarget) {

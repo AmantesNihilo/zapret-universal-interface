@@ -175,7 +175,11 @@ pub struct Config {
 
     /// Accept inbound Telegram clients using `ee` FakeTLS camouflage with this
     /// SNI hostname. The generated proxy link will use `secret=ee<key><hosthex>`.
-    #[arg(long = "listen-faketls-domain", env = "TG_LISTEN_FAKETLS_DOMAIN")]
+    #[arg(
+        long = "listen-faketls-domain",
+        alias = "fake-tls-domain",
+        env = "TG_LISTEN_FAKETLS_DOMAIN"
+    )]
     pub listen_faketls_domain: Option<String>,
 
     /// Target IP for a DC, e.g. `--dc-ip 2:149.154.167.220`.
@@ -201,6 +205,11 @@ pub struct Config {
     /// this switch is for clients that send them as plain DC 1-3.
     #[arg(long = "force-test-dc", env = "TG_FORCE_TEST_DC")]
     pub force_test_dc: bool,
+
+    /// Accept a HAProxy/nginx PROXY protocol v1 line before the Telegram
+    /// handshake and use its source address in diagnostics.
+    #[arg(long = "proxy-protocol", env = "TG_PROXY_PROTOCOL")]
+    pub proxy_protocol: bool,
 
     /// Maximum number of concurrent client connections.
     /// When omitted, a safe value is computed automatically from the process's
@@ -470,7 +479,7 @@ pub struct Config {
 
     /// Maximum age of a pooled WebSocket connection in seconds.
     /// Connections older than this are discarded and re-established.
-    #[arg(long = "pool-max-age", default_value = "55", env = "TG_POOL_MAX_AGE")]
+    #[arg(long = "pool-max-age", default_value = "120", env = "TG_POOL_MAX_AGE")]
     pub pool_max_age: u64,
 
     /// Test configured Cloudflare proxy domains and upstream MTProto proxies

@@ -25,7 +25,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -64,6 +64,7 @@ use crate::outbound::OutboundConnector;
 use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
+use crate::stats::STATS;
 use crate::ws_client::{
     TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound,
     connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_path_with_outbound,
@@ -140,6 +141,10 @@ impl<K: Eq + Hash> CooldownMap<K> {
         }
     }
 
+    fn clear_all(&self) {
+        *self.entries.lock().unwrap() = None;
+    }
+
     /// Whether `key` is still inside its cooldown window.
     fn active<Q>(&self, key: &Q) -> bool
     where
@@ -175,6 +180,19 @@ static CF_WORKER_FAIL: CooldownMap<String> = CooldownMap::new();
 /// retry a doomed fronting attempt on every single connection; see
 /// `Config::fronting_fail_cooldown`.
 static FRONTING_FAIL: CooldownMap<(u32, bool)> = CooldownMap::new();
+
+/// A service restart must behave like restarting the standalone upstream
+/// process. Without this, process-wide cooldowns survived a ZUI stop/start and
+/// could keep a recovered route disabled for up to an hour.
+pub(crate) fn reset_route_health() {
+    WS_FAIL.clear_all();
+    IP_FAIL.clear_all();
+    UPSTREAM_FAIL.clear_all();
+    CF_WORKER_FAIL.clear_all();
+    FRONTING_FAIL.clear_all();
+    CF_BALANCE_COUNTER.store(0, Ordering::Relaxed);
+    CF_WORKER_BALANCE_COUNTER.store(0, Ordering::Relaxed);
+}
 
 fn upstream_key(host: &str, port: u16) -> String {
     format!("{}:{}", host, port)
@@ -281,27 +299,59 @@ async fn accept_inbound_faketls(
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],
     expected_domain: &str,
+    runtime: &Runtime,
 ) -> Option<([u8; 64], PendingData)> {
-    let record = read_tls_record_bytes(reader, TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM)
-        .await
-        .ok()??;
-    if record[0] != TLS_RECORD_HANDSHAKE || record[1..3] != [0x03, 0x01] {
-        debug!("[{}] bad FakeTLS ClientHello record", label);
+    let mut header = [0u8; 5];
+    if let Err(error) = reader.read_exact(&mut header).await {
+        debug!("[{}] incomplete FakeTLS header: {}", label, error);
+        return None;
+    }
+    if header[0] != TLS_RECORD_HANDSHAKE {
+        STATS.masked();
+        let redirect = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{expected_domain}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = writer.write_all(redirect.as_bytes()).await;
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if payload_len > TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM {
+        debug!("[{}] oversized FakeTLS ClientHello", label);
+        return None;
+    }
+    let mut record = Vec::with_capacity(5 + payload_len);
+    record.extend_from_slice(&header);
+    record.resize(5 + payload_len, 0);
+    if let Err(error) = reader.read_exact(&mut record[5..]).await {
+        debug!("[{}] incomplete FakeTLS ClientHello: {}", label, error);
+        return None;
+    }
+    if record[1..3] != [0x03, 0x01] {
+        debug!("[{}] bad FakeTLS ClientHello version", label);
+        STATS.masked();
+        proxy_to_masking_domain(label, reader, writer, &record, expected_domain, runtime).await;
         return None;
     }
 
     let Some((hello, matched_secret)) = secrets.iter().find_map(|secret| {
         parse_faketls_client_hello(&record, secret).map(|hello| (hello, secret))
     }) else {
-        debug!("[{}] bad FakeTLS ClientHello digest", label);
+        debug!(
+            "[{}] unrecognized TLS ClientHello, forwarding to masking site",
+            label
+        );
+        STATS.masked();
+        proxy_to_masking_domain(label, reader, writer, &record, expected_domain, runtime).await;
         return None;
     };
 
     if hello.hostname.as_deref() != Some(expected_domain) {
         debug!(
-            "[{}] FakeTLS SNI mismatch: got {:?}, expected {}",
+            "[{}] FakeTLS SNI mismatch: got {:?}, expected {}; forwarding to masking site",
             label, hello.hostname, expected_domain
         );
+        STATS.masked();
+        proxy_to_masking_domain(label, reader, writer, &record, expected_domain, runtime).await;
         return None;
     }
 
@@ -334,6 +384,45 @@ async fn accept_inbound_faketls(
     }
 
     Some((handshake_buf, PendingData::default()))
+}
+
+async fn proxy_to_masking_domain(
+    label: SocketAddr,
+    reader: &mut TcpReader,
+    writer: &mut TcpWriter,
+    initial_data: &[u8],
+    domain: &str,
+    runtime: &Runtime,
+) {
+    let mut remote = match runtime
+        .outbound()
+        .connect(domain, 443, Duration::from_secs(10))
+        .await
+    {
+        Ok(remote) => remote,
+        Err(error) => {
+            debug!("[{}] masking connection failed: {}", label, error.reason);
+            return;
+        }
+    };
+    if let Err(error) = remote.write_all(initial_data).await {
+        debug!("[{}] masking ClientHello write failed: {}", label, error);
+        return;
+    }
+
+    let (mut remote_reader, mut remote_writer) = remote.into_split();
+    tokio::select! {
+        result = tokio::io::copy(reader, &mut remote_writer) => {
+            if let Err(error) = result {
+                debug!("[{}] masking upload closed: {}", label, error);
+            }
+        }
+        result = tokio::io::copy(&mut remote_reader, writer) => {
+            if let Err(error) = result {
+                debug!("[{}] masking download closed: {}", label, error);
+            }
+        }
+    }
 }
 
 // ─── Client handler ──────────────────────────────────────────────────────────
@@ -405,7 +494,15 @@ pub async fn handle_client_with_runtime(
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
 ) {
-    let label = peer;
+    let _active_connection = STATS.connection_started();
+
+    // Preserve the public embedding API: callers that construct Runtime
+    // themselves still get the configured initial pool. The server replaces
+    // this snapshot during live default-domain refreshes.
+    if !runtime.has_cf_domains() && !config.cf_domains.is_empty() {
+        runtime.replace_cf_domains(config.cf_domains.clone());
+    }
+    let mut label = peer;
     let _ = stream.set_nodelay(true);
     let socket = socket2::SockRef::from(&stream);
     let _ = socket.set_send_buffer_size(config.buf_bytes());
@@ -417,6 +514,25 @@ pub async fn handle_client_with_runtime(
     // Split into independent read / write halves.
     let (mut reader, mut writer) = stream.into_split();
 
+    if config.proxy_protocol {
+        label = match tokio::time::timeout(
+            timeouts.handshake,
+            read_proxy_protocol_v1(&mut reader, peer),
+        )
+        .await
+        {
+            Ok(Ok(label)) => label,
+            Ok(Err(error)) => {
+                debug!("[{}] invalid PROXY protocol header: {}", peer, error);
+                return;
+            }
+            Err(_) => {
+                debug!("[{}] PROXY protocol header timeout", peer);
+                return;
+            }
+        };
+    }
+
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
     let inbound_faketls_domain = config.normalized_listen_faketls_domain();
     let handshake = tokio::time::timeout(
@@ -427,6 +543,7 @@ pub async fn handle_client_with_runtime(
             &mut writer,
             secrets,
             inbound_faketls_domain,
+            &runtime,
         ),
     )
     .await;
@@ -457,6 +574,7 @@ pub async fn handle_client_with_runtime(
         .iter()
         .find_map(|secret| parse_handshake(&handshake_buf, secret).map(|i| (i, secret.as_slice())))
     else {
+        STATS.bad();
         debug!(
             "[{}] bad handshake (wrong secret or reserved prefix)",
             label
@@ -715,6 +833,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     if route.is_test {
         let target_ip = target_ip?;
         if let Some(ws) = route.direct_ws(target_ip).await {
+            STATS.ws();
             return Some(Upstream::Ws {
                 ws,
                 framing: WsFraming::Packets,
@@ -786,6 +905,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
             )
             .await
         {
+            STATS.ws();
             info!(
                 "[{}] DC{}{} direct IP is cooling down, but pool hit via {}",
                 route.label, route.dc, route.media, target_ip
@@ -830,6 +950,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
             .await
     };
     if let Some(ws) = pooled {
+        STATS.ws();
         info!(
             "[{}] DC{}{} → pool hit via {}",
             route.label, route.dc, route.media, target_ip
@@ -841,6 +962,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     }
 
     if let Some(ws) = route.direct_ws(target_ip).await {
+        STATS.ws();
         return Some(Upstream::Ws {
             ws,
             framing: WsFraming::Packets,
@@ -947,7 +1069,7 @@ impl Route<'_> {
     /// Whether anything other than the direct WebSocket path is configured.
     fn has_fallback(&self) -> bool {
         !self.config.cf_worker_domains().is_empty()
-            || !self.config.cf_domains.is_empty()
+            || self.runtime.has_cf_domains()
             || !self.config.mtproto_proxies.is_empty()
     }
 
@@ -975,6 +1097,7 @@ impl Route<'_> {
                 .cf_get(CfTier::Worker, self.dc, self.is_media)
                 .await
         {
+            STATS.cfproxy();
             info!(
                 "[{}] DC{}{} {} → CF Worker pool hit ({})",
                 self.label, self.dc, self.media, reason, domain
@@ -1016,6 +1139,7 @@ impl Route<'_> {
 
             match ws {
                 Some(ws) => {
+                    STATS.cfproxy();
                     CF_WORKER_FAIL.clear(worker_domain);
                     info!(
                         "[{}] DC{}{} {} → CF Worker connected ({})",
@@ -1065,21 +1189,19 @@ impl Route<'_> {
     /// cooldown window, forcing every connection in that window down into the
     /// fronting/TCP fallback instead.
     async fn cf_proxy(&self, reason: &str) -> Option<TgWsStream> {
-        if self.is_test || self.config.cf_domains.is_empty() {
+        let cf_domains = self.runtime.cf_domains();
+        if self.is_test || cf_domains.is_empty() {
             return None;
         }
 
-        let first_domain = balance_offset(
-            &self.config.cf_domains,
-            self.config.cf_balance,
-            &CF_BALANCE_COUNTER,
-        );
+        let first_domain = balance_offset(&cf_domains, self.config.cf_balance, &CF_BALANCE_COUNTER);
 
         if let Some((ws, domain)) = self
             .pool
             .cf_get(CfTier::Proxy, self.dc, self.is_media)
             .await
         {
+            STATS.cfproxy();
             info!(
                 "[{}] DC{}{} {} → CF proxy pool hit ({})",
                 self.label, self.dc, self.media, reason, domain
@@ -1090,12 +1212,12 @@ impl Route<'_> {
 
         debug!(
             "[{}] DC{}{} {} → trying CF proxy via {:?}",
-            self.label, self.dc, self.media, reason, self.config.cf_domains
+            self.label, self.dc, self.media, reason, cf_domains
         );
 
         let (ws, domain, _all_redirects) = connect_cf_ws_for_dc_with_outbound_ordered(
             self.dc,
-            &self.config.cf_domains,
+            &cf_domains,
             self.is_media,
             self.config.skip_tls_verify,
             self.timeouts.cf_connect,
@@ -1105,6 +1227,7 @@ impl Route<'_> {
         .await;
 
         if ws.is_some() {
+            STATS.cfproxy();
             info!(
                 "[{}] DC{}{} {} → CF proxy connected",
                 self.label, self.dc, self.media, reason
@@ -1114,7 +1237,7 @@ impl Route<'_> {
                     CfTier::Proxy,
                     "",
                     &domain,
-                    &self.config.cf_domains,
+                    &cf_domains,
                     &CF_BALANCE_COUNTER,
                 ));
             }
@@ -1216,6 +1339,7 @@ impl Route<'_> {
         } else if attempt.ws.is_some() {
             WS_FAIL.clear(&(self.dc, self.is_media));
             IP_FAIL.clear(target_ip);
+            self.pool.report_success(self.dc, self.is_media);
             info!(
                 "[{}] DC{}{} → WS connected via {}",
                 self.label, self.dc, self.media, target_ip
@@ -1297,7 +1421,7 @@ impl Route<'_> {
             self.timeouts.ws_connect
         };
 
-        if self.is_test {
+        let attempt = if self.is_test {
             connect_ws_for_dc_path_with_outbound(
                 target_ip,
                 self.dc,
@@ -1320,10 +1444,16 @@ impl Route<'_> {
                 sni_override,
             )
             .await
+        };
+
+        if attempt.ws.is_none() {
+            STATS.ws_error();
         }
+        attempt
     }
 
     fn on_fronting_success(&self, domain: &str) {
+        STATS.fronting();
         FRONTING_FAIL.clear(&(self.dc, self.is_media));
         self.runtime.activate_fronting();
         info!(
@@ -1825,6 +1955,7 @@ async fn bridge_tcp(
             return;
         }
     };
+    STATS.tcp_fallback();
 
     let _ = remote.set_nodelay(true);
     let (mut rem_reader, mut rem_writer) = remote.into_split();
@@ -1983,6 +2114,7 @@ fn log_session_closed(
     bytes_down: u64,
     start: Instant,
 ) {
+    STATS.traffic(bytes_up, bytes_down);
     info!(
         "[{}] DC{}{} {} session closed by {}: ↑{}  ↓{}  {:.1}s",
         label,
@@ -2002,9 +2134,10 @@ async fn read_inbound_handshake(
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],
     faketls_domain: Option<&str>,
+    runtime: &Runtime,
 ) -> Option<([u8; 64], PendingData)> {
     if let Some(domain) = faketls_domain {
-        return accept_inbound_faketls(label, reader, writer, secrets, domain).await;
+        return accept_inbound_faketls(label, reader, writer, secrets, domain, runtime).await;
     }
 
     let mut handshake_buf = [0u8; 64];
@@ -2015,6 +2148,55 @@ async fn read_inbound_handshake(
             None
         }
     }
+}
+
+const PROXY_V1_MAX_LINE: usize = 108;
+
+async fn read_proxy_protocol_v1(
+    reader: &mut TcpReader,
+    peer: SocketAddr,
+) -> Result<SocketAddr, String> {
+    let mut line = Vec::with_capacity(PROXY_V1_MAX_LINE);
+    loop {
+        let byte = reader
+            .read_u8()
+            .await
+            .map_err(|error| format!("read failed: {error}"))?;
+        line.push(byte);
+        if byte == b'\n' {
+            break;
+        }
+        if line.len() >= PROXY_V1_MAX_LINE {
+            return Err("line exceeds 108 bytes".to_string());
+        }
+    }
+
+    let text = std::str::from_utf8(&line)
+        .map_err(|_| "header is not ASCII/UTF-8".to_string())?
+        .trim_end_matches(['\r', '\n']);
+    match parse_proxy_protocol_v1(text) {
+        Some(source) => {
+            debug!("[{}] PROXY protocol source {}", source, peer);
+            Ok(source)
+        }
+        None if text == "PROXY UNKNOWN" => Ok(peer),
+        None => Err(format!("unexpected header {:?}", text)),
+    }
+}
+
+fn parse_proxy_protocol_v1(line: &str) -> Option<SocketAddr> {
+    let mut parts = line.split_ascii_whitespace();
+    if parts.next()? != "PROXY" {
+        return None;
+    }
+    if !matches!(parts.next()?, "TCP4" | "TCP6") {
+        return None;
+    }
+    let source_ip = parts.next()?.parse::<IpAddr>().ok()?;
+    let _destination_ip = parts.next()?.parse::<IpAddr>().ok()?;
+    let source_port = parts.next()?.parse::<u16>().ok()?;
+    let _destination_port = parts.next()?.parse::<u16>().ok()?;
+    (parts.next().is_none()).then_some(SocketAddr::new(source_ip, source_port))
 }
 
 pub fn split_mtproto_init_and_pending(data: &[u8]) -> Option<([u8; 64], Vec<u8>)> {

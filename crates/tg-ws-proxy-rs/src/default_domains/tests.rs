@@ -24,5 +24,24 @@ fn fallback_domains_are_all_decodable() {
     let domains = fallback_domains();
 
     assert_eq!(domains.len(), FALLBACK_ENCODED.len());
+    assert_eq!(domains.len(), 20);
     assert!(domains.iter().all(|domain| domain.ends_with(".co.uk")));
+}
+
+#[test]
+fn parse_domain_list_normalizes_and_deduplicates() {
+    let domains = parse_domain_list("virkgj.com\nvirkgj.com\nVIRKGJ.com\n");
+
+    assert_eq!(domains, vec!["pclead.co.uk"]);
+}
+
+#[test]
+fn merge_keeps_user_domains_first_and_deduplicates() {
+    let primary = vec!["custom.example".to_string(), "pclead.co.uk".to_string()];
+    let refreshed = vec!["pclead.co.uk".to_string(), "fresh.example".to_string()];
+
+    assert_eq!(
+        merge_domain_pools(&primary, &refreshed),
+        vec!["custom.example", "pclead.co.uk", "fresh.example"]
+    );
 }

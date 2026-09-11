@@ -106,3 +106,36 @@ async fn port_zero_reports_the_real_bound_port_in_the_link() {
         .expect("server task panicked")
         .expect("server returned an error");
 }
+
+#[tokio::test]
+async fn default_domain_refresh_does_not_delay_listener_startup() {
+    let mut config = test_config(0);
+    config.default_domains = true;
+    // If startup still awaited GitHub, this deliberately unreachable proxy
+    // would hold the listener behind the outbound connect timeout.
+    config.outbound_proxy = Some("http://192.0.2.1:9".to_string());
+    config.no_proxy = Some(String::new());
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        server::run_with_listen(
+            config,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            move |info| {
+                let _ = listen_tx.send(info);
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), listen_rx)
+        .await
+        .expect("live CF refresh delayed the local listener")
+        .expect("listen callback dropped");
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}

@@ -5,7 +5,7 @@
 //! stateless pass-throughs to `config`, kept as methods so call sites can take
 //! everything they need from one place.
 
-use std::sync::Mutex as StdMutex;
+use std::sync::{Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{default_dc_ip, websocket_dc};
@@ -16,6 +16,9 @@ const DEFAULT_FRONTING_COOLDOWN: Duration = Duration::from_secs(1800);
 
 pub struct Runtime {
     outbound: OutboundConnector,
+    /// Live Cloudflare proxy pool. Unlike the immutable CLI configuration,
+    /// this can be refreshed while the server is running.
+    cf_domains: RwLock<std::sync::Arc<Vec<String>>>,
     /// Domain-fronting SNI, when enabled via `--fronting-domain`. `None` means
     /// the fallback is disabled entirely (the default).
     fronting_domain: Option<String>,
@@ -31,6 +34,7 @@ impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
             outbound,
+            cf_domains: RwLock::new(std::sync::Arc::new(Vec::new())),
             fronting_domain: None,
             fronting_cooldown: DEFAULT_FRONTING_COOLDOWN,
             fronting_until: StdMutex::new(None),
@@ -46,6 +50,25 @@ impl Runtime {
 
     pub fn outbound(&self) -> &OutboundConnector {
         &self.outbound
+    }
+
+    /// Return a consistent snapshot for one connection attempt.
+    pub fn cf_domains(&self) -> std::sync::Arc<Vec<String>> {
+        std::sync::Arc::clone(&self.cf_domains.read().unwrap())
+    }
+
+    pub fn has_cf_domains(&self) -> bool {
+        !self.cf_domains.read().unwrap().is_empty()
+    }
+
+    /// Replace the live pool and report whether it actually changed.
+    pub fn replace_cf_domains(&self, domains: Vec<String>) -> bool {
+        let mut current = self.cf_domains.write().unwrap();
+        if current.as_ref() == &domains {
+            return false;
+        }
+        *current = std::sync::Arc::new(domains);
+        true
     }
 
     pub fn websocket_dc(&self, dc: u32) -> u32 {

@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::check;
@@ -20,6 +21,9 @@ use crate::limits::{auto_max_connections, soft_nofile_limit};
 use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
+use crate::stats::STATS;
+
+const DEFAULT_DOMAIN_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Why [`run`] / [`run_with_listen`] stopped before serving, or failed to start.
 #[derive(Debug)]
@@ -96,6 +100,10 @@ pub async fn run_with_listen(
     on_listen: impl FnOnce(ListenInfo) + Send,
 ) -> Result<(), RunError> {
     install_crypto_provider();
+    proxy::reset_route_health();
+    STATS.reset();
+
+    let user_cf_domains = config.cf_domains.clone();
 
     let outbound = config
         .outbound_connector()
@@ -108,23 +116,25 @@ pub async fn run_with_listen(
     tokio::pin!(shutdown);
 
     // ── Default CF domain list (--default-domains) ────────────────────────
-    // Fetch the obfuscated domain list from GitHub, deobfuscate it, and
-    // append the resulting domains to any that were supplied with --cf-domain.
-    // Done once here so both --check mode and the normal server path share
-    // the same fetched list.  The fetch selects on `shutdown` so an embedder
-    // can cancel a slow fetch instead of blocking a stop for the full timeout.
+    // Start with Flowseal's embedded pool so a blocked raw.githubusercontent.com
+    // cannot delay the listener by ten seconds.  The live list is refreshed in
+    // the background immediately after startup and then once per hour.
     if config.default_domains {
-        info!("Fetching default CF proxy domain list from GitHub…");
-        let fetched = tokio::select! {
-            _ = &mut shutdown => {
-                info!("proxy stopped");
-                return Ok(());
-            }
-            fetched = default_domains::fetch_default_domains_with_outbound(runtime.outbound()) => fetched,
-        };
-        info!("  Got {} default CF domain(s)", fetched.len());
-        config.cf_domains.extend(fetched);
+        let built_in = default_domains::fallback_domains();
+        config.cf_domains = default_domains::merge_domain_pools(&user_cf_domains, &built_in);
+        info!(
+            "Loaded {} built-in CF proxy domain(s); live refresh scheduled",
+            config.cf_domains.len()
+        );
+        // Flowseal's automatic pool starts each DC on a different domain and
+        // shuffles the remaining candidates. Round-robin gives the Rust
+        // engine the same important property: a dead first domain is not paid
+        // again by every new Telegram connection.
+        if config.cf_domains.len() > 1 {
+            config.cf_balance = true;
+        }
     }
+    runtime.replace_cf_domains(config.cf_domains.clone());
 
     // ── Connectivity check mode (--check) ────────────────────────────────
     // Run probes for every configured CF domain and MTProto proxy, print the
@@ -153,6 +163,7 @@ pub async fn run_with_listen(
         .map_err(|source| RunError::Bind { addr, source })?;
     let bound_addr = listener.local_addr().unwrap_or(addr);
     let listen_port = bound_addr.port();
+    let mut listener = Some(listener);
 
     // ── FD budget & effective max_connections ────────────────────────────
     // Each active connection uses 2 FDs: the accepted client socket and the
@@ -310,13 +321,55 @@ pub async fn run_with_listen(
     // Shared for the rest of the process: every connection reads the same
     // settings, so they are behind one `Arc` instead of a per-connection clone.
     let config = Arc::new(config);
+    let mut background = JoinSet::new();
+    if config.default_domains {
+        let runtime_clone = Arc::clone(&runtime);
+        let user_cf_domains = user_cf_domains.clone();
+        background.spawn(async move {
+            loop {
+                match default_domains::fetch_default_domains_candidate_with_outbound(
+                    runtime_clone.outbound(),
+                )
+                .await
+                {
+                    Ok(refreshed) => {
+                        let domains =
+                            default_domains::merge_domain_pools(&user_cf_domains, &refreshed);
+                        let count = domains.len();
+                        if runtime_clone.replace_cf_domains(domains) {
+                            info!("CF proxy domain pool refreshed ({} domains)", count);
+                        } else {
+                            info!(
+                                "CF proxy domain refresh completed; pool unchanged ({} domains)",
+                                count
+                            );
+                        }
+                    }
+                    Err(error) => warn!(
+                        "CF proxy domain refresh failed ({}); keeping last known-good pool",
+                        error
+                    ),
+                }
+                tokio::time::sleep(DEFAULT_DOMAIN_REFRESH_INTERVAL).await;
+            }
+        });
+    }
     {
         let pool_clone = pool.clone();
         let config_clone = Arc::clone(&config);
-        tokio::spawn(async move {
+        background.spawn(async move {
             pool_clone.warmup(&config_clone).await;
+            pool_clone.run_maintenance(config_clone).await;
         });
     }
+    background.spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            info!("stats: {}", STATS.summary());
+        }
+    });
 
     // ── Accept loop ───────────────────────────────────────────────────────
     // Acquire a permit before each accept() to cap concurrent connections.
@@ -325,8 +378,15 @@ pub async fn run_with_listen(
     // connections can be open simultaneously.
     const EMFILE: i32 = 24; // too many open files (per-process fd limit)
     const ENFILE: i32 = 23; // file table overflow (system-wide fd limit)
+    const WSAEMFILE: i32 = 10024; // Windows socket handle limit
     let semaphore = Arc::new(Semaphore::new(max_connections));
-    loop {
+    let mut clients = JoinSet::new();
+    let mut consecutive_accept_errors = 0u32;
+    'accept: loop {
+        // Completed tasks must be reaped; otherwise their JoinSet entries grow
+        // for the entire lifetime of a busy proxy.
+        while clients.try_join_next().is_some() {}
+
         // Block here when we are already at the connection limit.  Pending
         // TCP connections queue in the kernel backlog until capacity frees up.
         let permit = tokio::select! {
@@ -338,13 +398,14 @@ pub async fn run_with_listen(
 
         tokio::select! {
             _ = &mut shutdown => break,
-            accepted = listener.accept() => {
+            accepted = listener.as_ref().expect("listener missing outside recovery").accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
+                        consecutive_accept_errors = 0;
                         let cfg = Arc::clone(&config);
                         let pool = pool.clone();
                         let runtime = Arc::clone(&runtime);
-                        tokio::spawn(async move {
+                        clients.spawn(async move {
                             // Hold the permit for the lifetime of this connection so
                             // it is released (and the slot freed) when the task ends.
                             let _permit = permit;
@@ -359,12 +420,52 @@ pub async fn run_with_listen(
                         // (e.g. from pool connections).  Back off longer to let
                         // existing connections close, and log at warn-level to avoid
                         // flooding the log with repeated identical messages.
-                        if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+                        if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE) | Some(WSAEMFILE)) {
                             warn!("accept error: {} — backing off to allow FDs to free", e);
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         } else {
                             error!("accept error: {}", e);
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                            if consecutive_accept_errors >= 3 {
+                                warn!("listener repeatedly failed; rebinding {}", bound_addr);
+                                drop(listener.take());
+                                tokio::select! {
+                                    _ = &mut shutdown => break 'accept,
+                                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                                }
+                                match TcpListener::bind(bound_addr).await {
+                                    Ok(rebound) => {
+                                        listener = Some(rebound);
+                                        consecutive_accept_errors = 0;
+                                        warn!("listener restored on {}", bound_addr);
+                                    }
+                                    Err(bind_error) => {
+                                        error!("listener rebind failed on {}: {}", bound_addr, bind_error);
+                                        // Keep retrying through the same branch without
+                                        // ever returning to accept() with no listener.
+                                        loop {
+                                            tokio::select! {
+                                                _ = &mut shutdown => break 'accept,
+                                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                                            }
+                                            match TcpListener::bind(bound_addr).await {
+                                                Ok(rebound) => {
+                                                    listener = Some(rebound);
+                                                    consecutive_accept_errors = 0;
+                                                    warn!("listener restored on {}", bound_addr);
+                                                    break;
+                                                }
+                                                Err(error) => error!(
+                                                    "listener rebind retry failed on {}: {}",
+                                                    bound_addr, error
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
                         }
                     }
                 }
@@ -372,6 +473,13 @@ pub async fn run_with_listen(
         }
     }
 
-    info!("proxy stopped");
+    // Match Flowseal's shutdown semantics: stop every live client bridge
+    // before returning control to the embedded runtime. Leaving these tasks to
+    // Runtime::drop was the main reason ZUI could miss its five-second stop
+    // deadline under load.
+    clients.shutdown().await;
+    background.shutdown().await;
+
+    info!("proxy stopped; final stats: {}", STATS.summary());
     Ok(())
 }
