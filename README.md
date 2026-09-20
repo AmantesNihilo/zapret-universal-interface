@@ -12,7 +12,7 @@
   <a href="https://github.com/AmantesNihilo/zapret-universal-interface/releases">
     <img alt="Download" src="https://img.shields.io/badge/download-GitHub%20Releases-ff4fb8?style=for-the-badge">
   </a>
-  <img alt="Version" src="https://img.shields.io/badge/version-2.2.1-24c8db?style=for-the-badge">
+  <img alt="Version" src="https://img.shields.io/badge/version-2.2.2-24c8db?style=for-the-badge">
   <img alt="Windows" src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=for-the-badge">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-f0b83a?style=for-the-badge">
 </p>
@@ -61,10 +61,10 @@ ZUI - современная Windows-утилита для запуска `zapre
 
 | Файл                       | Назначение                              |
 | -------------------------- | --------------------------------------- |
-| `ZUI_2.2.1_x64-setup.exe`  | Установщик ZUI для 64-битной Windows    |
+| `ZUI_2.2.2_x64-setup.exe`  | Установщик ZUI для 64-битной Windows    |
 
 > [!TIP]
-> Если не знаете, что выбрать, скачивайте `ZUI_2.2.1_x64-setup.exe`.
+> Если не знаете, что выбрать, скачивайте `ZUI_2.2.2_x64-setup.exe`.
 
 ## Для кого это
 
@@ -116,7 +116,7 @@ ZUI подойдет, если вы:
 
 ## Быстрый старт
 
-1. Скачайте и установите `ZUI_2.2.1_x64-setup.exe`.
+1. Скачайте и установите `ZUI_2.2.2_x64-setup.exe`.
 2. Запустите ZUI от имени администратора.
 3. Откройте `Настройки -> Проверки` и убедитесь, что ресурсы найдены.
 4. Запустите проверку пресетов и дождитесь результатов
@@ -205,7 +205,7 @@ ZUI тестирует только подходящие исполняемые 
 
 ## Установка
 
-1. Скачайте `ZUI_2.2.1_x64-setup.exe`.
+1. Скачайте `ZUI_2.2.2_x64-setup.exe`.
 2. Запустите установщик.
 3. Откройте ZUI.
 4. Проверьте вкладку `Настройки -> Проверки`.
