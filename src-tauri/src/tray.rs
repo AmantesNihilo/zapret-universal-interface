@@ -1,4 +1,5 @@
 use crate::state::RuntimeState;
+use crate::webview_memory::{self, MemoryMode};
 use crate::{logging, services};
 use std::sync::Mutex;
 use tauri::menu::MenuBuilder;
@@ -51,8 +52,8 @@ pub fn setup(app: &mut App, language: &str) -> tauri::Result<()> {
 
     if let Some(window) = app.get_webview_window("main") {
         let handle = app.handle().clone();
-        window.on_window_event(move |event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        window.on_window_event(move |event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 if handle
                     .state::<Mutex<RuntimeState>>()
                     .lock()
@@ -64,6 +65,15 @@ pub fn setup(app: &mut App, language: &str) -> tauri::Result<()> {
                 api.prevent_close();
                 request_quit(&handle);
             }
+            WindowEvent::Focused(focused) => webview_memory::set_main_webview_memory_mode(
+                &handle,
+                if *focused {
+                    MemoryMode::Normal
+                } else {
+                    MemoryMode::Low
+                },
+            ),
+            _ => {}
         });
     }
 
@@ -106,11 +116,13 @@ impl TrayLabels {
 pub fn hide_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
+        webview_memory::set_main_webview_memory_mode(app, MemoryMode::Low);
     }
 }
 
 pub fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        webview_memory::set_main_webview_memory_mode(app, MemoryMode::Normal);
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();

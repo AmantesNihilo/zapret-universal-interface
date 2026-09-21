@@ -1,7 +1,8 @@
 param(
-    [string]$Version = "2.2.2",
+    [string]$Version = "2.2.2-memory-optimazation",
     [string]$TargetDir = "",
-    [string]$OutputDir = ""
+    [string]$OutputDir = "",
+    [switch]$SkipMsi
 )
 
 $ErrorActionPreference = "Stop"
@@ -121,12 +122,17 @@ $nsisRelease = Join-Path $release "ZUI_${Version}_x64-setup.exe"
 $msiRelease = Join-Path $release "ZUI_${Version}_x64_en-US.msi"
 
 Copy-Item -LiteralPath $nsisSource -Destination $nsisRelease -Force
-Copy-Item -LiteralPath $msiSource -Destination $msiRelease -Force
+if (-not $SkipMsi) {
+    Copy-Item -LiteralPath $msiSource -Destination $msiRelease -Force
+}
 Move-Item -LiteralPath $stage -Destination $portable
 Compress-Archive -Path (Join-Path $portable "*") -DestinationPath $tempZip -CompressionLevel Optimal
 Move-Item -LiteralPath $tempZip -Destination $portableZip
 
-$artifacts = @($nsisRelease, $msiRelease, $portableZip)
+$artifacts = @($nsisRelease, $portableZip)
+if (-not $SkipMsi) {
+    $artifacts += $msiRelease
+}
 $hashLines = Get-FileHash $artifacts -Algorithm SHA256 | ForEach-Object {
     "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))"
 }

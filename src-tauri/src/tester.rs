@@ -46,6 +46,7 @@ const FALLBACK_TARGETS: &[(&str, &str)] = &[
     ("DNS", "PING:9.9.9.9"),
 ];
 const MAX_PARALLEL_TARGET_CHECKS: usize = 8;
+const MAX_STORED_RESULTS: usize = 100;
 
 pub fn load_results() -> Result<Vec<TestResult>, String> {
     paths::ensure_data_layout().map_err(|error| error.to_string())?;
@@ -56,8 +57,9 @@ pub fn load_results() -> Result<Vec<TestResult>, String> {
     }
     let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
     match json_storage::parse::<Vec<TestResult>>(&text) {
-        Ok(results) => {
-            if text.starts_with('\u{feff}') {
+        Ok(mut results) => {
+            let was_trimmed = trim_results(&mut results);
+            if text.starts_with('\u{feff}') || was_trimmed {
                 save_results(&results)?;
             }
             Ok(results)
@@ -112,9 +114,7 @@ pub fn import_results(path: String) -> Result<Vec<TestResult>, String> {
             .unwrap_or_default()
             .cmp(&right.finished_at.parse::<u64>().unwrap_or_default())
     });
-    if results.len() > 500 {
-        results.drain(0..results.len() - 500);
-    }
+    trim_results(&mut results);
     save_results(&results)?;
     Ok(results)
 }
@@ -163,9 +163,7 @@ pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, Strin
                 runtime.test_cancelled = false;
                 if !cancelled {
                     runtime.test_results.push(result.clone());
-                    if runtime.test_results.len() > 100 {
-                        runtime.test_results.remove(0);
-                    }
+                    trim_results(&mut runtime.test_results);
                     let _ = save_results(&runtime.test_results);
                 }
             }
@@ -288,9 +286,7 @@ fn run_batch_preset_test(
                 {
                     let mut runtime = runtime_state.lock().unwrap();
                     runtime.test_results.push(result.clone());
-                    if runtime.test_results.len() > 100 {
-                        runtime.test_results.remove(0);
-                    }
+                    trim_results(&mut runtime.test_results);
                     let _ = save_results(&runtime.test_results);
                 }
                 batch_results.push(result);
@@ -1007,6 +1003,15 @@ fn planned_check_count(targets: &[Target]) -> u32 {
 
 fn emit_progress(app: &AppHandle, progress: &TestProgress) {
     let _ = app.emit("test_progress", progress);
+}
+
+fn trim_results(results: &mut Vec<TestResult>) -> bool {
+    if results.len() <= MAX_STORED_RESULTS {
+        return false;
+    }
+    let excess = results.len() - MAX_STORED_RESULTS;
+    results.drain(0..excess);
+    true
 }
 
 fn is_cancelled(state: &Mutex<RuntimeState>) -> bool {

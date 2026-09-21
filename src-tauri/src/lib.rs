@@ -17,6 +17,7 @@ mod system_process;
 mod tester;
 mod tray;
 mod updater;
+mod webview_memory;
 mod windowing;
 
 use commands::*;
