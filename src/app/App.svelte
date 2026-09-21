@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { bindUiActivity } from "$lib/uiActivity";
   import { get } from "svelte/store";
   import { fly, slide } from "svelte/transition";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -93,7 +94,7 @@
   let updateInstalling = $state(false);
   let updateMessage = $state<string | null>(null);
   let updatePostponedVersion = $state<string | null>(null);
-  let appVersion = $state("2.2.1");
+  let appVersion = $state("2.2.2");
   let changingZapretEngine = $state(false);
   let engineTransition = $state<ZapretEngine | null>(null);
   let testSelectionOpen = $state(false);
@@ -305,6 +306,7 @@
   });
 
   onMount(() => {
+    const unbindUiActivity = bindUiActivity();
     let unlistenState: (() => void) | undefined;
     let unlistenLogs: (() => void) | undefined;
     let unlistenTray: (() => void) | undefined;
@@ -372,6 +374,7 @@
         unlistenFailures();
       }
       document.removeEventListener("contextmenu", blockContextMenu);
+      unbindUiActivity();
     };
   });
 
