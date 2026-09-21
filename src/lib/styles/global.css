@@ -115,7 +115,7 @@ textarea {
       color-mix(in srgb, var(--text) 2.5%, transparent) 62px 63px,
       transparent 63px 126px
     );
-  animation: ambient-grid-drift 32s linear infinite;
+  /* Keep the decorative grid static: background-position repaints the whole window. */
 }
 
 .utility-window > * {
@@ -421,7 +421,6 @@ textarea:disabled,
     inset 0 0 18px color-mix(in srgb, var(--accent) 12%, transparent);
   opacity: 0.72;
   mask: radial-gradient(circle, transparent 0 58%, #000 60%);
-  animation: power-idle-ring 3.4s ease-in-out infinite;
 }
 
 .power-button::after {
@@ -487,7 +486,6 @@ textarea:disabled,
     0 0 70px color-mix(in srgb, var(--accent) 26%, transparent),
     inset 0 0 24px color-mix(in srgb, var(--accent) 30%, transparent);
   opacity: 1;
-  animation: power-active-ring 4s linear infinite;
 }
 
 .power-button.active::after {
@@ -2992,10 +2990,10 @@ textarea {
 @keyframes test-orb-breathe {
   0%,
   100% {
-    box-shadow: 0 0 16px color-mix(in srgb, var(--accent) 14%, transparent);
+    opacity: 0.7;
   }
   50% {
-    box-shadow: 0 0 30px color-mix(in srgb, var(--accent) 30%, transparent);
+    opacity: 1;
   }
 }
 
@@ -3855,15 +3853,6 @@ textarea {
   }
 }
 
-@keyframes ambient-grid-drift {
-  from {
-    background-position: 0 0, 0 0;
-  }
-  to {
-    background-position: 70px 70px, -126px 126px;
-  }
-}
-
 @keyframes test-workspace-reveal {
   from {
     opacity: 0;
@@ -3928,10 +3917,10 @@ textarea {
 @keyframes pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 var(--accent-faint);
+    opacity: 0.56;
   }
   50% {
-    box-shadow: 0 0 0 9px var(--accent-soft);
+    opacity: 0.85;
   }
 }
 
@@ -3950,24 +3939,6 @@ textarea {
   50% {
     opacity: 0.32;
     transform: scale(1.45);
-  }
-}
-
-@keyframes power-idle-ring {
-  0%,
-  100% {
-    opacity: 0.52;
-    transform: scale(0.96);
-  }
-  50% {
-    opacity: 0.86;
-    transform: scale(1.03);
-  }
-}
-
-@keyframes power-active-ring {
-  to {
-    transform: rotate(360deg);
   }
 }
 
@@ -4138,6 +4109,14 @@ textarea {
   }
 }
 
+/* Pause continuous indicators, but let finite entrance animations finish so
+   an unfocused window never gets stuck with invisible content. */
+html[data-ui-inactive] :is(.power-button.busy, .test-progress-orb, .wait-orbit span, .service-row.busy-state .service-icon, .spin),
+html[data-ui-inactive] .wait-orbit::before,
+html[data-ui-inactive] :is(.status-starting, .status-stopping, .status-testing)::before {
+  animation-play-state: paused !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -4202,7 +4181,7 @@ textarea {
 @keyframes service-icon-wait {
   50% {
     transform: scale(0.94);
-    box-shadow: 0 0 22px color-mix(in srgb, var(--amber) 18%, transparent);
+    opacity: 0.7;
   }
 }
 
