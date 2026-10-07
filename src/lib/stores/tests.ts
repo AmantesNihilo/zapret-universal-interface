@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 import { commands } from "$lib/api/commands";
 import {
+  onTestAborted,
   onTestCancelled,
   onTestBatchFinished,
   onTestFinished,
@@ -23,6 +24,7 @@ export const currentPresetName = writable<string | null>(null);
 export const currentTargets = writable<TestTargetResult[]>([]);
 export const currentProgress = writable<TestProgress | null>(null);
 export const batchRecommendations = writable<TestResult[]>([]);
+export const testAbortReason = writable<string | null>(null);
 
 export async function loadTestResults() {
   testResults.set((await commands.getTestResults()).slice(-MAX_STORED_RESULTS));
@@ -43,6 +45,7 @@ export async function bindTestEvents() {
     batchRecommendations.set([]);
     testRunning.set(true);
     testStopping.set(false);
+    testAbortReason.set(null);
   });
   const unlistenStopping = await onTestStopping(() => {
     testStopping.set(true);
@@ -91,6 +94,15 @@ export async function bindTestEvents() {
     currentProgress.set(null);
     batchRecommendations.set([]);
   });
+  const unlistenAborted = await onTestAborted((reason) => {
+    testRunning.set(false);
+    testStopping.set(false);
+    currentTestId.set(null);
+    currentPresetName.set(null);
+    currentTargets.set([]);
+    currentProgress.set(null);
+    testAbortReason.set(reason);
+  });
 
   return () => {
     unlistenStarted();
@@ -102,6 +114,7 @@ export async function bindTestEvents() {
     unlistenFinished();
     unlistenBatchFinished();
     unlistenCancelled();
+    unlistenAborted();
   };
 }
 

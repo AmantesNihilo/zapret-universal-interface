@@ -68,6 +68,7 @@
     loadTestResults,
     runAllPresetTest,
     runSelectedPresetTests,
+    testAbortReason,
     testResults,
     testRunning,
     testStopping
@@ -1673,6 +1674,21 @@
       </div>
     {/if}
 
+    {#if $testAbortReason}
+      <div class="notification-region" aria-live="assertive" aria-atomic="true">
+        <article class="app-notification notification-warning">
+          <span class="notification-icon" aria-hidden="true"><AlertTriangle size={18} /></span>
+          <div class="notification-content">
+            <strong>{$t("test.abortedTitle")}</strong>
+            <p>{$testAbortReason === "processExited" ? $t("test.processExitedExternal") : $t("test.abortedGeneric")}</p>
+          </div>
+          <button class="notification-close" type="button" onclick={() => ($testAbortReason = null)} title={$t("common.close")}>
+            <X size={15} />
+          </button>
+        </article>
+      </div>
+    {/if}
+
     {#if $testStopping}
       <div class="wait-overlay" role="presentation" aria-live="polite">
         <div class="wait-panel">
@@ -2071,26 +2087,28 @@
             </button>
           </div>
 
-          <div class="test-details-score">
-            <div class="score-ring" class:partial={testDetails.recommendation === "partial"} class:failed={testDetails.recommendation === "notRecommended"}>{testDetails.score}</div>
-            <div>
-              <strong>{$t("test.overall")}</strong>
-              <span>{$t("test.passed", { ok: testDetails.ok, total: testDetails.total })}</span>
-              {#if testDetails.inconclusive > 0}<small>{$t("test.inconclusiveCount", { count: testDetails.inconclusive })}</small>{/if}
-              {#if testDetails.regressions > 0}<small>{$t("test.regressionCount", { count: testDetails.regressions })}</small>{/if}
-            </div>
-          </div>
-
-          {#if testDetails.baseline}
-            <div class="test-details-score baseline-summary">
-              <div class="score-ring muted">B</div>
+          <div class="test-details-overview" class:with-baseline={Boolean(testDetails.baseline)}>
+            <div class="test-details-score">
+              <div class="score-ring" class:partial={testDetails.recommendation === "partial"} class:failed={testDetails.recommendation === "notRecommended"}>{testDetails.score}</div>
               <div>
-                <strong>{$t("test.baseline")}</strong>
-                <span>{$t("test.baselineSummary", { passed: testDetails.baseline.passed, failed: testDetails.baseline.failed, inconclusive: testDetails.baseline.inconclusive })}</span>
-                <small>{$t("test.networkFingerprint", { value: testDetails.baseline.networkFingerprint })}</small>
+                <strong>{$t("test.overall")}</strong>
+                <span>{$t("test.passed", { ok: testDetails.ok, total: testDetails.total })}</span>
+                {#if testDetails.inconclusive > 0}<small>{$t("test.inconclusiveCount", { count: testDetails.inconclusive })}</small>{/if}
+                {#if testDetails.regressions > 0}<small>{$t("test.regressionCount", { count: testDetails.regressions })}</small>{/if}
               </div>
             </div>
-          {/if}
+
+            {#if testDetails.baseline}
+              <div class="test-details-score baseline-summary">
+                <div class="score-ring muted">B</div>
+                <div>
+                  <strong>{$t("test.baseline")}</strong>
+                  <span>{$t("test.baselineSummary", { passed: testDetails.baseline.passed, failed: testDetails.baseline.failed, inconclusive: testDetails.baseline.inconclusive })}</span>
+                  <small>{$t("test.networkFingerprint", { value: testDetails.baseline.networkFingerprint })}</small>
+                </div>
+              </div>
+            {/if}
+          </div>
 
           <div class="test-details-meta">
             <span><strong>{$t("test.version")}</strong>{testDetails.presetVersion || "-"}</span>

@@ -49,6 +49,10 @@ export function onTestCancelled(callback: () => void) {
   return listen<string>("test_cancelled", () => callback());
 }
 
+export function onTestAborted(callback: (reason: string) => void) {
+  return listen<string>("test_aborted", (event) => callback(event.payload));
+}
+
 export function onTestStopping(callback: () => void) {
   return listen<string>("test_stopping", () => callback());
 }

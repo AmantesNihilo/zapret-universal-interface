@@ -42,6 +42,7 @@ enum TargetKind {
 }
 const MAX_PARALLEL_TARGET_CHECKS: usize = 8;
 const MAX_STORED_RESULTS: usize = 100;
+const TEST_ABORT_PROCESS_EXITED: &str = "processExited";
 
 pub fn load_results() -> Result<Vec<TestResult>, String> {
     paths::ensure_data_layout().map_err(|error| error.to_string())?;
@@ -227,6 +228,15 @@ pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, Strin
 
             if cancelled {
                 let _ = thread_app.emit("test_cancelled", "cancelled");
+            } else if let Some(reason) = test_abort_reason(&result) {
+                let _ = thread_app.emit("test_finished", &result);
+                let _ = thread_app.emit("test_aborted", reason);
+                logging::push(
+                    &thread_app,
+                    &runtime_state,
+                    LogSource::Tests,
+                    "Quick test aborted because the zapret process exited outside ZUI",
+                );
             } else {
                 let _ = thread_app.emit("test_finished", &result);
             }
@@ -337,6 +347,7 @@ fn run_batch_preset_test(
             );
 
             let mut batch_results = Vec::new();
+            let mut aborted_reason = None;
             for (preset_index, preset) in selected.into_iter().enumerate() {
                 if is_cancelled(&runtime_state) {
                     break;
@@ -380,6 +391,10 @@ fn run_batch_preset_test(
                     let _ = save_results(&runtime.test_results);
                 }
                 batch_results.push(result);
+                if let Some(reason) = batch_results.last().and_then(test_abort_reason) {
+                    aborted_reason = Some(reason);
+                    break;
+                }
             }
 
             batch_results.sort_by(|left, right| {
@@ -392,7 +407,15 @@ fn run_batch_preset_test(
 
             let cancelled = is_cancelled(&runtime_state);
             state_reset(&runtime_state);
-            if cancelled {
+            if let Some(reason) = aborted_reason {
+                let _ = thread_app.emit("test_aborted", reason);
+                logging::push(
+                    &thread_app,
+                    &runtime_state,
+                    LogSource::Tests,
+                    format!("{mode_label} aborted because the zapret process exited outside ZUI"),
+                );
+            } else if cancelled {
                 let _ = thread_app.emit("test_cancelled", "cancelled");
                 logging::push(
                     &thread_app,
@@ -520,6 +543,15 @@ fn run_one_preset(
                         true,
                     );
                     process_ok = lifecycle::is_healthy(app, state);
+                    if !process_ok
+                        && !target_results
+                            .iter()
+                            .any(|target| target.failure_stage == Some(FailureStage::Process))
+                    {
+                        let failure = runtime_process_failure_target(&preset.relative_path);
+                        let _ = app.emit("test_target_finished", &failure);
+                        target_results.push(failure);
+                    }
                 }
             }
             Err(error) => {
@@ -741,10 +773,7 @@ async fn run_targets_async(
 
         if monitor_process && !lifecycle::is_healthy(app, state) {
             tasks.abort_all();
-            let failure = process_failure_target(
-                "runtime",
-                "zapret process exited during network checks".into(),
-            );
+            let failure = runtime_process_failure_target("runtime");
             let _ = app.emit("test_target_finished", &failure);
             results.push(failure);
             progress.failed_checks = progress.failed_checks.saturating_add(1);
@@ -985,6 +1014,16 @@ fn process_failure_target(preset_path: &str, error: String) -> TestTargetResult 
     let mut target = startup_failure_target(preset_path, error);
     target.label = "zapret readiness".into();
     target.reason_code = Some("process_not_ready".into());
+    target
+}
+
+fn runtime_process_failure_target(preset_path: &str) -> TestTargetResult {
+    let mut target = process_failure_target(
+        preset_path,
+        "zapret process exited outside ZUI during network checks".into(),
+    );
+    target.label = "zapret process".into();
+    target.reason_code = Some("process_exited_external".into());
     target
 }
 
@@ -1303,6 +1342,15 @@ fn test_mode_label(mode: &TestMode) -> &'static str {
     }
 }
 
+fn test_abort_reason(result: &TestResult) -> Option<&'static str> {
+    result
+        .services
+        .iter()
+        .flat_map(|service| &service.targets)
+        .any(|target| target.reason_code.as_deref() == Some("process_exited_external"))
+        .then_some(TEST_ABORT_PROCESS_EXITED)
+}
+
 fn planned_check_count(targets: &[Target]) -> u32 {
     let http_checks = http_check_clients().len().max(1) as u32;
     targets
@@ -1390,6 +1438,25 @@ mod tests {
             ProbeStatus::Passed
         );
         assert_eq!(result.score, 100);
+    }
+
+    #[test]
+    fn external_process_exit_aborts_the_test_session() {
+        let result = build_result(
+            "test".into(),
+            "preset".into(),
+            "Preset".into(),
+            "Zapret 2/preset.txt".into(),
+            crate::models::ZapretEngine::Zapret2,
+            TestMode::Selected,
+            "1".into(),
+            "2".into(),
+            vec![runtime_process_failure_target("runtime")],
+            None,
+            false,
+        );
+
+        assert_eq!(test_abort_reason(&result), Some(TEST_ABORT_PROCESS_EXITED));
     }
 }
 
