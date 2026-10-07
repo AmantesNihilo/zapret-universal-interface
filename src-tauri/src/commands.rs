@@ -1,6 +1,7 @@
 use crate::models::{
     AppState, ConflictProcess, Diagnostics, LayoutOrientation, LogLine, Profile, ProfilesFile,
-    ServiceName, ServiceStatus, Settings, TestResult, TgWsConnectivityReport, UpdateCheck,
+    ServiceName, ServiceStatus, Settings, TestResult, TestTargetConfig, TgWsConnectivityReport,
+    UpdateCheck,
 };
 use crate::state::RuntimeState;
 use crate::{
@@ -32,6 +33,7 @@ pub fn save_settings(
     state: State<Mutex<RuntimeState>>,
     settings_payload: Settings,
 ) -> Result<Settings, String> {
+    tester::validate_target_configs(&settings_payload.test_targets)?;
     settings::save_settings(&settings_payload)?;
     state.lock().unwrap().settings = settings_payload.clone();
     Ok(settings_payload)
@@ -312,6 +314,16 @@ pub fn set_window_layout(app: AppHandle, layout: LayoutOrientation) -> Result<()
 #[tauri::command]
 pub fn run_preset_test(app: AppHandle, preset_id: String) -> Result<String, String> {
     tester::run_quick_test(app, preset_id)
+}
+
+#[tauri::command]
+pub fn get_test_target_manifest() -> Vec<TestTargetConfig> {
+    tester::default_target_configs()
+}
+
+#[tauri::command]
+pub fn validate_test_targets(targets: Vec<TestTargetConfig>) -> Result<(), String> {
+    tester::validate_target_configs(&targets)
 }
 
 #[tauri::command]

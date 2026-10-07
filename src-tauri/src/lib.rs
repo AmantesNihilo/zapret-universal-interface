@@ -70,6 +70,8 @@ pub fn run() {
             quit_app,
             show_main_window,
             set_window_layout,
+            get_test_target_manifest,
+            validate_test_targets,
             run_preset_test,
             run_best_preset_test,
             run_all_preset_test,

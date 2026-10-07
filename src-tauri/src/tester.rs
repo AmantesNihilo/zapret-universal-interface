@@ -1,6 +1,6 @@
 use crate::models::{
-    LogSource, ServiceTestResult, TestMode, TestPhase, TestProgress, TestRecommendation,
-    TestResult, TestServiceStatus, TestTargetConfig, TestTargetResult,
+    BaselineSnapshot, FailureStage, LogSource, ProbeChange, ProbeContext, ProbeStatus, TestMode,
+    TestPhase, TestProgress, TestResult, TestTargetConfig, TestTargetResult,
 };
 use crate::state::RuntimeState;
 use crate::{json_storage, logging, paths, presets, services, settings, system_process};
@@ -13,38 +13,33 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Semaphore;
 
+#[path = "tester/baseline.rs"]
+mod baseline;
+#[path = "tester/dns.rs"]
+mod dns;
+#[path = "tester/lifecycle.rs"]
+mod lifecycle;
+#[path = "tester/manifest.rs"]
+mod manifest;
+#[path = "tester/scoring.rs"]
+mod scoring;
+
 #[derive(Clone)]
 struct Target {
     name: String,
     service: String,
     kind: TargetKind,
+    weight: u16,
+    required: bool,
+    diagnostic: bool,
 }
 
 #[derive(Clone)]
 enum TargetKind {
     Url(String),
     Ping(String),
+    Dns { resolver: String, host: String },
 }
-
-const FALLBACK_TARGETS: &[(&str, &str)] = &[
-    ("Discord", "https://discord.com"),
-    ("Discord", "https://gateway.discord.gg"),
-    ("Discord", "https://cdn.discordapp.com"),
-    ("Discord", "https://updates.discord.com"),
-    ("YouTube", "https://www.youtube.com"),
-    ("YouTube", "https://youtu.be"),
-    ("YouTube", "https://i.ytimg.com"),
-    ("YouTube", "https://redirector.googlevideo.com"),
-    ("Google", "https://www.google.com"),
-    ("Google", "https://www.gstatic.com"),
-    ("Cloudflare", "https://www.cloudflare.com"),
-    ("Cloudflare", "https://cdnjs.cloudflare.com"),
-    ("Cloudflare", "PING:1.1.1.1"),
-    ("Cloudflare", "PING:1.0.0.1"),
-    ("Google", "PING:8.8.8.8"),
-    ("Google", "PING:8.8.4.4"),
-    ("DNS", "PING:9.9.9.9"),
-];
 const MAX_PARALLEL_TARGET_CHECKS: usize = 8;
 const MAX_STORED_RESULTS: usize = 100;
 
@@ -58,8 +53,9 @@ pub fn load_results() -> Result<Vec<TestResult>, String> {
     let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
     match json_storage::parse::<Vec<TestResult>>(&text) {
         Ok(mut results) => {
+            let was_migrated = results.iter_mut().any(migrate_result);
             let was_trimmed = trim_results(&mut results);
-            if text.starts_with('\u{feff}') || was_trimmed {
+            if text.starts_with('\u{feff}') || was_trimmed || was_migrated {
                 save_results(&results)?;
             }
             Ok(results)
@@ -94,13 +90,14 @@ pub fn import_results(path: String) -> Result<Vec<TestResult>, String> {
         .map_err(|error| format!("Invalid ZUI test results file: {error}"))?;
     let mut results = load_results()?;
 
-    for result in imported {
+    for mut result in imported {
         if result.id.trim().is_empty()
             || result.preset_id.trim().is_empty()
             || result.finished_at.trim().is_empty()
         {
             return Err("Invalid ZUI test result: required fields are missing".into());
         }
+        migrate_result(&mut result);
         if let Some(existing) = results.iter_mut().find(|existing| existing.id == result.id) {
             *existing = result;
         } else {
@@ -117,6 +114,43 @@ pub fn import_results(path: String) -> Result<Vec<TestResult>, String> {
     trim_results(&mut results);
     save_results(&results)?;
     Ok(results)
+}
+
+fn migrate_result(result: &mut TestResult) -> bool {
+    if result.schema_version >= 2 {
+        return false;
+    }
+    let mut targets = Vec::new();
+    for service in &mut result.services {
+        for target in &mut service.targets {
+            target.probe_status = if target.ok {
+                ProbeStatus::Passed
+            } else {
+                ProbeStatus::Failed
+            };
+            target.context = ProbeContext::Preset;
+            target.change = ProbeChange::NotCompared;
+            target.failure_stage = (!target.ok).then_some(FailureStage::Http);
+            target.reason_code = (!target.ok).then(|| "legacy_failure".into());
+            target.diagnostic = target.label.contains("Ping");
+            target.weight = if target.diagnostic { 0 } else { 1 };
+            target.required = false;
+            targets.push(target.clone());
+        }
+    }
+    result.services = scoring::build_services(&targets);
+    let summary = scoring::summarize(&result.services, true);
+    result.schema_version = 2;
+    result.score = summary.score;
+    result.recommendation = summary.recommendation;
+    result.ok = summary.ok;
+    result.total = summary.total;
+    result.passed_weight = summary.passed_weight;
+    result.total_weight = summary.total_weight;
+    result.inconclusive = summary.inconclusive;
+    result.regressions = summary.regressions;
+    result.process_ok = true;
+    true
 }
 
 pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, String> {
@@ -146,6 +180,27 @@ pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, Strin
         let outcome = catch_unwind(AssertUnwindSafe(move || {
             let runtime_state = thread_app.state::<Mutex<RuntimeState>>();
             let _ = thread_app.emit("test_started", &thread_test_id);
+            let targets = test_targets();
+            let baseline = collect_baseline(
+                &thread_app,
+                &runtime_state,
+                &thread_test_id,
+                &preset,
+                1,
+                1,
+                targets.clone(),
+            );
+            if is_cancelled(&runtime_state) {
+                state_reset(&runtime_state);
+                let _ = thread_app.emit("test_cancelled", "cancelled");
+                logging::push(
+                    &thread_app,
+                    &runtime_state,
+                    LogSource::Tests,
+                    "Quick test cancelled during network baseline",
+                );
+                return;
+            }
             let result = run_one_preset(
                 &thread_app,
                 &runtime_state,
@@ -154,6 +209,8 @@ pub fn run_quick_test(app: AppHandle, preset_id: String) -> Result<String, Strin
                 TestMode::Selected,
                 1,
                 1,
+                targets,
+                Some(baseline),
             );
             let cancelled = is_cancelled(&runtime_state);
 
@@ -268,10 +325,38 @@ fn run_batch_preset_test(
             );
 
             let preset_count = selected.len();
+            let targets = test_targets();
+            let mut baseline = collect_baseline(
+                &thread_app,
+                &runtime_state,
+                &thread_batch_id,
+                &selected[0],
+                1,
+                preset_count,
+                targets.clone(),
+            );
+
             let mut batch_results = Vec::new();
             for (preset_index, preset) in selected.into_iter().enumerate() {
                 if is_cancelled(&runtime_state) {
                     break;
+                }
+                if baseline_needs_refresh(&baseline) {
+                    logging::push(
+                        &thread_app,
+                        &runtime_state,
+                        LogSource::Tests,
+                        "Network baseline expired or the adapter configuration changed; refreshing",
+                    );
+                    baseline = collect_baseline(
+                        &thread_app,
+                        &runtime_state,
+                        &thread_batch_id,
+                        &preset,
+                        preset_index + 1,
+                        preset_count,
+                        targets.clone(),
+                    );
                 }
                 let result = run_one_preset(
                     &thread_app,
@@ -281,7 +366,12 @@ fn run_batch_preset_test(
                     mode.clone(),
                     preset_index + 1,
                     preset_count,
+                    targets.clone(),
+                    Some(baseline.clone()),
                 );
+                if is_cancelled(&runtime_state) {
+                    break;
+                }
                 let _ = thread_app.emit("test_preset_finished", &result);
                 {
                     let mut runtime = runtime_state.lock().unwrap();
@@ -290,9 +380,6 @@ fn run_batch_preset_test(
                     let _ = save_results(&runtime.test_results);
                 }
                 batch_results.push(result);
-                if is_cancelled(&runtime_state) {
-                    break;
-                }
             }
 
             batch_results.sort_by(|left, right| {
@@ -344,6 +431,14 @@ pub fn cancel_with_app(app: &AppHandle, state: &Mutex<RuntimeState>) {
     let _ = app.emit("test_stopping", "stopping");
 }
 
+fn baseline_needs_refresh(snapshot: &BaselineSnapshot) -> bool {
+    let captured = snapshot.captured_at.parse::<u64>().unwrap_or_default();
+    let now = unix_timestamp().parse::<u64>().unwrap_or_default();
+    now.saturating_sub(captured) >= 300
+        || baseline::network_fingerprint() != snapshot.network_fingerprint
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_one_preset(
     app: &AppHandle,
     state: &Mutex<RuntimeState>,
@@ -352,9 +447,10 @@ fn run_one_preset(
     mode: TestMode,
     preset_index: usize,
     preset_count: usize,
+    targets: Vec<Target>,
+    baseline: Option<BaselineSnapshot>,
 ) -> TestResult {
     let started_at = unix_timestamp();
-    let targets = test_targets();
     let total_checks = planned_check_count(&targets);
     let mut progress = TestProgress {
         test_id: test_id.clone(),
@@ -367,6 +463,7 @@ fn run_one_preset(
         completed_checks: 0,
         passed_checks: 0,
         failed_checks: 0,
+        inconclusive_checks: 0,
         phase: TestPhase::Starting,
         current_target: None,
     };
@@ -384,6 +481,7 @@ fn run_one_preset(
     );
 
     let mut target_results = Vec::new();
+    let mut process_ok = false;
     let start_result = services::start_zapret(app, state, preset.id.clone());
     if let Err(error) = start_result {
         logging::push(app, state, LogSource::Tests, error.clone());
@@ -395,17 +493,49 @@ fn run_one_preset(
     } else {
         progress.phase = TestPhase::Warmup;
         emit_progress(app, &progress);
-        warmup(app, state);
-        if !is_cancelled(state) {
-            progress.phase = TestPhase::Checking;
-            emit_progress(app, &progress);
-            target_results = run_targets(app, state, targets, &mut progress);
+        match lifecycle::wait_until_ready(app, state) {
+            Ok(pids) => {
+                process_ok = true;
+                logging::push(
+                    app,
+                    state,
+                    LogSource::Tests,
+                    format!(
+                        "zapret readiness confirmed: PID {}",
+                        pids.iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                );
+                if !is_cancelled(state) {
+                    progress.phase = TestPhase::Checking;
+                    emit_progress(app, &progress);
+                    target_results = run_targets(
+                        app,
+                        state,
+                        targets,
+                        &mut progress,
+                        ProbeContext::Preset,
+                        true,
+                    );
+                    process_ok = lifecycle::is_healthy(app, state);
+                }
+            }
+            Err(error) => {
+                logging::push(app, state, LogSource::Tests, error.clone());
+                target_results.push(process_failure_target(&preset.relative_path, error));
+                progress.completed_checks = total_checks;
+                progress.failed_checks = total_checks;
+            }
         }
         progress.phase = TestPhase::Finishing;
         progress.current_target = None;
         emit_progress(app, &progress);
         let _ = services::stop_zapret(app, state);
     }
+
+    scoring::apply_baseline_comparison(&mut target_results, baseline.as_ref());
 
     let result = build_result(
         test_id,
@@ -417,6 +547,8 @@ fn run_one_preset(
         started_at,
         unix_timestamp(),
         target_results,
+        baseline,
+        process_ok,
     );
 
     logging::push(
@@ -433,14 +565,52 @@ fn run_one_preset(
     result
 }
 
-fn warmup(app: &AppHandle, state: &Mutex<RuntimeState>) {
-    let _ = app.emit("operation_progress", "Warmup");
-    for _ in 0..2 {
-        if is_cancelled(state) {
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
+fn collect_baseline(
+    app: &AppHandle,
+    state: &Mutex<RuntimeState>,
+    test_id: &str,
+    preset: &crate::models::Preset,
+    preset_index: usize,
+    preset_count: usize,
+    targets: Vec<Target>,
+) -> BaselineSnapshot {
+    let total_checks = planned_check_count(&targets);
+    let mut progress = TestProgress {
+        test_id: test_id.to_string(),
+        preset_id: preset.id.clone(),
+        preset_name: "Baseline".into(),
+        engine: preset.engine,
+        preset_index,
+        preset_count,
+        total_checks,
+        completed_checks: 0,
+        passed_checks: 0,
+        failed_checks: 0,
+        inconclusive_checks: 0,
+        phase: TestPhase::Baseline,
+        current_target: None,
+    };
+    emit_progress(app, &progress);
+    logging::push(app, state, LogSource::Tests, "Network baseline started");
+    let results = run_targets(
+        app,
+        state,
+        targets,
+        &mut progress,
+        ProbeContext::Baseline,
+        false,
+    );
+    let snapshot = baseline::snapshot(unix_timestamp(), results);
+    logging::push(
+        app,
+        state,
+        LogSource::Tests,
+        format!(
+            "Network baseline finished: passed={}, failed={}, inconclusive={}, fingerprint={}",
+            snapshot.passed, snapshot.failed, snapshot.inconclusive, snapshot.network_fingerprint
+        ),
+    );
+    snapshot
 }
 
 fn run_targets(
@@ -448,6 +618,8 @@ fn run_targets(
     state: &Mutex<RuntimeState>,
     targets: Vec<Target>,
     progress: &mut TestProgress,
+    context: ProbeContext,
+    monitor_process: bool,
 ) -> Vec<TestTargetResult> {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -470,7 +642,14 @@ fn run_targets(
         }
     };
 
-    runtime.block_on(run_targets_async(app, state, targets, progress))
+    runtime.block_on(run_targets_async(
+        app,
+        state,
+        targets,
+        progress,
+        context,
+        monitor_process,
+    ))
 }
 
 async fn run_targets_async(
@@ -478,6 +657,8 @@ async fn run_targets_async(
     state: &Mutex<RuntimeState>,
     targets: Vec<Target>,
     progress: &mut TestProgress,
+    context: ProbeContext,
+    monitor_process: bool,
 ) -> Vec<TestTargetResult> {
     let checks = http_check_clients();
     let limiter = Arc::new(Semaphore::new(MAX_PARALLEL_TARGET_CHECKS));
@@ -514,7 +695,8 @@ async fn run_targets_async(
 
                 for check in &checks {
                     let limiter = Arc::clone(&limiter);
-                    let target = target.clone();
+                    let mut target = target.clone();
+                    target.weight = (target.weight / checks.len() as u16).max(1);
                     let url = url.clone();
                     let client = check.client.clone();
                     let label = check.label.to_string();
@@ -540,6 +722,13 @@ async fn run_targets_async(
                     check_ping_target(target, host).await
                 });
             }
+            TargetKind::Dns { resolver, host } => {
+                let limiter = Arc::clone(&limiter);
+                tasks.spawn(async move {
+                    let _permit = limiter.acquire_owned().await.ok();
+                    check_dns_target(target, resolver, host).await
+                });
+            }
         }
     }
 
@@ -550,7 +739,22 @@ async fn run_targets_async(
             break;
         }
 
-        let result = match joined {
+        if monitor_process && !lifecycle::is_healthy(app, state) {
+            tasks.abort_all();
+            let failure = process_failure_target(
+                "runtime",
+                "zapret process exited during network checks".into(),
+            );
+            let _ = app.emit("test_target_finished", &failure);
+            results.push(failure);
+            progress.failed_checks = progress.failed_checks.saturating_add(1);
+            progress.completed_checks = progress.total_checks;
+            progress.current_target = Some("zapret process".into());
+            emit_progress(app, progress);
+            break;
+        }
+
+        let mut result = match joined {
             Ok(result) => result,
             Err(error) => {
                 logging::push(
@@ -566,12 +770,19 @@ async fn run_targets_async(
                 continue;
             }
         };
+        result.context = context;
         let _ = app.emit("test_target_finished", &result);
         progress.completed_checks = progress.completed_checks.saturating_add(1);
-        if result.ok {
-            progress.passed_checks = progress.passed_checks.saturating_add(1);
-        } else {
-            progress.failed_checks = progress.failed_checks.saturating_add(1);
+        match result.probe_status {
+            ProbeStatus::Passed => {
+                progress.passed_checks = progress.passed_checks.saturating_add(1)
+            }
+            ProbeStatus::Failed => {
+                progress.failed_checks = progress.failed_checks.saturating_add(1)
+            }
+            ProbeStatus::Inconclusive | ProbeStatus::Cancelled => {
+                progress.inconclusive_checks = progress.inconclusive_checks.saturating_add(1)
+            }
         }
         progress.current_target = Some(result.label.clone());
         emit_progress(app, progress);
@@ -582,7 +793,12 @@ async fn run_targets_async(
             format!(
                 "{} {} {}",
                 result.service,
-                if result.ok { "passed" } else { "failed" },
+                match result.probe_status {
+                    ProbeStatus::Passed => "passed",
+                    ProbeStatus::Failed => "failed",
+                    ProbeStatus::Inconclusive => "inconclusive",
+                    ProbeStatus::Cancelled => "cancelled",
+                },
                 result.url
             ),
         );
@@ -644,18 +860,33 @@ async fn check_http_target(
     match send_http_probe(&client, &url).await {
         Ok(response) => {
             let status = response.status().as_u16();
+            let probe_status = if status == 429 {
+                ProbeStatus::Inconclusive
+            } else if status < 500 {
+                ProbeStatus::Passed
+            } else {
+                ProbeStatus::Failed
+            };
             TestTargetResult {
                 service: target.service,
                 label,
                 url,
-                ok: status < 500,
+                ok: probe_status == ProbeStatus::Passed,
+                probe_status,
+                context: ProbeContext::Preset,
+                change: ProbeChange::NotCompared,
+                failure_stage: (probe_status != ProbeStatus::Passed).then_some(FailureStage::Http),
+                reason_code: match probe_status {
+                    ProbeStatus::Inconclusive => Some("http_rate_limited".into()),
+                    ProbeStatus::Failed => Some("http_server_error".into()),
+                    _ => None,
+                },
+                weight: target.weight,
+                required: target.required,
+                diagnostic: target.diagnostic,
                 status: Some(status),
                 latency_ms: Some(started.elapsed().as_millis()),
-                error: if status < 500 {
-                    None
-                } else {
-                    Some(format!("HTTP {status}"))
-                },
+                error: (probe_status != ProbeStatus::Passed).then(|| format!("HTTP {status}")),
             }
         }
         Err(error) => TestTargetResult {
@@ -663,6 +894,14 @@ async fn check_http_target(
             label,
             url,
             ok: false,
+            probe_status: ProbeStatus::Failed,
+            context: ProbeContext::Preset,
+            change: ProbeChange::NotCompared,
+            failure_stage: Some(classify_reqwest_failure(&error)),
+            reason_code: Some(reqwest_reason_code(&error).into()),
+            weight: target.weight,
+            required: target.required,
+            diagnostic: target.diagnostic,
             status: None,
             latency_ms: Some(started.elapsed().as_millis()),
             error: Some(error.to_string()),
@@ -692,16 +931,61 @@ async fn send_http_probe(client: &reqwest::Client, url: &str) -> Result<Response
     }
 }
 
+fn classify_reqwest_failure(error: &reqwest::Error) -> FailureStage {
+    let detail = error.to_string().to_ascii_lowercase();
+    if detail.contains("dns") || detail.contains("resolve") {
+        FailureStage::Dns
+    } else if detail.contains("tls")
+        || detail.contains("certificate")
+        || detail.contains("handshake")
+    {
+        FailureStage::Tls
+    } else if error.is_connect() {
+        FailureStage::Tcp
+    } else {
+        FailureStage::Http
+    }
+}
+
+fn reqwest_reason_code(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "http_timeout"
+    } else if error.is_connect() {
+        "http_connect_failed"
+    } else if error.is_redirect() {
+        "http_redirect_failed"
+    } else if error.is_builder() {
+        "http_request_invalid"
+    } else {
+        "http_request_failed"
+    }
+}
+
 fn startup_failure_target(preset_path: &str, error: String) -> TestTargetResult {
     TestTargetResult {
         service: "Zapret".into(),
         label: "zapret start".into(),
         url: preset_path.into(),
         ok: false,
+        probe_status: ProbeStatus::Failed,
+        context: ProbeContext::Preset,
+        change: ProbeChange::NotCompared,
+        failure_stage: Some(FailureStage::Process),
+        reason_code: Some("process_start_failed".into()),
+        weight: 100,
+        required: true,
+        diagnostic: false,
         status: None,
         latency_ms: None,
         error: Some(error),
     }
+}
+
+fn process_failure_target(preset_path: &str, error: String) -> TestTargetResult {
+    let mut target = startup_failure_target(preset_path, error);
+    target.label = "zapret readiness".into();
+    target.reason_code = Some("process_not_ready".into());
+    target
 }
 
 fn unavailable_http_target(target: Target, label: String, url: String) -> TestTargetResult {
@@ -710,9 +994,39 @@ fn unavailable_http_target(target: Target, label: String, url: String) -> TestTa
         label: format!("{} {label}", target.name),
         url,
         ok: false,
+        probe_status: ProbeStatus::Inconclusive,
+        context: ProbeContext::Preset,
+        change: ProbeChange::NotCompared,
+        failure_stage: Some(FailureStage::Internal),
+        reason_code: Some("http_client_unavailable".into()),
+        weight: target.weight,
+        required: target.required,
+        diagnostic: target.diagnostic,
         status: None,
         latency_ms: None,
         error: Some("HTTP test client is unavailable".into()),
+    }
+}
+
+async fn check_dns_target(target: Target, resolver: String, host: String) -> TestTargetResult {
+    let outcome = dns::probe(&resolver, &host).await;
+    let ok = outcome.status == ProbeStatus::Passed;
+    TestTargetResult {
+        service: target.service,
+        label: format!("{} DNS", target.name),
+        url: format!("DNS:{resolver}:{host}"),
+        ok,
+        probe_status: outcome.status,
+        context: ProbeContext::Preset,
+        change: ProbeChange::NotCompared,
+        failure_stage: (!ok).then_some(FailureStage::Dns),
+        reason_code: outcome.reason_code,
+        weight: target.weight,
+        required: target.required,
+        diagnostic: target.diagnostic,
+        status: None,
+        latency_ms: Some(outcome.latency_ms),
+        error: (!ok).then_some(outcome.detail),
     }
 }
 
@@ -739,6 +1053,18 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
                     label: format!("{} Ping", target.name),
                     url: host,
                     ok: output.status.success(),
+                    probe_status: if output.status.success() {
+                        ProbeStatus::Passed
+                    } else {
+                        ProbeStatus::Failed
+                    },
+                    context: ProbeContext::Preset,
+                    change: ProbeChange::NotCompared,
+                    failure_stage: (!output.status.success()).then_some(FailureStage::Udp),
+                    reason_code: (!output.status.success()).then(|| "icmp_failed".into()),
+                    weight: 0,
+                    required: false,
+                    diagnostic: true,
                     status: None,
                     latency_ms: parse_ping_average_ms(&stdout)
                         .or_else(|| Some(started.elapsed().as_millis())),
@@ -756,6 +1082,14 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
                 label: format!("{} Ping", target.name),
                 url: host,
                 ok: false,
+                probe_status: ProbeStatus::Inconclusive,
+                context: ProbeContext::Preset,
+                change: ProbeChange::NotCompared,
+                failure_stage: Some(FailureStage::Internal),
+                reason_code: Some("ping_unavailable".into()),
+                weight: 0,
+                required: false,
+                diagnostic: true,
                 status: None,
                 latency_ms: Some(started.elapsed().as_millis()),
                 error: Some(error.to_string()),
@@ -768,6 +1102,14 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
         label: fallback_label,
         url: fallback_host,
         ok: false,
+        probe_status: ProbeStatus::Inconclusive,
+        context: ProbeContext::Preset,
+        change: ProbeChange::NotCompared,
+        failure_stage: Some(FailureStage::Internal),
+        reason_code: Some("ping_task_failed".into()),
+        weight: 0,
+        required: false,
+        diagnostic: true,
         status: None,
         latency_ms: None,
         error: Some(error.to_string()),
@@ -797,6 +1139,20 @@ fn test_targets() -> Vec<Target> {
     load_custom_targets().unwrap_or_else(fallback_targets)
 }
 
+pub fn default_target_configs() -> Vec<TestTargetConfig> {
+    manifest::default_configs()
+}
+
+pub fn validate_target_configs(configs: &[TestTargetConfig]) -> Result<(), String> {
+    if configs.len() > 100 {
+        return Err("No more than 100 test targets are allowed".into());
+    }
+    for config in configs {
+        manifest::validate_config(config)?;
+    }
+    Ok(())
+}
+
 fn load_custom_targets() -> Option<Vec<Target>> {
     let settings = settings::load_settings().ok()?;
     let targets: Vec<Target> = settings
@@ -804,11 +1160,7 @@ fn load_custom_targets() -> Option<Vec<Target>> {
         .iter()
         .filter_map(target_from_config)
         .collect();
-    if targets.is_empty() {
-        None
-    } else {
-        Some(targets)
-    }
+    (!settings.test_targets.is_empty()).then_some(targets)
 }
 
 fn target_from_config(config: &TestTargetConfig) -> Option<Target> {
@@ -817,7 +1169,7 @@ fn target_from_config(config: &TestTargetConfig) -> Option<Target> {
     }
     let service = config.service.trim();
     let value = config.value.trim();
-    if service.is_empty() || value.is_empty() {
+    if manifest::validate_config(config).is_err() {
         return None;
     }
     let kind = target_kind(value)?;
@@ -826,24 +1178,35 @@ fn target_from_config(config: &TestTargetConfig) -> Option<Target> {
     } else {
         config.name.trim()
     };
+    let definition = manifest::definition_for(service, name, value);
+    let (weight, required, diagnostic) = if let Some(definition) = definition {
+        (
+            definition.weight,
+            definition.required,
+            definition.diagnostic,
+        )
+    } else {
+        let (weight, diagnostic) = match &kind {
+            TargetKind::Ping(_) => (0, true),
+            TargetKind::Dns { .. } => (6, false),
+            TargetKind::Url(_) => (10, false),
+        };
+        (weight, false, diagnostic)
+    };
     Some(Target {
         name: name.into(),
         service: service.into(),
         kind,
+        weight,
+        required,
+        diagnostic,
     })
 }
 
 fn fallback_targets() -> Vec<Target> {
-    FALLBACK_TARGETS
+    manifest::default_configs()
         .iter()
-        .filter_map(|(service, value)| {
-            let kind = target_kind(value)?;
-            Some(Target {
-                name: (*service).into(),
-                service: (*service).into(),
-                kind,
-            })
-        })
+        .filter_map(target_from_config)
         .collect()
 }
 
@@ -855,7 +1218,19 @@ fn target_kind(value: &str) -> Option<TargetKind> {
             return Some(TargetKind::Ping(host.into()));
         }
     }
-    if value.starts_with("https://") || value.starts_with("http://") {
+    if value.len() >= 4 && value[..4].eq_ignore_ascii_case("DNS:") {
+        let (resolver, host) = manifest::parse_dns_target(value).ok()?;
+        if !resolver.trim().is_empty() && !host.trim().is_empty() {
+            return Some(TargetKind::Dns {
+                resolver: resolver.trim().into(),
+                host: host.trim().into(),
+            });
+        }
+    }
+    if reqwest::Url::parse(value)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
+    {
         return Some(TargetKind::Url(value.into()));
     }
     None
@@ -878,63 +1253,14 @@ fn build_result(
     started_at: String,
     finished_at: String,
     targets: Vec<TestTargetResult>,
+    baseline: Option<BaselineSnapshot>,
+    process_ok: bool,
 ) -> TestResult {
-    let mut services = Vec::new();
-    let mut service_names: Vec<String> = [
-        "Zapret",
-        "Discord",
-        "YouTube",
-        "Google",
-        "Cloudflare",
-        "DNS",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    for target in &targets {
-        if !service_names.iter().any(|name| name == &target.service) {
-            service_names.push(target.service.clone());
-        }
-    }
-
-    for service in service_names {
-        let service_targets: Vec<TestTargetResult> = targets
-            .iter()
-            .filter(|target| target.service == service)
-            .cloned()
-            .collect();
-        if service_targets.is_empty() {
-            continue;
-        }
-        let ok = service_targets.iter().filter(|target| target.ok).count() as u32;
-        let total = service_targets.len() as u32;
-        let status = if ok == total {
-            TestServiceStatus::Passed
-        } else if ok > 0 {
-            TestServiceStatus::Partial
-        } else {
-            TestServiceStatus::Failed
-        };
-        let errors = service_targets
-            .iter()
-            .filter_map(|target| target.error.clone())
-            .collect();
-        services.push(ServiceTestResult {
-            name: service,
-            status,
-            ok,
-            total,
-            errors,
-            targets: service_targets,
-        });
-    }
-
-    let ok = services.iter().map(|service| service.ok).sum::<u32>();
-    let total = services.iter().map(|service| service.total).sum::<u32>();
-    let score = ok.saturating_mul(100).checked_div(total).unwrap_or(0) as u8;
-    let recommendation = recommendation_for(score, &services);
+    let services = scoring::build_services(&targets);
+    let summary = scoring::summarize(&services, process_ok);
 
     TestResult {
+        schema_version: 2,
         id,
         preset_id,
         preset_name,
@@ -944,30 +1270,17 @@ fn build_result(
         started_at,
         finished_at: finished_at.clone(),
         cached_at: finished_at,
-        recommendation,
-        score,
-        ok,
-        total,
+        recommendation: summary.recommendation,
+        score: summary.score,
+        ok: summary.ok,
+        total: summary.total,
+        passed_weight: summary.passed_weight,
+        total_weight: summary.total_weight,
+        inconclusive: summary.inconclusive,
+        regressions: summary.regressions,
+        baseline,
+        process_ok,
         services,
-    }
-}
-
-fn recommendation_for(score: u8, services: &[ServiceTestResult]) -> TestRecommendation {
-    let core_services: Vec<&ServiceTestResult> = services
-        .iter()
-        .filter(|service| matches!(service.name.as_str(), "Discord" | "YouTube"))
-        .collect();
-    let core_failed = !core_services.is_empty()
-        && core_services
-            .iter()
-            .all(|service| matches!(service.status, TestServiceStatus::Failed));
-
-    if score >= 70 && !core_failed {
-        TestRecommendation::Recommended
-    } else if score >= 35 || services.iter().any(|service| service.ok > 0) {
-        TestRecommendation::Partial
-    } else {
-        TestRecommendation::NotRecommended
     }
 }
 
@@ -997,6 +1310,7 @@ fn planned_check_count(targets: &[Target]) -> u32 {
         .map(|target| match target.kind {
             TargetKind::Url(_) => http_checks + 1,
             TargetKind::Ping(_) => 1,
+            TargetKind::Dns { .. } => 1,
         })
         .sum()
 }
@@ -1056,6 +1370,26 @@ mod tests {
         let total = planned_check_count(&targets);
         assert!(total > targets.len() as u32);
         assert_eq!(total, planned_check_count(&targets));
+    }
+
+    #[test]
+    fn migrates_legacy_results_without_losing_successes() {
+        let json = r#"{
+          "id":"legacy-1","presetId":"preset","presetName":"Legacy","engine":"classic",
+          "presetVersion":"2.2","mode":"selected","startedAt":"1","finishedAt":"2",
+          "cachedAt":"2","recommendation":"recommended","score":100,"ok":1,"total":1,
+          "services":[{"name":"Discord","status":"passed","ok":1,"total":1,"errors":[],
+            "targets":[{"service":"Discord","label":"Discord HTTP1.1","url":"https://discord.com",
+              "ok":true,"status":200,"latencyMs":10,"error":null}]}]
+        }"#;
+        let mut result: TestResult = serde_json::from_str(json).unwrap();
+        assert!(migrate_result(&mut result));
+        assert_eq!(result.schema_version, 2);
+        assert_eq!(
+            result.services[0].targets[0].probe_status,
+            ProbeStatus::Passed
+        );
+        assert_eq!(result.score, 100);
     }
 }
 

@@ -94,7 +94,7 @@
   let updateInstalling = $state(false);
   let updateMessage = $state<string | null>(null);
   let updatePostponedVersion = $state<string | null>(null);
-  let appVersion = $state("2.2.2-memory-optimazation");
+  let appVersion = $state("2.2.3-network-test.1");
   let changingZapretEngine = $state(false);
   let engineTransition = $state<ZapretEngine | null>(null);
   let testSelectionOpen = $state(false);
@@ -102,6 +102,7 @@
   let selectedTestPresetIds = $state<string[]>([]);
   let targetEditorOpen = $state(false);
   let targetEditorTargets = $state<TestTargetConfig[]>([]);
+  let defaultTestTargets = $state<TestTargetConfig[]>([]);
   let customTargetService = $state("Custom");
   let customTargetName = $state("");
   let customTargetValue = $state("");
@@ -116,26 +117,6 @@
 
   const settingsTabOrder: SettingsTab[] = ["general", "services", "test", "presets", "diagnostics"];
   const settingsTabIndex = $derived(Math.max(0, settingsTabOrder.indexOf(settingsTab)));
-
-  const defaultTestTargets: TestTargetConfig[] = [
-    { service: "Discord", name: "Discord", value: "https://discord.com", enabled: true },
-    { service: "Discord", name: "Discord Gateway", value: "https://gateway.discord.gg", enabled: true },
-    { service: "Discord", name: "Discord CDN", value: "https://cdn.discordapp.com", enabled: true },
-    { service: "Discord", name: "Discord Updates", value: "https://updates.discord.com", enabled: true },
-    { service: "YouTube", name: "YouTube", value: "https://www.youtube.com", enabled: true },
-    { service: "YouTube", name: "YouTube Short", value: "https://youtu.be", enabled: true },
-    { service: "YouTube", name: "YouTube Images", value: "https://i.ytimg.com", enabled: true },
-    { service: "YouTube", name: "GoogleVideo", value: "https://redirector.googlevideo.com", enabled: true },
-    { service: "Google", name: "Google", value: "https://www.google.com", enabled: true },
-    { service: "Google", name: "Google Static", value: "https://www.gstatic.com", enabled: true },
-    { service: "Google", name: "Google DNS", value: "PING:8.8.8.8", enabled: true },
-    { service: "Google", name: "Google DNS 2", value: "PING:8.8.4.4", enabled: true },
-    { service: "Cloudflare", name: "Cloudflare", value: "https://www.cloudflare.com", enabled: true },
-    { service: "Cloudflare", name: "Cloudflare CDN", value: "https://cdnjs.cloudflare.com", enabled: true },
-    { service: "Cloudflare", name: "Cloudflare DNS", value: "PING:1.1.1.1", enabled: true },
-    { service: "Cloudflare", name: "Cloudflare DNS 2", value: "PING:1.0.0.1", enabled: true },
-    { service: "DNS", name: "Quad9", value: "PING:9.9.9.9", enabled: true }
-  ];
 
   const themeOptions = $derived.by((): DropdownOption[] => [
     { value: "dark", label: $t("theme.dark"), hint: $t("theme.darkHint") },
@@ -325,7 +306,8 @@
         loadPresets(),
         loadLogs(),
         loadTestResults(),
-        loadDiagnostics()
+        loadDiagnostics(),
+        commands.getTestTargetManifest().then((targets) => (defaultTestTargets = targets))
       ];
       const results = await Promise.allSettled(startupTasks);
       const failures = results
@@ -683,27 +665,32 @@
     targetEditorTargets = targetEditorTargets.filter((_, itemIndex) => itemIndex !== index);
   }
 
-  function addEditorTarget() {
+  async function addEditorTarget() {
     const name = customTargetName.trim();
     const value = customTargetValue.trim();
-    if (!name || (!value.startsWith("http://") && !value.startsWith("https://") && !value.toUpperCase().startsWith("PING:"))) {
+    if (!name) {
       error = $t("test.invalidTarget");
       return;
     }
-    targetEditorTargets = [
-      ...targetEditorTargets,
-      {
-        service: customTargetService.trim() || "Custom",
-        name,
-        value,
-        enabled: true
-      }
-    ];
+    const target = {
+      service: customTargetService.trim() || "Custom",
+      name,
+      value,
+      enabled: true
+    };
+    try {
+      await commands.validateTestTargets([target]);
+      targetEditorTargets = [...targetEditorTargets, target];
+    } catch (caught) {
+      error = String(caught);
+      return;
+    }
     customTargetName = "";
     customTargetValue = "";
   }
 
   async function saveTargetEditor() {
+    await commands.validateTestTargets(targetEditorTargets);
     await updateSettings({ testTargets: targetEditorTargets });
     targetEditorOpen = false;
   }
@@ -732,14 +719,32 @@
     if (label.includes("TLS1.2")) return "TLS 1.2";
     if (label.includes("HTTP1.1")) return "HTTP 1.1";
     if (label.includes("Ping")) return "Ping";
+    if (label.includes("DNS")) return "DNS";
     return $t("common.check");
   }
 
-  function targetMeta(target: { label: string; status?: number | null; latencyMs?: number | null }) {
+  function targetMeta(target: { label: string; status?: number | null; latencyMs?: number | null; failureStage?: string | null }) {
     const parts = [targetKind(target.label)];
     if (target.status) parts.push(`HTTP ${target.status}`);
     if (target.latencyMs) parts.push(`${target.latencyMs} ms`);
+    if (target.failureStage) parts.push(target.failureStage.toUpperCase());
     return parts.join(" / ");
+  }
+
+  function probeStatusLabel(status: string) {
+    if (status === "passed") return $t("common.ok");
+    if (status === "inconclusive") return $t("test.inconclusive");
+    if (status === "cancelled") return $t("test.cancelled");
+    return $t("common.fail");
+  }
+
+  function changeLabel(change: string) {
+    if (change === "unblocked") return $t("test.changeUnblocked");
+    if (change === "unchangedAvailable") return $t("test.changeUnchangedAvailable");
+    if (change === "unchangedBlocked") return $t("test.changeUnchangedBlocked");
+    if (change === "regressed") return $t("test.changeRegressed");
+    if (change === "inconclusive") return $t("test.inconclusive");
+    return "";
   }
 
   function recommendationLabel(value: TestResult["recommendation"]) {
@@ -2071,8 +2076,21 @@
             <div>
               <strong>{$t("test.overall")}</strong>
               <span>{$t("test.passed", { ok: testDetails.ok, total: testDetails.total })}</span>
+              {#if testDetails.inconclusive > 0}<small>{$t("test.inconclusiveCount", { count: testDetails.inconclusive })}</small>{/if}
+              {#if testDetails.regressions > 0}<small>{$t("test.regressionCount", { count: testDetails.regressions })}</small>{/if}
             </div>
           </div>
+
+          {#if testDetails.baseline}
+            <div class="test-details-score baseline-summary">
+              <div class="score-ring muted">B</div>
+              <div>
+                <strong>{$t("test.baseline")}</strong>
+                <span>{$t("test.baselineSummary", { passed: testDetails.baseline.passed, failed: testDetails.baseline.failed, inconclusive: testDetails.baseline.inconclusive })}</span>
+                <small>{$t("test.networkFingerprint", { value: testDetails.baseline.networkFingerprint })}</small>
+              </div>
+            </div>
+          {/if}
 
           <div class="test-details-meta">
             <span><strong>{$t("test.version")}</strong>{testDetails.presetVersion || "-"}</span>
@@ -2091,8 +2109,8 @@
                 </header>
                 <div>
                   {#each service.targets as target}
-                    <div class:failed={!target.ok} class="target-row">
-                      <span>{target.ok ? $t("common.ok") : $t("common.fail")}</span>
+                    <div class:failed={target.probeStatus === "failed"} class:inconclusive={target.probeStatus === "inconclusive"} class="target-row">
+                      <span>{probeStatusLabel(target.probeStatus)}</span>
                       <div class="target-body">
                         <div class="target-title-line">
                           <strong>{target.label || target.url}</strong>
@@ -2100,6 +2118,7 @@
                         </div>
                         <small>{target.url}</small>
                         <small>{targetMeta(target)}</small>
+                        {#if changeLabel(target.change)}<small class:failed={target.change === "regressed"}>{changeLabel(target.change)}</small>{/if}
                       </div>
                       {#if target.error}
                         <em>{target.error}</em>

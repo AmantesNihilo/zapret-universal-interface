@@ -10,6 +10,27 @@ export type LogSource = "app" | "zapret" | "tgWs" | "tests";
 export type TestMode = "selected" | "all";
 export type TestServiceStatus = "passed" | "partial" | "failed";
 export type TestRecommendationState = "recommended" | "partial" | "notRecommended";
+export type ProbeStatus = "passed" | "failed" | "inconclusive" | "cancelled";
+export type ProbeContext = "baseline" | "preset";
+export type ProbeChange =
+  | "unblocked"
+  | "unchangedAvailable"
+  | "unchangedBlocked"
+  | "regressed"
+  | "inconclusive"
+  | "notCompared";
+export type FailureStage =
+  | "process"
+  | "dns"
+  | "tcp"
+  | "tls"
+  | "http"
+  | "content"
+  | "websocket"
+  | "quic"
+  | "udp"
+  | "resource"
+  | "internal";
 
 export type TestTargetConfig = {
   service: string;
@@ -130,9 +151,26 @@ export type TestTargetResult = {
   label: string;
   url: string;
   ok: boolean;
+  probeStatus: ProbeStatus;
+  context: ProbeContext;
+  change: ProbeChange;
+  failureStage?: FailureStage | null;
+  reasonCode?: string | null;
+  weight: number;
+  required: boolean;
+  diagnostic: boolean;
   status?: number | null;
   latencyMs?: number | null;
   error?: string | null;
+};
+
+export type BaselineSnapshot = {
+  capturedAt: string;
+  networkFingerprint: string;
+  passed: number;
+  failed: number;
+  inconclusive: number;
+  targets: TestTargetResult[];
 };
 
 export type ServiceTestResult = {
@@ -140,11 +178,17 @@ export type ServiceTestResult = {
   status: TestServiceStatus;
   ok: number;
   total: number;
+  score: number;
+  passedWeight: number;
+  totalWeight: number;
+  inconclusive: number;
+  regressions: number;
   errors: string[];
   targets: TestTargetResult[];
 };
 
 export type TestResult = {
+  schemaVersion: number;
   id: string;
   presetId: string;
   presetName: string;
@@ -158,10 +202,16 @@ export type TestResult = {
   score: number;
   ok: number;
   total: number;
+  passedWeight: number;
+  totalWeight: number;
+  inconclusive: number;
+  regressions: number;
+  baseline?: BaselineSnapshot | null;
+  processOk: boolean;
   services: ServiceTestResult[];
 };
 
-export type TestPhase = "starting" | "warmup" | "checking" | "finishing";
+export type TestPhase = "baseline" | "starting" | "warmup" | "checking" | "finishing";
 
 export type TestProgress = {
   testId: string;
@@ -174,6 +224,7 @@ export type TestProgress = {
   completedChecks: number;
   passedChecks: number;
   failedChecks: number;
+  inconclusiveChecks: number;
   phase: TestPhase;
   currentTarget?: string | null;
 };

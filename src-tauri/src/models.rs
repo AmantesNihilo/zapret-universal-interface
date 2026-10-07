@@ -345,6 +345,8 @@ pub enum LogSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestResult {
+    #[serde(default)]
+    pub schema_version: u8,
     pub id: String,
     pub preset_id: String,
     pub preset_name: String,
@@ -362,6 +364,18 @@ pub struct TestResult {
     pub score: u8,
     pub ok: u32,
     pub total: u32,
+    #[serde(default)]
+    pub passed_weight: u32,
+    #[serde(default)]
+    pub total_weight: u32,
+    #[serde(default)]
+    pub inconclusive: u32,
+    #[serde(default)]
+    pub regressions: u32,
+    #[serde(default)]
+    pub baseline: Option<BaselineSnapshot>,
+    #[serde(default = "default_true")]
+    pub process_ok: bool,
     pub services: Vec<ServiceTestResult>,
 }
 
@@ -390,11 +404,21 @@ pub struct ServiceTestResult {
     pub status: TestServiceStatus,
     pub ok: u32,
     pub total: u32,
+    #[serde(default)]
+    pub score: u8,
+    #[serde(default)]
+    pub passed_weight: u32,
+    #[serde(default)]
+    pub total_weight: u32,
+    #[serde(default)]
+    pub inconclusive: u32,
+    #[serde(default)]
+    pub regressions: u32,
     pub errors: Vec<String>,
     pub targets: Vec<TestTargetResult>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TestServiceStatus {
     Passed,
@@ -410,14 +434,88 @@ pub struct TestTargetResult {
     pub label: String,
     pub url: String,
     pub ok: bool,
+    #[serde(default)]
+    pub probe_status: ProbeStatus,
+    #[serde(default)]
+    pub context: ProbeContext,
+    #[serde(default)]
+    pub change: ProbeChange,
+    #[serde(default)]
+    pub failure_stage: Option<FailureStage>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub weight: u16,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub diagnostic: bool,
     pub status: Option<u16>,
     pub latency_ms: Option<u128>,
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProbeStatus {
+    Passed,
+    #[default]
+    Failed,
+    Inconclusive,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProbeContext {
+    Baseline,
+    #[default]
+    Preset,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProbeChange {
+    Unblocked,
+    UnchangedAvailable,
+    UnchangedBlocked,
+    Regressed,
+    Inconclusive,
+    #[default]
+    NotCompared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FailureStage {
+    Process,
+    Dns,
+    Tcp,
+    Tls,
+    Http,
+    Content,
+    Websocket,
+    Quic,
+    Udp,
+    Resource,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineSnapshot {
+    pub captured_at: String,
+    pub network_fingerprint: String,
+    pub passed: u32,
+    pub failed: u32,
+    pub inconclusive: u32,
+    pub targets: Vec<TestTargetResult>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TestPhase {
+    Baseline,
     Starting,
     Warmup,
     Checking,
@@ -437,8 +535,14 @@ pub struct TestProgress {
     pub completed_checks: u32,
     pub passed_checks: u32,
     pub failed_checks: u32,
+    #[serde(default)]
+    pub inconclusive_checks: u32,
     pub phase: TestPhase,
     pub current_target: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

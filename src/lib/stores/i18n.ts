@@ -689,6 +689,40 @@ Object.assign(ru, {
   "minimize.defaultAction": "Действие по умолчанию"
 });
 
+Object.assign(en, {
+  "test.phaseBaseline": "Checking the network without zapret",
+  "test.baseline": "Network baseline",
+  "test.baselineSummary": "Passed {passed}, failed {failed}, inconclusive {inconclusive}",
+  "test.networkFingerprint": "Network snapshot: {value}",
+  "test.inconclusive": "Inconclusive",
+  "test.inconclusiveCount": "Inconclusive {count}",
+  "test.regressionCount": "Regressions {count}",
+  "test.cancelled": "Cancelled",
+  "test.changeUnblocked": "Unblocked by preset",
+  "test.changeUnchangedAvailable": "Available before and after",
+  "test.changeUnchangedBlocked": "Unavailable before and after",
+  "test.changeRegressed": "Worked before preset, failed after",
+  "test.editTargetsHint": "Enable standard probes or add custom HTTP, DNS:RESOLVER:HOST and PING targets.",
+  "test.invalidTarget": "Enter a valid HTTP, HTTPS, DNS:RESOLVER:HOST or PING target"
+});
+
+Object.assign(ru, {
+  "test.phaseBaseline": "Проверяем сеть без zapret",
+  "test.baseline": "Исходное состояние сети",
+  "test.baselineSummary": "Успешно {passed}, ошибок {failed}, неопределённо {inconclusive}",
+  "test.networkFingerprint": "Снимок сети: {value}",
+  "test.inconclusive": "Неопределённо",
+  "test.inconclusiveCount": "Неопределённых проверок: {count}",
+  "test.regressionCount": "Регрессий: {count}",
+  "test.cancelled": "Отменено",
+  "test.changeUnblocked": "Разблокировано пресетом",
+  "test.changeUnchangedAvailable": "Доступно до и после",
+  "test.changeUnchangedBlocked": "Недоступно до и после",
+  "test.changeRegressed": "Работало до пресета, перестало после",
+  "test.editTargetsHint": "Включайте стандартные проверки или добавляйте HTTP, DNS:СЕРВЕР:ДОМЕН и PING-цели.",
+  "test.invalidTarget": "Укажите корректную HTTP, HTTPS, DNS:СЕРВЕР:ДОМЕН или PING-цель"
+});
+
 const dictionaries: Record<string, Dictionary> = { en, ru };
 
 function format(template: string, vars?: Vars) {

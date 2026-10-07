@@ -10,6 +10,7 @@ import type {
   ServiceStatus,
   Settings,
   TestResult,
+  TestTargetConfig,
   TgWsConnectivityReport,
   UpdateCheck
 } from "./types";
@@ -56,6 +57,9 @@ export const commands = {
   showMainWindow: () => invoke<void>("show_main_window"),
   setWindowLayout: (layout: Settings["layoutOrientation"]) =>
     invoke<void>("set_window_layout", { layout }),
+  getTestTargetManifest: () => invoke<TestTargetConfig[]>("get_test_target_manifest"),
+  validateTestTargets: (targets: TestTargetConfig[]) =>
+    invoke<void>("validate_test_targets", { targets }),
   runPresetTest: (presetId: string) => invoke<string>("run_preset_test", { presetId }),
   runBestPresetTest: (presetIds: string[], maxCount: number) =>
     invoke<string>("run_best_preset_test", { presetIds, maxCount }),

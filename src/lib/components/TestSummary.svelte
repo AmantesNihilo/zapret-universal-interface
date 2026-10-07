@@ -37,6 +37,7 @@
 
   function phaseLabel(value?: TestProgress["phase"]) {
     if (stopping) return $t("test.stoppingTitle");
+    if (value === "baseline") return $t("test.phaseBaseline");
     if (value === "starting") return $t("test.phaseStarting");
     if (value === "warmup") return $t("test.phaseWarmup");
     if (value === "finishing") return $t("test.phaseFinishing");
@@ -48,6 +49,7 @@
     if (label.includes("TLS1.2")) return "TLS 1.2";
     if (label.includes("HTTP1.1")) return "HTTP";
     if (label.includes("Ping")) return "Ping";
+    if (label.includes("DNS")) return "DNS";
     return $t("common.check");
   }
 
@@ -97,6 +99,9 @@
         <span>{$t("test.completed", { completed, total })}</span>
         <span class="passed">{$t("test.successCount", { count: progress?.passedChecks ?? 0 })}</span>
         <span class="failed">Fail {progress?.failedChecks ?? 0}</span>
+        {#if (progress?.inconclusiveChecks ?? 0) > 0}
+          <span>{$t("test.inconclusiveCount", { count: progress?.inconclusiveChecks ?? 0 })}</span>
+        {/if}
       </div>
       {#if progress && progress.presetCount > 1}
         <small class="batch-progress">
@@ -106,7 +111,7 @@
       {#if latestTargets.length > 0}
         <div class="live-targets">
           {#each latestTargets as target}
-            <span class:failed={!target.ok}>{chipLabel(target.label)}</span>
+            <span class:failed={target.probeStatus === "failed"} class:inconclusive={target.probeStatus === "inconclusive"}>{chipLabel(target.label)}</span>
           {/each}
         </div>
       {/if}
