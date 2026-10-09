@@ -82,7 +82,7 @@
   let activitySource = $state<"app" | "engine" | "tgWs">("app");
   let activityDirection = $state(1);
   let profileUpdateQueue: Promise<void> = Promise.resolve();
-  const updater = new UpdateController((message) => (error = message || null));
+  const updater = new UpdateController((message) => (error = message));
   const networkTest = new NetworkTestController({
     setError: (message) => (error = message),
     runAction,

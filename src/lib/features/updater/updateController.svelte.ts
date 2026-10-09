@@ -11,7 +11,7 @@ export class UpdateController {
   message = $state<string | null>(null);
   postponedVersion = $state<string | null>(null);
 
-  constructor(private readonly onError: (message: string) => void) {}
+  constructor(private readonly onError: (message: string | null) => void) {}
 
   async checkOnLaunch() {
     try {
@@ -26,7 +26,7 @@ export class UpdateController {
 
   async checkManual() {
     this.checking = true;
-    this.onError("");
+    this.onError(null);
     try {
       const info = await commands.checkForUpdate();
       this.info = info;
@@ -44,7 +44,7 @@ export class UpdateController {
 
   async install() {
     this.installing = true;
-    this.onError("");
+    this.onError(null);
     try {
       await commands.installUpdate();
     } catch (caught) {
