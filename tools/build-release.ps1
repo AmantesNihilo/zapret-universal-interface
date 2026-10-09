@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.2.3-network-test.1",
+    [string]$Version = "2.2.3",
     [string]$TargetDir = "",
     [string]$OutputDir = "",
     [switch]$SkipMsi
