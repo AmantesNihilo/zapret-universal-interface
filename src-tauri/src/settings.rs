@@ -16,9 +16,15 @@ pub fn load_settings() -> Result<Settings, String> {
     }
 
     let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    match json_storage::parse(&text) {
-        Ok(settings) => {
-            if text.starts_with('\u{feff}') {
+    match json_storage::parse::<Settings>(&text) {
+        Ok(mut settings) => {
+            let migrate_targets = settings.test_targets_schema < 2;
+            if migrate_targets {
+                settings.test_targets =
+                    crate::tester::migrate_target_configs(&settings.test_targets);
+                settings.test_targets_schema = 2;
+            }
+            if text.starts_with('\u{feff}') || migrate_targets {
                 save_settings(&settings)?;
             }
             Ok(settings)
@@ -155,5 +161,12 @@ mod tests {
             OsString::from("zui.exe"),
             OsString::from("--windows-startup-extra"),
         ]));
+    }
+
+    #[test]
+    fn missing_test_target_schema_is_marked_for_migration() {
+        let settings: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(settings.test_targets_schema, 0);
+        assert_eq!(Settings::default().test_targets_schema, 2);
     }
 }

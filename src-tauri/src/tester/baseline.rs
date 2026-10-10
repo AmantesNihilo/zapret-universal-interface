@@ -82,6 +82,7 @@ mod tests {
             status: None,
             latency_ms: None,
             error: None,
+            ..Default::default()
         }
     }
 

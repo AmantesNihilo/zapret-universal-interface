@@ -22,9 +22,10 @@ pub fn apply_baseline_comparison(
     for target in targets {
         let Some(baseline_target) = baseline.and_then(|snapshot| {
             snapshot.targets.iter().find(|candidate| {
-                candidate.service == target.service
-                    && candidate.label == target.label
-                    && candidate.url == target.url
+                (!target.target_id.is_empty() && candidate.target_id == target.target_id)
+                    || (candidate.service == target.service
+                        && candidate.label == target.label
+                        && candidate.url == target.url)
             })
         }) else {
             target.change = ProbeChange::NotCompared;
@@ -113,6 +114,9 @@ pub fn build_services(targets: &[TestTargetResult]) -> Vec<ServiceTestResult> {
             let required_failed = scored
                 .iter()
                 .any(|target| target.required && target.probe_status == ProbeStatus::Failed);
+            let required_incomplete = scored
+                .iter()
+                .any(|target| target.required && target.probe_status != ProbeStatus::Passed);
             let mut score = passed_weight
                 .saturating_mul(100)
                 .checked_div(total_weight)
@@ -123,9 +127,9 @@ pub fn build_services(targets: &[TestTargetResult]) -> Vec<ServiceTestResult> {
             if regressions > 0 {
                 score = score.saturating_sub((regressions.min(3) * 10) as u8);
             }
-            let status = if total == 0 {
+            let status = if total == 0 || (required_incomplete && !required_failed) {
                 TestServiceStatus::Partial
-            } else if score >= 90 && !required_failed {
+            } else if score >= 90 && !required_incomplete {
                 TestServiceStatus::Passed
             } else if ok > 0 {
                 TestServiceStatus::Partial
@@ -179,21 +183,25 @@ pub fn summarize(services: &[ServiceTestResult], process_ok: bool) -> ScoreSumma
         matches!(service.name.as_str(), "Discord" | "YouTube")
             && matches!(service.status, TestServiceStatus::Failed)
     });
-    let core_required_failed = services.iter().any(|service| {
+    let core_required_incomplete = services.iter().any(|service| {
         matches!(service.name.as_str(), "Discord" | "YouTube")
             && service
                 .targets
                 .iter()
-                .any(|target| target.required && target.probe_status == ProbeStatus::Failed)
+                .any(|target| target.required && target.probe_status != ProbeStatus::Passed)
     });
-    let recommendation =
-        if process_ok && score >= 70 && !core_failed && !core_required_failed && regressions == 0 {
-            TestRecommendation::Recommended
-        } else if process_ok && (score >= 35 || ok > 0) {
-            TestRecommendation::Partial
-        } else {
-            TestRecommendation::NotRecommended
-        };
+    let recommendation = if process_ok
+        && score >= 70
+        && !core_failed
+        && !core_required_incomplete
+        && regressions == 0
+    {
+        TestRecommendation::Recommended
+    } else if process_ok && (score >= 35 || ok > 0) {
+        TestRecommendation::Partial
+    } else {
+        TestRecommendation::NotRecommended
+    };
 
     ScoreSummary {
         score,
@@ -229,6 +237,7 @@ mod tests {
             status: None,
             latency_ms: None,
             error: None,
+            ..Default::default()
         }
     }
 
@@ -267,6 +276,23 @@ mod tests {
             target(ProbeStatus::Passed, false, 20),
             target(ProbeStatus::Passed, false, 20),
         ]);
+        let summary = summarize(&services, true);
+        assert!(!matches!(
+            summary.recommendation,
+            TestRecommendation::Recommended
+        ));
+    }
+
+    #[test]
+    fn required_media_inconclusive_keeps_service_partial() {
+        let mut media = target(ProbeStatus::Inconclusive, true, 20);
+        media.service = "YouTube".into();
+        media.label = "GoogleVideo media range".into();
+        let mut web = target(ProbeStatus::Passed, true, 20);
+        web.service = "YouTube".into();
+        web.label = "YouTube Web".into();
+        let services = build_services(&[web, media]);
+        assert_eq!(services[0].status, TestServiceStatus::Partial);
         let summary = summarize(&services, true);
         assert!(!matches!(
             summary.recommendation,

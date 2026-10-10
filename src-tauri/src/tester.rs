@@ -1,15 +1,15 @@
 use crate::models::{
-    BaselineSnapshot, FailureStage, LogSource, ProbeChange, ProbeContext, ProbeStatus, TestMode,
-    TestPhase, TestProgress, TestResult, TestTargetConfig, TestTargetResult,
+    BaselineSnapshot, FailureStage, LogSource, ProbeCapability, ProbeChange, ProbeContext,
+    ProbeStatus, ProbeStepResult, TestMode, TestPhase, TestProgress, TestResult, TestTargetConfig,
+    TestTargetResult,
 };
 use crate::state::RuntimeState;
 use crate::{json_storage, logging, paths, presets, services, settings, system_process};
-use reqwest::{tls::Version, Method, Response};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Semaphore;
 
@@ -21,24 +21,27 @@ mod dns;
 mod lifecycle;
 #[path = "tester/manifest.rs"]
 mod manifest;
+#[path = "tester/protocol.rs"]
+mod protocol;
 #[path = "tester/scoring.rs"]
 mod scoring;
+#[path = "tester/service_probes.rs"]
+mod service_probes;
 
 #[derive(Clone)]
 struct Target {
+    id: String,
     name: String,
     service: String,
-    kind: TargetKind,
+    value: String,
+    probe_kind: manifest::ProbeKind,
+    capability: ProbeCapability,
     weight: u16,
     required: bool,
     diagnostic: bool,
-}
-
-#[derive(Clone)]
-enum TargetKind {
-    Url(String),
-    Ping(String),
-    Dns { resolver: String, host: String },
+    allowed_statuses: Vec<u16>,
+    content_types: Vec<String>,
+    markers: Vec<String>,
 }
 const MAX_PARALLEL_TARGET_CHECKS: usize = 8;
 const MAX_STORED_RESULTS: usize = 100;
@@ -118,30 +121,32 @@ pub fn import_results(path: String) -> Result<Vec<TestResult>, String> {
 }
 
 fn migrate_result(result: &mut TestResult) -> bool {
-    if result.schema_version >= 2 {
+    if result.schema_version >= 3 {
         return false;
     }
-    let mut targets = Vec::new();
-    for service in &mut result.services {
-        for target in &mut service.targets {
-            target.probe_status = if target.ok {
-                ProbeStatus::Passed
-            } else {
-                ProbeStatus::Failed
-            };
-            target.context = ProbeContext::Preset;
-            target.change = ProbeChange::NotCompared;
-            target.failure_stage = (!target.ok).then_some(FailureStage::Http);
-            target.reason_code = (!target.ok).then(|| "legacy_failure".into());
-            target.diagnostic = target.label.contains("Ping");
-            target.weight = if target.diagnostic { 0 } else { 1 };
-            target.required = false;
-            targets.push(target.clone());
+    if result.schema_version < 2 {
+        let mut targets = Vec::new();
+        for service in &mut result.services {
+            for target in &mut service.targets {
+                target.probe_status = if target.ok {
+                    ProbeStatus::Passed
+                } else {
+                    ProbeStatus::Failed
+                };
+                target.context = ProbeContext::Preset;
+                target.change = ProbeChange::NotCompared;
+                target.failure_stage = (!target.ok).then_some(FailureStage::Http);
+                target.reason_code = (!target.ok).then(|| "legacy_failure".into());
+                target.diagnostic = target.label.contains("Ping");
+                target.weight = if target.diagnostic { 0 } else { 1 };
+                target.required = false;
+                targets.push(target.clone());
+            }
         }
+        result.services = scoring::build_services(&targets);
     }
-    result.services = scoring::build_services(&targets);
     let summary = scoring::summarize(&result.services, true);
-    result.schema_version = 2;
+    result.schema_version = 3;
     result.score = summary.score;
     result.recommendation = summary.recommendation;
     result.ok = summary.ok;
@@ -692,7 +697,6 @@ async fn run_targets_async(
     context: ProbeContext,
     monitor_process: bool,
 ) -> Vec<TestTargetResult> {
-    let checks = http_check_clients();
     let limiter = Arc::new(Semaphore::new(MAX_PARALLEL_TARGET_CHECKS));
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -700,68 +704,11 @@ async fn run_targets_async(
         if is_cancelled(state) {
             break;
         }
-
-        match target.kind.clone() {
-            TargetKind::Url(url) => {
-                if checks.is_empty() {
-                    let host = host_from_url(&url);
-                    let unavailable_target = target.clone();
-                    let unavailable_url = url.clone();
-                    tasks.spawn(async move {
-                        unavailable_http_target(
-                            unavailable_target,
-                            "HTTP client".into(),
-                            unavailable_url,
-                        )
-                    });
-                    if let Some(host) = host {
-                        let limiter = Arc::clone(&limiter);
-                        let target = target.clone();
-                        tasks.spawn(async move {
-                            let _permit = limiter.acquire_owned().await.ok();
-                            check_ping_target(target, host).await
-                        });
-                    }
-                    continue;
-                }
-
-                for check in &checks {
-                    let limiter = Arc::clone(&limiter);
-                    let mut target = target.clone();
-                    target.weight = (target.weight / checks.len() as u16).max(1);
-                    let url = url.clone();
-                    let client = check.client.clone();
-                    let label = check.label.to_string();
-                    tasks.spawn(async move {
-                        let _permit = limiter.acquire_owned().await.ok();
-                        check_http_target(client, target, label, url).await
-                    });
-                }
-
-                if let Some(host) = host_from_url(&url) {
-                    let limiter = Arc::clone(&limiter);
-                    let target = target.clone();
-                    tasks.spawn(async move {
-                        let _permit = limiter.acquire_owned().await.ok();
-                        check_ping_target(target, host).await
-                    });
-                }
-            }
-            TargetKind::Ping(host) => {
-                let limiter = Arc::clone(&limiter);
-                tasks.spawn(async move {
-                    let _permit = limiter.acquire_owned().await.ok();
-                    check_ping_target(target, host).await
-                });
-            }
-            TargetKind::Dns { resolver, host } => {
-                let limiter = Arc::clone(&limiter);
-                tasks.spawn(async move {
-                    let _permit = limiter.acquire_owned().await.ok();
-                    check_dns_target(target, resolver, host).await
-                });
-            }
-        }
+        let limiter = Arc::clone(&limiter);
+        tasks.spawn(async move {
+            let _permit = limiter.acquire_owned().await.ok();
+            check_target(target).await
+        });
     }
 
     let mut results = Vec::new();
@@ -837,156 +784,196 @@ async fn run_targets_async(
     results
 }
 
-struct HttpCheck {
-    label: &'static str,
-    client: reqwest::Client,
-}
-
-fn http_check_clients() -> Vec<HttpCheck> {
-    [
-        ("HTTP1.1", http_client(|builder| builder.http1_only())),
-        (
-            "TLS1.2",
-            http_client(|builder| {
-                builder
-                    .min_tls_version(Version::TLS_1_2)
-                    .max_tls_version(Version::TLS_1_2)
-            }),
-        ),
-        (
-            "TLS1.3",
-            http_client(|builder| {
-                builder
-                    .min_tls_version(Version::TLS_1_3)
-                    .max_tls_version(Version::TLS_1_3)
-            }),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(label, client)| client.ok().map(|client| HttpCheck { label, client }))
-    .collect()
-}
-
-fn http_client(
-    configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
-) -> Result<reqwest::Client, reqwest::Error> {
-    let builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::limited(4))
-        .user_agent(concat!("ZUI/", env!("CARGO_PKG_VERSION")));
-    configure(builder).build()
-}
-
-async fn check_http_target(
-    client: reqwest::Client,
-    target: Target,
-    label: String,
-    url: String,
-) -> TestTargetResult {
-    let started = Instant::now();
-    let label = format!("{} {label}", target.name);
-
-    match send_http_probe(&client, &url).await {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            let probe_status = if status == 429 {
-                ProbeStatus::Inconclusive
-            } else if status < 500 {
-                ProbeStatus::Passed
-            } else {
-                ProbeStatus::Failed
+async fn check_target(target: Target) -> TestTargetResult {
+    use manifest::ProbeKind;
+    match target.probe_kind {
+        ProbeKind::Ping => {
+            check_ping_target(target.clone(), target.value[5..].trim().to_string()).await
+        }
+        ProbeKind::Dns | ProbeKind::UdpDns => {
+            let value = target.value.clone();
+            let (resolver, host) = manifest::parse_dns_target(&value).unwrap_or(("SYSTEM", ""));
+            check_dns_target(target, resolver.to_string(), host.to_string()).await
+        }
+        ProbeKind::DiscordGatewayWebsocket => {
+            let outcome = service_probes::discord_gateway_websocket(&target.value).await;
+            result_from_simple(target, outcome)
+        }
+        ProbeKind::WebsocketEcho => {
+            let outcome = service_probes::websocket_echo(&target.value).await;
+            result_from_simple(target, outcome)
+        }
+        ProbeKind::DiscordVoiceReadiness => {
+            result_from_simple(target, service_probes::discord_voice_readiness())
+        }
+        ProbeKind::QuicHttp3 => {
+            let value = target.value.clone();
+            let outcome = service_probes::quic_http3_readiness(&value).await;
+            result_from_simple(target, outcome)
+        }
+        ProbeKind::YoutubeMedia => {
+            let request = http_request(&target, protocol::HttpMode::Auto, None);
+            let outcome = service_probes::youtube_media_probe(request).await;
+            result_from_http(target, outcome)
+        }
+        ProbeKind::Http
+        | ProbeKind::Http1
+        | ProbeKind::Http2
+        | ProbeKind::Tls12
+        | ProbeKind::Tls13
+        | ProbeKind::DiscordGatewayApi
+        | ProbeKind::YoutubeWeb
+        | ProbeKind::ControlledJson
+        | ProbeKind::ControlledRedirect
+        | ProbeKind::ControlledRange => {
+            let mode = match target.probe_kind {
+                ProbeKind::Http1 => protocol::HttpMode::Http1,
+                ProbeKind::Http2 => protocol::HttpMode::Http2,
+                ProbeKind::Tls12 => protocol::HttpMode::Tls12,
+                ProbeKind::Tls13 => protocol::HttpMode::Tls13,
+                _ => protocol::HttpMode::Auto,
             };
-            TestTargetResult {
-                service: target.service,
-                label,
-                url,
-                ok: probe_status == ProbeStatus::Passed,
-                probe_status,
-                context: ProbeContext::Preset,
-                change: ProbeChange::NotCompared,
-                failure_stage: (probe_status != ProbeStatus::Passed).then_some(FailureStage::Http),
-                reason_code: match probe_status {
-                    ProbeStatus::Inconclusive => Some("http_rate_limited".into()),
-                    ProbeStatus::Failed => Some("http_server_error".into()),
-                    _ => None,
-                },
-                weight: target.weight,
-                required: target.required,
-                diagnostic: target.diagnostic,
-                status: Some(status),
-                latency_ms: Some(started.elapsed().as_millis()),
-                error: (probe_status != ProbeStatus::Passed).then(|| format!("HTTP {status}")),
+            let range =
+                (target.probe_kind == ProbeKind::ControlledRange).then(|| "bytes=0-32767".into());
+            let mut outcome = protocol::staged_http_probe(http_request(&target, mode, range)).await;
+            if target.probe_kind == ProbeKind::DiscordGatewayApi
+                && outcome.probe_status == ProbeStatus::Passed
+            {
+                let valid_gateway = serde_json::from_slice::<serde_json::Value>(&outcome.body)
+                    .ok()
+                    .and_then(|json| {
+                        json.get("url")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|url| url.starts_with("wss://gateway.discord.gg"));
+                if !valid_gateway {
+                    outcome.probe_status = ProbeStatus::Failed;
+                    outcome.failure_stage = Some(FailureStage::Content);
+                    outcome.reason_code = Some("discord_gateway_json_invalid".into());
+                    outcome.error =
+                        Some("Gateway response has no valid Discord WebSocket URL".into());
+                    outcome.steps.push(ProbeStepResult {
+                        stage: FailureStage::Content,
+                        status: ProbeStatus::Failed,
+                        latency_ms: None,
+                        detail: "Missing valid gateway URL field".into(),
+                    });
+                }
             }
+            result_from_http(target, outcome)
         }
-        Err(error) => TestTargetResult {
-            service: target.service,
-            label,
-            url,
-            ok: false,
-            probe_status: ProbeStatus::Failed,
-            context: ProbeContext::Preset,
-            change: ProbeChange::NotCompared,
-            failure_stage: Some(classify_reqwest_failure(&error)),
-            reason_code: Some(reqwest_reason_code(&error).into()),
-            weight: target.weight,
-            required: target.required,
-            diagnostic: target.diagnostic,
-            status: None,
-            latency_ms: Some(started.elapsed().as_millis()),
-            error: Some(error.to_string()),
-        },
     }
 }
 
-async fn send_http_probe(client: &reqwest::Client, url: &str) -> Result<Response, reqwest::Error> {
-    let mut last_error = None;
-    for attempt in 0..2 {
-        match client.request(Method::HEAD, url).send().await {
-            Ok(response) if response.status().as_u16() != 405 => return Ok(response),
-            Ok(_) => match client.request(Method::GET, url).send().await {
-                Ok(response) => return Ok(response),
-                Err(error) => last_error = Some(error),
-            },
-            Err(error) => last_error = Some(error),
-        }
-        if attempt == 0 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-
-    match client.request(Method::GET, url).send().await {
-        Ok(response) => Ok(response),
-        Err(error) => Err(last_error.unwrap_or(error)),
-    }
-}
-
-fn classify_reqwest_failure(error: &reqwest::Error) -> FailureStage {
-    let detail = error.to_string().to_ascii_lowercase();
-    if detail.contains("dns") || detail.contains("resolve") {
-        FailureStage::Dns
-    } else if detail.contains("tls")
-        || detail.contains("certificate")
-        || detail.contains("handshake")
-    {
-        FailureStage::Tls
-    } else if error.is_connect() {
-        FailureStage::Tcp
-    } else {
-        FailureStage::Http
+fn http_request(
+    target: &Target,
+    mode: protocol::HttpMode,
+    range: Option<String>,
+) -> protocol::HttpProbeRequest {
+    let allowed_final_hosts = reqwest::Url::parse(&target.value)
+        .ok()
+        .and_then(|url| url.host_str().map(base_domain))
+        .into_iter()
+        .collect();
+    protocol::HttpProbeRequest {
+        url: target.value.clone(),
+        allowed_statuses: target.allowed_statuses.clone(),
+        content_types: target.content_types.clone(),
+        markers: target.markers.clone(),
+        allowed_final_hosts,
+        mode,
+        range,
     }
 }
 
-fn reqwest_reason_code(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
-        "http_timeout"
-    } else if error.is_connect() {
-        "http_connect_failed"
-    } else if error.is_redirect() {
-        "http_redirect_failed"
-    } else if error.is_builder() {
-        "http_request_invalid"
-    } else {
-        "http_request_failed"
+fn base_domain(host: &str) -> String {
+    for suffix in [
+        "discord.com",
+        "discordapp.com",
+        "youtube.com",
+        "ytimg.com",
+        "googlevideo.com",
+        "cloudflare.com",
+        "cloudflare-quic.com",
+    ] {
+        if host.eq_ignore_ascii_case(suffix)
+            || host.to_ascii_lowercase().ends_with(&format!(".{suffix}"))
+        {
+            return suffix.into();
+        }
+    }
+    host.to_string()
+}
+
+fn result_from_http(target: Target, outcome: protocol::HttpProbeOutcome) -> TestTargetResult {
+    TestTargetResult {
+        target_id: target.id,
+        service: target.service,
+        label: target.name,
+        url: target.value,
+        ok: outcome.probe_status == ProbeStatus::Passed,
+        probe_status: outcome.probe_status,
+        context: ProbeContext::Preset,
+        change: ProbeChange::NotCompared,
+        failure_stage: outcome.failure_stage,
+        reason_code: outcome.reason_code,
+        weight: target.weight,
+        required: target.required,
+        diagnostic: target.diagnostic,
+        capability: target.capability,
+        steps: outcome.steps,
+        status: outcome.status,
+        latency_ms: Some(outcome.latency_ms),
+        final_url: outcome.final_url,
+        content_type: outcome.content_type,
+        negotiated_protocol: outcome.negotiated_protocol,
+        tls_version: outcome.tls_version,
+        alpn: outcome.alpn,
+        bytes_read: Some(outcome.bytes_read),
+        error: outcome.error,
+    }
+}
+
+fn result_from_simple(
+    target: Target,
+    outcome: service_probes::SimpleProbeOutcome,
+) -> TestTargetResult {
+    let negotiated_protocol = match target.capability {
+        ProbeCapability::Http3 if outcome.status == ProbeStatus::Passed => Some("HTTP/3".into()),
+        ProbeCapability::Websocket if outcome.status == ProbeStatus::Passed => {
+            Some("WebSocket".into())
+        }
+        _ => None,
+    };
+    let alpn = (target.capability == ProbeCapability::Http3
+        && outcome.status == ProbeStatus::Passed)
+        .then(|| "h3".into());
+    TestTargetResult {
+        target_id: target.id,
+        service: target.service,
+        label: target.name,
+        url: target.value,
+        ok: outcome.status == ProbeStatus::Passed,
+        probe_status: outcome.status,
+        context: ProbeContext::Preset,
+        change: ProbeChange::NotCompared,
+        failure_stage: outcome.failure_stage,
+        reason_code: outcome.reason_code,
+        weight: target.weight,
+        required: target.required,
+        diagnostic: target.diagnostic,
+        capability: target.capability,
+        steps: outcome.steps,
+        status: None,
+        latency_ms: Some(outcome.latency_ms),
+        final_url: None,
+        content_type: None,
+        negotiated_protocol,
+        tls_version: None,
+        alpn,
+        bytes_read: None,
+        error: outcome.error,
     }
 }
 
@@ -1007,6 +994,7 @@ fn startup_failure_target(preset_path: &str, error: String) -> TestTargetResult 
         status: None,
         latency_ms: None,
         error: Some(error),
+        ..Default::default()
     }
 }
 
@@ -1027,30 +1015,16 @@ fn runtime_process_failure_target(preset_path: &str) -> TestTargetResult {
     target
 }
 
-fn unavailable_http_target(target: Target, label: String, url: String) -> TestTargetResult {
-    TestTargetResult {
-        service: target.service,
-        label: format!("{} {label}", target.name),
-        url,
-        ok: false,
-        probe_status: ProbeStatus::Inconclusive,
-        context: ProbeContext::Preset,
-        change: ProbeChange::NotCompared,
-        failure_stage: Some(FailureStage::Internal),
-        reason_code: Some("http_client_unavailable".into()),
-        weight: target.weight,
-        required: target.required,
-        diagnostic: target.diagnostic,
-        status: None,
-        latency_ms: None,
-        error: Some("HTTP test client is unavailable".into()),
-    }
-}
-
 async fn check_dns_target(target: Target, resolver: String, host: String) -> TestTargetResult {
     let outcome = dns::probe(&resolver, &host).await;
     let ok = outcome.status == ProbeStatus::Passed;
+    let failure_stage = if target.probe_kind == manifest::ProbeKind::UdpDns {
+        FailureStage::Udp
+    } else {
+        FailureStage::Dns
+    };
     TestTargetResult {
+        target_id: target.id.clone(),
         service: target.service,
         label: format!("{} DNS", target.name),
         url: format!("DNS:{resolver}:{host}"),
@@ -1058,13 +1032,26 @@ async fn check_dns_target(target: Target, resolver: String, host: String) -> Tes
         probe_status: outcome.status,
         context: ProbeContext::Preset,
         change: ProbeChange::NotCompared,
-        failure_stage: (!ok).then_some(FailureStage::Dns),
+        failure_stage: (!ok).then_some(failure_stage),
         reason_code: outcome.reason_code,
         weight: target.weight,
         required: target.required,
         diagnostic: target.diagnostic,
+        capability: target.capability,
+        steps: vec![ProbeStepResult {
+            stage: failure_stage,
+            status: outcome.status,
+            latency_ms: Some(outcome.latency_ms),
+            detail: outcome.detail.clone(),
+        }],
         status: None,
         latency_ms: Some(outcome.latency_ms),
+        final_url: None,
+        content_type: None,
+        negotiated_protocol: None,
+        tls_version: None,
+        alpn: None,
+        bytes_read: None,
         error: (!ok).then_some(outcome.detail),
     }
 }
@@ -1088,6 +1075,7 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 TestTargetResult {
+                    target_id: target.id.clone(),
                     service: target.service,
                     label: format!("{} Ping", target.name),
                     url: host,
@@ -1104,6 +1092,22 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
                     weight: 0,
                     required: false,
                     diagnostic: true,
+                    capability: target.capability,
+                    steps: vec![ProbeStepResult {
+                        stage: FailureStage::Udp,
+                        status: if output.status.success() {
+                            ProbeStatus::Passed
+                        } else {
+                            ProbeStatus::Failed
+                        },
+                        latency_ms: parse_ping_average_ms(&stdout)
+                            .or_else(|| Some(started.elapsed().as_millis())),
+                        detail: if output.status.success() {
+                            "ICMP reply received".into()
+                        } else {
+                            "ICMP request failed".into()
+                        },
+                    }],
                     status: None,
                     latency_ms: parse_ping_average_ms(&stdout)
                         .or_else(|| Some(started.elapsed().as_millis())),
@@ -1114,9 +1118,11 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
                             first_non_empty_line(&stderr).unwrap_or_else(|| "Ping timeout".into())
                         }))
                     },
+                    ..Default::default()
                 }
             }
             Err(error) => TestTargetResult {
+                target_id: target.id.clone(),
                 service: target.service,
                 label: format!("{} Ping", target.name),
                 url: host,
@@ -1129,9 +1135,11 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
                 weight: 0,
                 required: false,
                 diagnostic: true,
+                capability: target.capability,
                 status: None,
                 latency_ms: Some(started.elapsed().as_millis()),
                 error: Some(error.to_string()),
+                ..Default::default()
             },
         }
     })
@@ -1152,6 +1160,7 @@ async fn check_ping_target(target: Target, host: String) -> TestTargetResult {
         status: None,
         latency_ms: None,
         error: Some(error.to_string()),
+        ..Default::default()
     })
 }
 
@@ -1175,11 +1184,133 @@ fn first_non_empty_line(text: &str) -> Option<String> {
 }
 
 fn test_targets() -> Vec<Target> {
-    load_custom_targets().unwrap_or_else(fallback_targets)
+    let mut targets = load_custom_targets().unwrap_or_else(fallback_targets);
+    targets.extend(configured_probe_targets());
+    targets
+}
+
+fn configured_probe_targets() -> Vec<Target> {
+    let Some(base) = option_env!("ZUI_PROBE_BASE_URL")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Ok(url) = reqwest::Url::parse(base) else {
+        return Vec::new();
+    };
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Vec::new();
+    }
+    let root = base.trim_end_matches('/');
+    let definitions = [
+        (
+            "zui-probe-json",
+            "Fixed JSON",
+            format!("{root}/json"),
+            manifest::ProbeKind::ControlledJson,
+            ProbeCapability::WebApi,
+            vec![200],
+            vec!["application/json".into()],
+            vec!["zui-probe-v1".into()],
+        ),
+        (
+            "zui-probe-redirect",
+            "Controlled redirect",
+            format!("{root}/redirect"),
+            manifest::ProbeKind::ControlledRedirect,
+            ProbeCapability::WebApi,
+            vec![200],
+            vec!["application/json".into()],
+            vec!["zui-probe-v1".into()],
+        ),
+        (
+            "zui-probe-range",
+            "Binary range",
+            format!("{root}/bytes"),
+            manifest::ProbeKind::ControlledRange,
+            ProbeCapability::CdnMedia,
+            vec![206],
+            vec!["application/octet-stream".into()],
+            Vec::new(),
+        ),
+        (
+            "zui-probe-websocket",
+            "WebSocket echo",
+            format!("{}/ws", root.replacen("https://", "wss://", 1)),
+            manifest::ProbeKind::WebsocketEcho,
+            ProbeCapability::Websocket,
+            vec![],
+            vec![],
+            vec![],
+        ),
+        (
+            "zui-probe-http1",
+            "Controlled HTTP/1.1",
+            format!("{root}/diagnostic"),
+            manifest::ProbeKind::Http1,
+            ProbeCapability::Transport,
+            vec![200],
+            vec!["application/json".into()],
+            vec!["zui-probe-v1".into()],
+        ),
+        (
+            "zui-probe-http2",
+            "Controlled HTTP/2",
+            format!("{root}/diagnostic"),
+            manifest::ProbeKind::Http2,
+            ProbeCapability::Transport,
+            vec![200],
+            vec!["application/json".into()],
+            vec!["zui-probe-v1".into()],
+        ),
+        (
+            "zui-probe-http3",
+            "Controlled QUIC / HTTP/3",
+            root.to_string(),
+            manifest::ProbeKind::QuicHttp3,
+            ProbeCapability::Http3,
+            vec![],
+            vec![],
+            vec![],
+        ),
+    ];
+    definitions
+        .into_iter()
+        .map(
+            |(
+                id,
+                name,
+                value,
+                probe_kind,
+                capability,
+                allowed_statuses,
+                content_types,
+                markers,
+            )| Target {
+                id: id.into(),
+                name: name.into(),
+                service: "ZUI Probe".into(),
+                value,
+                probe_kind,
+                capability,
+                weight: 0,
+                required: false,
+                diagnostic: true,
+                allowed_statuses,
+                content_types,
+                markers,
+            },
+        )
+        .collect()
 }
 
 pub fn default_target_configs() -> Vec<TestTargetConfig> {
     manifest::default_configs()
+}
+
+pub fn migrate_target_configs(configs: &[TestTargetConfig]) -> Vec<TestTargetConfig> {
+    manifest::migrate_configs(configs)
 }
 
 pub fn validate_target_configs(configs: &[TestTargetConfig]) -> Result<(), String> {
@@ -1194,12 +1325,28 @@ pub fn validate_target_configs(configs: &[TestTargetConfig]) -> Result<(), Strin
 
 fn load_custom_targets() -> Option<Vec<Target>> {
     let settings = settings::load_settings().ok()?;
-    let targets: Vec<Target> = settings
-        .test_targets
-        .iter()
-        .filter_map(target_from_config)
-        .collect();
-    (!settings.test_targets.is_empty()).then_some(targets)
+    if settings.test_targets.is_empty() {
+        return None;
+    }
+    let mut targets = fallback_targets();
+    for config in &settings.test_targets {
+        if let Some(definition) =
+            manifest::definition_for(&config.service, &config.name, &config.value)
+        {
+            targets.retain(|target| target.id != definition.id);
+            if let Some(target) = target_from_config(config) {
+                targets.push(target);
+            }
+            continue;
+        }
+        if manifest::is_legacy_builtin(&config.service, &config.name, &config.value) {
+            continue;
+        }
+        if let Some(target) = target_from_config(config) {
+            targets.push(target);
+        }
+    }
+    Some(targets)
 }
 
 fn target_from_config(config: &TestTargetConfig) -> Option<Target> {
@@ -1211,34 +1358,96 @@ fn target_from_config(config: &TestTargetConfig) -> Option<Target> {
     if manifest::validate_config(config).is_err() {
         return None;
     }
-    let kind = target_kind(value)?;
     let name = if config.name.trim().is_empty() {
         service
     } else {
         config.name.trim()
     };
     let definition = manifest::definition_for(service, name, value);
-    let (weight, required, diagnostic) = if let Some(definition) = definition {
-        (
-            definition.weight,
-            definition.required,
-            definition.diagnostic,
-        )
-    } else {
-        let (weight, diagnostic) = match &kind {
-            TargetKind::Ping(_) => (0, true),
-            TargetKind::Dns { .. } => (6, false),
-            TargetKind::Url(_) => (10, false),
-        };
-        (weight, false, diagnostic)
-    };
-    Some(Target {
-        name: name.into(),
-        service: service.into(),
-        kind,
+    let (
+        id,
+        probe_kind,
+        capability,
         weight,
         required,
         diagnostic,
+        allowed_statuses,
+        content_types,
+        markers,
+    ) = if let Some(definition) = definition {
+        (
+            definition.id.to_string(),
+            definition.kind,
+            definition.capability,
+            definition.weight,
+            definition.required,
+            definition.diagnostic,
+            definition.allowed_statuses.to_vec(),
+            definition
+                .content_types
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            definition
+                .markers
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        )
+    } else {
+        let (probe_kind, capability, weight, diagnostic) = if value
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("PING:"))
+        {
+            (
+                manifest::ProbeKind::Ping,
+                ProbeCapability::Transport,
+                0,
+                true,
+            )
+        } else if value
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("DNS:"))
+        {
+            (manifest::ProbeKind::Dns, ProbeCapability::Dns, 6, false)
+        } else if reqwest::Url::parse(value)
+            .ok()
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
+        {
+            (
+                manifest::ProbeKind::Http,
+                ProbeCapability::Generic,
+                10,
+                false,
+            )
+        } else {
+            return None;
+        };
+        (
+            format!("custom:{service}:{name}:{value}"),
+            probe_kind,
+            capability,
+            weight,
+            false,
+            diagnostic,
+            (200..=299).collect(),
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    Some(Target {
+        id,
+        name: name.into(),
+        service: service.into(),
+        value: value.into(),
+        probe_kind,
+        capability,
+        weight,
+        required,
+        diagnostic,
+        allowed_statuses,
+        content_types,
+        markers,
     })
 }
 
@@ -1247,38 +1456,6 @@ fn fallback_targets() -> Vec<Target> {
         .iter()
         .filter_map(target_from_config)
         .collect()
-}
-
-fn target_kind(value: &str) -> Option<TargetKind> {
-    let value = value.trim();
-    if value.len() >= 5 && value[..5].eq_ignore_ascii_case("PING:") {
-        let host = value[5..].trim();
-        if !host.is_empty() {
-            return Some(TargetKind::Ping(host.into()));
-        }
-    }
-    if value.len() >= 4 && value[..4].eq_ignore_ascii_case("DNS:") {
-        let (resolver, host) = manifest::parse_dns_target(value).ok()?;
-        if !resolver.trim().is_empty() && !host.trim().is_empty() {
-            return Some(TargetKind::Dns {
-                resolver: resolver.trim().into(),
-                host: host.trim().into(),
-            });
-        }
-    }
-    if reqwest::Url::parse(value)
-        .ok()
-        .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
-    {
-        return Some(TargetKind::Url(value.into()));
-    }
-    None
-}
-
-fn host_from_url(value: &str) -> Option<String> {
-    reqwest::Url::parse(value)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1299,7 +1476,7 @@ fn build_result(
     let summary = scoring::summarize(&services, process_ok);
 
     TestResult {
-        schema_version: 2,
+        schema_version: 3,
         id,
         preset_id,
         preset_name,
@@ -1352,15 +1529,7 @@ fn test_abort_reason(result: &TestResult) -> Option<&'static str> {
 }
 
 fn planned_check_count(targets: &[Target]) -> u32 {
-    let http_checks = http_check_clients().len().max(1) as u32;
-    targets
-        .iter()
-        .map(|target| match target.kind {
-            TargetKind::Url(_) => http_checks + 1,
-            TargetKind::Ping(_) => 1,
-            TargetKind::Dns { .. } => 1,
-        })
-        .sum()
+    targets.len() as u32
 }
 
 fn emit_progress(app: &AppHandle, progress: &TestProgress) {
@@ -1416,7 +1585,8 @@ mod tests {
     fn planned_checks_are_stable_for_default_targets() {
         let targets = fallback_targets();
         let total = planned_check_count(&targets);
-        assert!(total > targets.len() as u32);
+        assert_eq!(total, targets.len() as u32);
+        assert!(total >= 15);
         assert_eq!(total, planned_check_count(&targets));
     }
 
@@ -1432,7 +1602,7 @@ mod tests {
         }"#;
         let mut result: TestResult = serde_json::from_str(json).unwrap();
         assert!(migrate_result(&mut result));
-        assert_eq!(result.schema_version, 2);
+        assert_eq!(result.schema_version, 3);
         assert_eq!(
             result.services[0].targets[0].probe_status,
             ProbeStatus::Passed
@@ -1457,6 +1627,22 @@ mod tests {
         );
 
         assert_eq!(test_abort_reason(&result), Some(TEST_ABORT_PROCESS_EXITED));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live network access"]
+    async fn live_stage_two_targets_return_structured_results() {
+        for target in fallback_targets() {
+            let result = check_target(target).await;
+            println!(
+                "{} / {} = {:?} ({:?})",
+                result.service, result.label, result.probe_status, result.reason_code
+            );
+            assert!(!result.target_id.is_empty());
+            assert!(!result.label.is_empty());
+            assert!(!result.steps.is_empty());
+            assert!(result.bytes_read.unwrap_or_default() <= protocol::MAX_RESPONSE_BYTES as u64);
+        }
     }
 }
 

@@ -16,7 +16,8 @@ export const settings = writable<Settings>({
   autoStartActiveProfileOnLaunch: false,
   checkUpdatesOnLaunch: true,
   customPresetRoots: [],
-  testTargets: []
+  testTargets: [],
+  testTargetsSchema: 2
 });
 
 export async function loadSettings() {

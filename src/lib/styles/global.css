@@ -3574,6 +3574,47 @@ textarea {
   background: rgba(239, 91, 91, 0.08);
 }
 
+.capability-matrix {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 5px;
+}
+
+.capability-matrix > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 6px 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--tile);
+}
+
+.capability-matrix span,
+.capability-matrix strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.capability-matrix span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.capability-matrix strong {
+  color: var(--green);
+  font-size: 11px;
+}
+
+.capability-matrix .failed strong {
+  color: var(--red);
+}
+
+.capability-matrix .inconclusive strong {
+  color: var(--amber);
+}
+
 .target-row {
   display: grid;
   grid-template-columns: 54px minmax(0, 1fr);
@@ -3613,6 +3654,49 @@ textarea {
 .target-row small,
 .target-row em {
   min-width: 0;
+}
+
+.probe-steps {
+  display: grid;
+  gap: 3px;
+  margin-top: 3px;
+  padding-left: 7px;
+  border-left: 2px solid var(--line-soft);
+}
+
+.target-row .probe-steps > span {
+  width: auto;
+  min-width: 0;
+  height: auto;
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  place-items: initial;
+  gap: 6px;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.target-row .probe-steps strong {
+  color: var(--green);
+  font-size: 10px;
+}
+
+.target-row .probe-steps .failed strong {
+  color: var(--red);
+}
+
+.target-row .probe-steps .inconclusive strong {
+  color: var(--amber);
+}
+
+.target-row .probe-steps small {
+  overflow: visible;
+  text-overflow: initial;
+  white-space: normal;
 }
 
 .target-body {

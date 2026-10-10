@@ -74,7 +74,7 @@
   let reportOpen = $state(false);
   let reportText = $state("");
   let reportCopied = $state(false);
-  let appVersion = $state("2.2.3");
+  let appVersion = $state("2.2.4-network-test.2");
   let changingZapretEngine = $state(false);
   let engineTransition = $state<ZapretEngine | null>(null);
   let minimizeChoiceOpen = $state(false);

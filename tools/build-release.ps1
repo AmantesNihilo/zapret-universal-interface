@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.2.3",
+    [string]$Version = "2.2.4-network-test.2",
     [string]$TargetDir = "",
     [string]$OutputDir = "",
     [switch]$SkipMsi
@@ -101,6 +101,7 @@ $settings = @{
     checkUpdatesOnLaunch = $true
     customPresetRoots = @()
     testTargets = @()
+    testTargetsSchema = 2
 }
 
 [IO.File]::WriteAllText(

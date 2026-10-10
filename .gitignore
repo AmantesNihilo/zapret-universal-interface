@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+.wrangler/
 
 # Frontend build output
 /build/
@@ -39,3 +40,5 @@ Thumbs.db
 # Keep project/research notes local. README is the only public Markdown file.
 *.md
 !/README.md
+!/docs/*.md
+!/probe-worker/README.md

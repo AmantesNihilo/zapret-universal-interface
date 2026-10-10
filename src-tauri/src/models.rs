@@ -18,6 +18,8 @@ pub struct Settings {
     pub check_updates_on_launch: bool,
     pub custom_preset_roots: Vec<String>,
     pub test_targets: Vec<TestTargetConfig>,
+    #[serde(default = "missing_test_targets_schema")]
+    pub test_targets_schema: u8,
 }
 
 impl Default for Settings {
@@ -37,8 +39,13 @@ impl Default for Settings {
             check_updates_on_launch: true,
             custom_preset_roots: Vec::new(),
             test_targets: Vec::new(),
+            test_targets_schema: 2,
         }
     }
+}
+
+fn missing_test_targets_schema() -> u8 {
+    0
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -426,9 +433,11 @@ pub enum TestServiceStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestTargetResult {
+    #[serde(default)]
+    pub target_id: String,
     pub service: String,
     #[serde(default)]
     pub label: String,
@@ -450,9 +459,48 @@ pub struct TestTargetResult {
     pub required: bool,
     #[serde(default)]
     pub diagnostic: bool,
+    #[serde(default)]
+    pub capability: ProbeCapability,
+    #[serde(default)]
+    pub steps: Vec<ProbeStepResult>,
     pub status: Option<u16>,
     pub latency_ms: Option<u128>,
+    #[serde(default)]
+    pub final_url: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub negotiated_protocol: Option<String>,
+    #[serde(default)]
+    pub tls_version: Option<String>,
+    #[serde(default)]
+    pub alpn: Option<String>,
+    #[serde(default)]
+    pub bytes_read: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProbeCapability {
+    WebApi,
+    CdnMedia,
+    Websocket,
+    UdpVoice,
+    Http3,
+    Dns,
+    Transport,
+    #[default]
+    Generic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeStepResult {
+    pub stage: FailureStage,
+    pub status: ProbeStatus,
+    pub latency_ms: Option<u128>,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

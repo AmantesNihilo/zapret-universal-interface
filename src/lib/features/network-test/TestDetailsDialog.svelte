@@ -1,6 +1,6 @@
 <script lang="ts">
   import { X } from "@lucide/svelte";
-  import type { TestResult } from "$lib/api/types";
+  import type { ProbeCapability, ProbeStatus, TestResult, TestTargetResult } from "$lib/api/types";
   import { t } from "$lib/stores/i18n";
   import { settings } from "$lib/stores/settings";
   import { formatUnixTime } from "$lib/shared/lib/date";
@@ -13,22 +13,40 @@
     onClose: () => void;
   } = $props();
 
-  function targetKind(label: string) {
-    if (label.includes("TLS1.3")) return "TLS 1.3";
-    if (label.includes("TLS1.2")) return "TLS 1.2";
-    if (label.includes("HTTP1.1")) return "HTTP 1.1";
-    if (label.includes("Ping")) return "Ping";
-    if (label.includes("DNS")) return "DNS";
-    return $t("common.check");
+  function capabilityLabel(capability: ProbeCapability) {
+    const labels: Record<ProbeCapability, string> = {
+      webApi: $t("test.capabilityWebApi"),
+      cdnMedia: $t("test.capabilityCdnMedia"),
+      websocket: "WebSocket",
+      udpVoice: $t("test.capabilityUdpVoice"),
+      http3: "HTTP/3",
+      dns: "DNS",
+      transport: $t("test.capabilityTransport"),
+      generic: $t("common.check")
+    };
+    return labels[capability] ?? $t("common.check");
   }
 
-  function targetMeta(target: { label: string; status?: number | null; latencyMs?: number | null; failureStage?: string | null }) {
-    const parts = [targetKind(target.label)];
+  function targetMeta(target: TestTargetResult) {
+    const parts = [capabilityLabel(target.capability)];
     if (target.status) parts.push(`HTTP ${target.status}`);
+    if (target.negotiatedProtocol) parts.push(target.negotiatedProtocol);
+    if (target.tlsVersion) parts.push(target.tlsVersion);
+    if (target.alpn) parts.push(`ALPN ${target.alpn}`);
     if (target.latencyMs) parts.push(`${target.latencyMs} ms`);
     if (target.failureStage) parts.push(target.failureStage.toUpperCase());
     return parts.join(" / ");
   }
+
+  function capabilityStatus(targets: TestTargetResult[], capability: ProbeCapability): ProbeStatus | null {
+    const matching = targets.filter((target) => target.capability === capability);
+    if (matching.length === 0) return null;
+    if (matching.some((target) => target.probeStatus === "failed")) return "failed";
+    if (matching.some((target) => target.probeStatus === "inconclusive" || target.probeStatus === "cancelled")) return "inconclusive";
+    return "passed";
+  }
+
+  const matrixCapabilities: ProbeCapability[] = ["webApi", "cdnMedia", "websocket", "udpVoice", "http3", "transport"];
 
   function probeStatusLabel(status: string) {
     if (status === "passed") return $t("common.ok");
@@ -109,6 +127,17 @@
                 {service.ok}/{service.total}
               </span>
             </header>
+            <div class="capability-matrix" aria-label={$t("test.capabilityMatrix")}>
+              {#each matrixCapabilities as capability}
+                {@const status = capabilityStatus(service.targets, capability)}
+                {#if status}
+                  <div class:passed={status === "passed"} class:failed={status === "failed"} class:inconclusive={status === "inconclusive"}>
+                    <span>{capabilityLabel(capability)}</span>
+                    <strong>{probeStatusLabel(status)}</strong>
+                  </div>
+                {/if}
+              {/each}
+            </div>
             <div>
               {#each service.targets as target}
                 <div class:failed={target.probeStatus === "failed"} class:inconclusive={target.probeStatus === "inconclusive"} class="target-row">
@@ -116,11 +145,23 @@
                   <div class="target-body">
                     <div class="target-title-line">
                       <strong>{target.label || target.url}</strong>
-                      <small class="protocol-chip">{targetKind(target.label)}</small>
+                      <small class="protocol-chip">{capabilityLabel(target.capability)}</small>
                     </div>
                     <small>{target.url}</small>
+                    {#if target.finalUrl && target.finalUrl !== target.url}<small>{$t("test.finalUrl")}: {target.finalUrl}</small>{/if}
                     <small>{targetMeta(target)}</small>
+                    {#if target.contentType}<small>{target.contentType}{target.bytesRead ? ` · ${target.bytesRead} B` : ""}</small>{/if}
                     {#if changeLabel(target.change)}<small class:failed={target.change === "regressed"}>{changeLabel(target.change)}</small>{/if}
+                    {#if target.steps?.length}
+                      <div class="probe-steps">
+                        {#each target.steps as step}
+                          <span class:passed={step.status === "passed"} class:failed={step.status === "failed"} class:inconclusive={step.status === "inconclusive"}>
+                            <strong>{step.stage.toUpperCase()}</strong>
+                            <small>{step.detail}{step.latencyMs != null ? ` · ${step.latencyMs} ms` : ""}</small>
+                          </span>
+                        {/each}
+                      </div>
+                    {/if}
                   </div>
                   {#if target.error}
                     <em>{target.error}</em>

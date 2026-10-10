@@ -31,6 +31,22 @@ export type FailureStage =
   | "udp"
   | "resource"
   | "internal";
+export type ProbeCapability =
+  | "webApi"
+  | "cdnMedia"
+  | "websocket"
+  | "udpVoice"
+  | "http3"
+  | "dns"
+  | "transport"
+  | "generic";
+
+export type ProbeStepResult = {
+  stage: FailureStage;
+  status: ProbeStatus;
+  latencyMs?: number | null;
+  detail: string;
+};
 
 export type TestTargetConfig = {
   service: string;
@@ -54,6 +70,7 @@ export type Settings = {
   checkUpdatesOnLaunch: boolean;
   customPresetRoots: string[];
   testTargets: TestTargetConfig[];
+  testTargetsSchema: number;
 };
 
 export type Profile = {
@@ -147,6 +164,7 @@ export type LogLine = {
 };
 
 export type TestTargetResult = {
+  targetId: string;
   service: string;
   label: string;
   url: string;
@@ -159,8 +177,16 @@ export type TestTargetResult = {
   weight: number;
   required: boolean;
   diagnostic: boolean;
+  capability: ProbeCapability;
+  steps: ProbeStepResult[];
   status?: number | null;
   latencyMs?: number | null;
+  finalUrl?: string | null;
+  contentType?: string | null;
+  negotiatedProtocol?: string | null;
+  tlsVersion?: string | null;
+  alpn?: string | null;
+  bytesRead?: number | null;
   error?: string | null;
 };
 

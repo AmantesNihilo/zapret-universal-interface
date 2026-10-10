@@ -705,6 +705,12 @@ Object.assign(en, {
   "test.changeUnchangedAvailable": "Available before and after",
   "test.changeUnchangedBlocked": "Unavailable before and after",
   "test.changeRegressed": "Worked before preset, failed after",
+  "test.capabilityMatrix": "Service capabilities",
+  "test.capabilityWebApi": "Web / API",
+  "test.capabilityCdnMedia": "CDN / media",
+  "test.capabilityUdpVoice": "UDP / voice",
+  "test.capabilityTransport": "Transport",
+  "test.finalUrl": "Final URL",
   "test.editTargetsHint": "Enable standard probes or add custom HTTP, DNS:RESOLVER:HOST and PING targets.",
   "test.invalidTarget": "Enter a valid HTTP, HTTPS, DNS:RESOLVER:HOST or PING target"
 });
@@ -725,6 +731,12 @@ Object.assign(ru, {
   "test.changeUnchangedAvailable": "Доступно до и после",
   "test.changeUnchangedBlocked": "Недоступно до и после",
   "test.changeRegressed": "Работало до пресета, перестало после",
+  "test.capabilityMatrix": "Возможности сервиса",
+  "test.capabilityWebApi": "Web / API",
+  "test.capabilityCdnMedia": "CDN / медиа",
+  "test.capabilityUdpVoice": "UDP / голос",
+  "test.capabilityTransport": "Транспорт",
+  "test.finalUrl": "Конечный адрес",
   "test.editTargetsHint": "Включайте стандартные проверки или добавляйте HTTP, DNS:СЕРВЕР:ДОМЕН и PING-цели.",
   "test.invalidTarget": "Укажите корректную HTTP, HTTPS, DNS:СЕРВЕР:ДОМЕН или PING-цель"
 });
