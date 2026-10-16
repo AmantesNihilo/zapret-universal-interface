@@ -37,8 +37,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Keep project/research notes local. README is the only public Markdown file.
+# Public entry documentation only. Agent instructions and working notes stay local.
 *.md
 !/README.md
-!/docs/*.md
 !/probe-worker/README.md
+AGENTS.md
+/.local-docs/
+/.local-notes/
