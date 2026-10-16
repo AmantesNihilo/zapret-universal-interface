@@ -663,6 +663,10 @@ async fn tls_handshake(tcp: TcpStream, host: &str, mode: HttpMode) -> Result<Tls
 
 fn build_client(mode: HttpMode) -> Result<Client, reqwest::Error> {
     let builder = Client::builder()
+        // Network diagnostics must measure the same direct path as the explicit
+        // DNS/TCP/TLS stages. Inherited HTTP_PROXY variables would otherwise
+        // let a proxy mask blocking and make the recorded stages inconsistent.
+        .no_proxy()
         .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(4))
         .user_agent(concat!("ZUI/", env!("CARGO_PKG_VERSION")));
