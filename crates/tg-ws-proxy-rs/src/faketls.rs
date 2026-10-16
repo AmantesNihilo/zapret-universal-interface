@@ -237,7 +237,8 @@ pub fn parse_faketls_client_hello(record: &[u8], secret: &[u8]) -> Option<FakeTl
     if cipher_suites_len < 2 || body.len() < session_end + 2 + cipher_suites_len + 1 {
         return None;
     }
-    let cipher_suite = [body[session_end + 2], body[session_end + 3]];
+    let cipher_suite =
+        select_tls13_cipher_suite(&body[session_end + 2..session_end + 2 + cipher_suites_len]);
 
     let mut p = session_end + 2 + cipher_suites_len;
     let compression_len = *body.get(p)? as usize;
@@ -259,6 +260,16 @@ pub fn parse_faketls_client_hello(record: &[u8], secret: &[u8]) -> Option<FakeTl
         cipher_suite,
         hostname,
     })
+}
+
+/// Select the first real TLS 1.3 suite offered by the client. Telegram clients
+/// may put an RFC 8701 GREASE value first; echoing that value in ServerHello is
+/// invalid and makes the FakeTLS stream easy to distinguish or reject.
+fn select_tls13_cipher_suite(cipher_suites: &[u8]) -> [u8; 2] {
+    cipher_suites
+        .chunks_exact(2)
+        .find(|suite| suite[0] == 0x13 && (0x01..=0x03).contains(&suite[1]))
+        .map_or([0x13, 0x01], |suite| [suite[0], suite[1]])
 }
 
 fn parse_sni_extension(mut extensions: &[u8]) -> Option<String> {

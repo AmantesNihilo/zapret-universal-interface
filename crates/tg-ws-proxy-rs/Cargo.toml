@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-rs"
-version = "2.3.4-zui.2"
+version = "2.3.4-zui.3"
 edition = "2024"
 description = "ZUI-owned native Telegram bridge, synchronized with Flowseal/tg-ws-proxy"
 license = "MIT"

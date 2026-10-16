@@ -772,7 +772,7 @@ fn ensure_no_foreign_zapret_processes(state: &Mutex<RuntimeState>) -> Result<(),
     Ok(())
 }
 
-const ZAPRET2_ENGINE_VERSION: &str = "1.0.5";
+const ZAPRET2_ENGINE_VERSION: &str = "1.0.5.2";
 
 fn validate_zapret2_resources(root: &Path) -> Result<(), String> {
     for relative in [

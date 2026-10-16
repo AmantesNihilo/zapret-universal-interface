@@ -24,6 +24,24 @@ fn signed_client_hello_parses_hostname_and_auth() {
 }
 
 #[test]
+fn server_hello_skips_a_grease_cipher_suite() {
+    let secret = [0x2b; 16];
+    let mut hello = build_faketls_client_hello("www.yandex.ru");
+
+    // The generated ClientHello has a 32-byte session id, followed by the
+    // cipher-suite length and suite list. Replace its first TLS 1.3 suite with
+    // the GREASE value commonly placed first by modern Telegram clients.
+    let session_len = hello[43] as usize;
+    let suites_len_pos = 44 + session_len;
+    let suites_pos = suites_len_pos + 2;
+    hello[suites_pos..suites_pos + 2].copy_from_slice(&[0x0a, 0x0a]);
+    sign_faketls_client_hello(&mut hello, &secret);
+
+    let parsed = parse_faketls_client_hello(&hello, &secret).expect("valid FakeTLS hello");
+    assert_eq!(parsed.cipher_suite, [0x13, 0x02]);
+}
+
+#[test]
 fn signed_client_hello_rejects_wrong_secret() {
     // A real-looking ClientHello with the wrong HMAC must be rejected before
     // any MTProto bytes are accepted.

@@ -136,7 +136,7 @@ fn visit_classic_dir(root: &Path, dir: &Path, presets: &mut Vec<Preset>) -> Resu
                 .unwrap_or("Preset")
                 .to_string();
             presets.push(Preset {
-                id: stable_id(ZapretEngine::Classic, &path),
+                id: stable_id(ZapretEngine::Classic, &classic_identity_path(&path)),
                 name,
                 path: path.to_string_lossy().to_string(),
                 relative_path: relative,
@@ -323,6 +323,41 @@ fn stable_id(engine: ZapretEngine, path: &Path) -> String {
     format!("preset-{:x}", hasher.finish())
 }
 
+/// Keep bundled Flowseal preset IDs stable when only the upstream version
+/// directory changes.  Existing installations generated their IDs with
+/// `flowseal/1.10.2`, so that path remains the permanent identity namespace.
+/// The real path stored in `Preset::path` is left untouched.
+fn classic_identity_path(path: &Path) -> PathBuf {
+    let mut identity = PathBuf::new();
+    let mut after_flowseal = false;
+
+    for component in path.components() {
+        let value = component.as_os_str();
+        if after_flowseal {
+            let is_version = value.to_str().is_some_and(|value| {
+                !value.is_empty()
+                    && value.chars().all(|character| {
+                        character.is_ascii_digit() || matches!(character, '.' | '-' | '_')
+                    })
+            });
+            identity.push(if is_version {
+                std::ffi::OsStr::new("1.10.2")
+            } else {
+                value
+            });
+            after_flowseal = false;
+            continue;
+        }
+
+        identity.push(value);
+        after_flowseal = value
+            .to_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("flowseal"));
+    }
+
+    identity
+}
+
 fn same_path_loose(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .trim_end_matches(['\\', '/'])
@@ -332,6 +367,23 @@ fn same_path_loose(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_flowseal_ids_survive_version_directory_updates() {
+        let old = Path::new(r"C:\ZUI\resources\zapret\flowseal\1.10.2\general.bat");
+        let new = Path::new(r"C:\ZUI\resources\zapret\flowseal\1.10.3\general.bat");
+
+        assert_eq!(
+            stable_id(ZapretEngine::Classic, old),
+            stable_id(ZapretEngine::Classic, &classic_identity_path(new))
+        );
+    }
+
+    #[test]
+    fn custom_flowseal_directory_without_a_version_keeps_its_filename() {
+        let path = Path::new(r"C:\presets\flowseal\general.bat");
+        assert_eq!(classic_identity_path(path), path);
+    }
 
     #[test]
     fn discovers_presets_for_both_engines() {
