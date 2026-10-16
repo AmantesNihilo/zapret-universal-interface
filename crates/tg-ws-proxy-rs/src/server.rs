@@ -224,6 +224,12 @@ pub async fn run_with_listen(
         info!("  ⚠  TLS certificate verification DISABLED");
     }
 
+    info!(
+        "  CF outer TLS: {} | H2 media: {} (experimental)",
+        !config.cf_disable_tls,
+        config.h2 && !config.no_h2 && !config.cf_disable_tls
+    );
+
     if !config.cf_domains.is_empty() {
         info!("  Cloudflare proxy domain(s):");
         for d in &config.cf_domains {
@@ -362,12 +368,17 @@ pub async fn run_with_listen(
             pool_clone.run_maintenance(config_clone).await;
         });
     }
-    background.spawn(async {
+    let stats_runtime = runtime.clone();
+    background.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.tick().await;
         loop {
             interval.tick().await;
-            info!("stats: {}", STATS.summary());
+            info!(
+                "stats: {} | h2: {}",
+                STATS.summary(),
+                stats_runtime.h2.summary()
+            );
         }
     });
 
@@ -479,6 +490,8 @@ pub async fn run_with_listen(
     // deadline under load.
     clients.shutdown().await;
     background.shutdown().await;
+    pool.close().await;
+    runtime.h2.close().await;
 
     info!("proxy stopped; final stats: {}", STATS.summary());
     Ok(())

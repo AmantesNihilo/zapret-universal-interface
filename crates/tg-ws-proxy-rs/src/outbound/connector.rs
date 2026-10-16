@@ -49,6 +49,7 @@ impl std::error::Error for OutboundError {}
 pub struct OutboundConnector {
     config: OutboundConfig,
     socket_buffer_bytes: Option<usize>,
+    cf_disable_tls: bool,
 }
 
 impl OutboundConnector {
@@ -59,6 +60,7 @@ impl OutboundConnector {
                 no_proxy: None,
             },
             socket_buffer_bytes: None,
+            cf_disable_tls: false,
         }
     }
 
@@ -70,6 +72,7 @@ impl OutboundConnector {
         Ok(Self {
             config: OutboundConfig::from_sources(outbound_proxy, no_proxy, use_env)?,
             socket_buffer_bytes: None,
+            cf_disable_tls: false,
         })
     }
 
@@ -77,6 +80,15 @@ impl OutboundConnector {
     pub fn with_socket_buffer_size(mut self, bytes: usize) -> Self {
         self.socket_buffer_bytes = Some(bytes.max(4 * 1024));
         self
+    }
+
+    pub fn with_cf_disable_tls(mut self, disabled: bool) -> Self {
+        self.cf_disable_tls = disabled;
+        self
+    }
+
+    pub fn cf_disable_tls(&self) -> bool {
+        self.cf_disable_tls
     }
 
     pub fn summary(&self) -> Option<String> {

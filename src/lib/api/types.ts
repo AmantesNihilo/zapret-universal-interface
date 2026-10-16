@@ -93,6 +93,9 @@ export type Profile = {
   tgWsFrontingDomain?: string | null;
   tgWsCfPriority: boolean;
   tgWsCfBalance: boolean;
+  tgWsCfDisableTls: boolean;
+  tgWsDirectDcEnabled: boolean;
+  tgWsH2Enabled: boolean;
   tgWsBufKb: number;
   tgWsPoolSize: number;
   tgWsVerbose: boolean;

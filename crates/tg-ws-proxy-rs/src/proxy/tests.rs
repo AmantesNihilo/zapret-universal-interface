@@ -1,5 +1,171 @@
 use super::*;
 
+#[test]
+fn balancing_cf_refill_keeps_the_expanded_dc_hostname() {
+    let config = Config::try_from_args(["tg-ws-proxy", "--cf-balance"]).unwrap();
+    let runtime = Runtime::new(OutboundConnector::direct());
+    let pool = Arc::new(WsPool::new(1, Duration::from_secs(60)));
+    let route = Route {
+        label: "127.0.0.1:1".parse().unwrap(),
+        config: &config,
+        runtime: &runtime,
+        pool: &pool,
+        timeouts: Timeouts::from_config(&config),
+        dc: 2,
+        is_media: true,
+        media: "m",
+        dc_idx: -2,
+        proto: ProtoTag::PaddedIntermediate,
+        is_test: false,
+    };
+    let rotation = vec!["a.example".to_string(), "b.example".to_string()];
+    let counter = AtomicUsize::new(0);
+    assert_eq!(
+        route
+            .cf_target(
+                CfTier::Proxy,
+                "",
+                "kws2.original.example",
+                &rotation,
+                &counter
+            )
+            .domain,
+        "kws2.a.example"
+    );
+    assert_eq!(
+        route
+            .cf_target(
+                CfTier::Proxy,
+                "",
+                "kws2.original.example",
+                &rotation,
+                &counter
+            )
+            .domain,
+        "kws2.b.example"
+    );
+    assert_eq!(
+        route
+            .cf_target(CfTier::Worker, "", "worker.example", &rotation, &counter)
+            .domain,
+        "a.example"
+    );
+}
+
+#[tokio::test]
+async fn h2_native_bridge_roundtrips_fragmented_encrypted_packets_and_faketls() {
+    use crate::crypto::make_cipher;
+    use tokio::net::TcpListener;
+    for fake_tls in [false, true] {
+        for proto in [
+            ProtoTag::Abridged,
+            ProtoTag::Intermediate,
+            ProtoTag::PaddedIntermediate,
+        ] {
+            let (lane, upstream, _) =
+                crate::h2_transport::tests::server(200, None, None, false).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (reader, writer) = server.into_split();
+            let runtime = Arc::new(Runtime::new(crate::outbound::OutboundConnector::direct()));
+            let permit = runtime.h2.channels.clone().acquire_owned().await.unwrap();
+            let ciphers = ConnectionCiphers {
+                clt_dec: make_cipher(&[1; 32], &[2; 16]),
+                clt_enc: make_cipher(&[3; 32], &[4; 16]),
+                tg_enc: make_cipher(&[5; 32], &[6; 16]),
+                tg_dec: make_cipher(&[7; 32], &[8; 16]),
+            };
+            let bridge = tokio::spawn(bridge_h2(
+                if fake_tls {
+                    ClientReader::FakeTls {
+                        reader,
+                        pending: PendingData::default(),
+                    }
+                } else {
+                    ClientReader::Plain(reader)
+                },
+                if fake_tls {
+                    ClientWriter::FakeTls(writer)
+                } else {
+                    ClientWriter::Plain(writer)
+                },
+                lane,
+                ciphers,
+                proto,
+                runtime,
+                permit,
+            ));
+            let body = vec![1; 24 + 16 * 1024];
+            let mut wire = crate::native_packet::frame(proto, &body).unwrap();
+            make_cipher(&[1; 32], &[2; 16]).apply_keystream(&mut wire);
+            if fake_tls {
+                write_tls_appdata(&mut client, &wire).await.unwrap();
+            } else {
+                for chunk in wire.chunks(113) {
+                    client.write_all(chunk).await.unwrap();
+                }
+            }
+            let read = async {
+                if fake_tls {
+                    let mut buf = vec![0; 64 * 1024];
+                    let mut decoded = Vec::new();
+                    let mut dec = make_cipher(&[3; 32], &[4; 16]);
+                    loop {
+                        let n = read_tls_appdata(&mut client, &mut buf).await.unwrap();
+                        assert!(n > 0);
+                        dec.apply_keystream(&mut buf[..n]);
+                        decoded.extend_from_slice(&buf[..n]);
+                        let header = crate::native_packet::header_len(proto, decoded[0]);
+                        if decoded.len() >= header {
+                            let length =
+                                crate::native_packet::packet_len(proto, &decoded[..header])
+                                    .unwrap();
+                            if decoded.len() >= header + length {
+                                return crate::native_packet::unpad(
+                                    proto,
+                                    decoded[header..header + length].to_vec(),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    let mut prefix = [0; 4];
+                    let mut dec = make_cipher(&[3; 32], &[4; 16]);
+                    client.read_exact(&mut prefix[..1]).await.unwrap();
+                    dec.apply_keystream(&mut prefix[..1]);
+                    let n = crate::native_packet::header_len(proto, prefix[0]);
+                    client.read_exact(&mut prefix[1..n]).await.unwrap();
+                    dec.apply_keystream(&mut prefix[1..n]);
+                    let length = crate::native_packet::packet_len(proto, &prefix[..n]).unwrap();
+                    let mut data = vec![0; length];
+                    client.read_exact(&mut data).await.unwrap();
+                    dec.apply_keystream(&mut data);
+                    crate::native_packet::unpad(proto, data).unwrap()
+                }
+            };
+            let reply = tokio::time::timeout(Duration::from_secs(3), read)
+                .await
+                .unwrap();
+            assert_eq!(
+                reply.len(),
+                body.len(),
+                "fake_tls={fake_tls} proto={proto:?}"
+            );
+            assert!(reply.as_ref() == body);
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(3), bridge)
+                .await
+                .unwrap()
+                .unwrap();
+            upstream.abort();
+        }
+    }
+}
+
 use clap::Parser;
 
 use crate::crypto::HANDSHAKE_LEN;

@@ -7,6 +7,58 @@ use tokio_tungstenite::accept_hdr_async;
 
 use super::*;
 
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn cloudflare_plaintext_uses_port_80_and_preserves_websocket_framing() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = proxy.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = proxy.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let byte = socket.read_u8().await.unwrap();
+            request.push(byte);
+        }
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with("CONNECT kws2.example.test:80 "));
+        socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        let mut ws = accept_hdr_async(
+            MaybeTlsStream::Plain(socket),
+            |req: &tungstenite::handshake::server::Request,
+             mut response: tungstenite::handshake::server::Response| {
+                assert_eq!(req.uri().path(), "/apiws");
+                assert_eq!(req.headers()["host"], "kws2.example.test");
+                response
+                    .headers_mut()
+                    .insert("sec-websocket-protocol", HeaderValue::from_static("binary"));
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+        let data = ws_recv(&mut ws).await.unwrap();
+        ws_send(&mut ws, data).await.unwrap();
+    });
+    let connector =
+        OutboundConnector::from_config(Some(&format!("http://{address}")), Some(""), false)
+            .unwrap()
+            .with_cf_disable_tls(true);
+    let (ws, _, _) = connect_cf_ws_for_dc_with_outbound(
+        2,
+        &["example.test".into()],
+        false,
+        false,
+        Duration::from_secs(2),
+        &connector,
+    )
+    .await;
+    let mut ws = ws.expect("plaintext CF upgrade");
+    ws_send(&mut ws, b"payload".to_vec()).await.unwrap();
+    assert_eq!(ws_recv(&mut ws).await.unwrap(), b"payload");
+    task.await.unwrap();
+}
+
 fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }

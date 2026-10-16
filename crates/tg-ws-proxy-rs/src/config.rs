@@ -130,6 +130,9 @@ fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
 
 /// Parse a `DC:IP` pair such as `2:149.154.167.220`.
 fn parse_dc_ip(s: &str) -> Result<(u32, String), String> {
+    if s == "0:none" {
+        return Ok((0, String::new()));
+    }
     let (dc_s, ip_s) = s
         .split_once(':')
         .ok_or_else(|| format!("expected DC:IP, got {s:?}"))?;
@@ -185,8 +188,23 @@ pub struct Config {
     /// Target IP for a DC, e.g. `--dc-ip 2:149.154.167.220`.
     /// Can be specified multiple times.
     /// Default: DC 2 and DC 4 → 149.154.167.220
-    #[arg(long = "dc-ip", value_name = "DC:IP", value_parser = parse_dc_ip)]
+    #[arg(long = "dc-ip", value_name = "DC:IP", num_args = 0..=1, default_missing_value = "0:none", value_parser = parse_dc_ip)]
     pub dc_ip: Vec<(u32, String)>,
+
+    /// Explicitly disable direct WebSocket DC routes, including CLI defaults.
+    #[arg(long = "no-direct-dc")]
+    pub no_direct_dc: bool,
+
+    /// Use port 80 without outer TLS for Cloudflare Proxy and Worker only.
+    #[arg(long = "cf-disable-tls", alias = "no-secure")]
+    pub cf_disable_tls: bool,
+
+    /// Enable experimental HTTP/2 media transport through Cloudflare Proxy.
+    #[arg(long = "h2", conflicts_with = "no_h2")]
+    pub h2: bool,
+
+    #[arg(long = "no-h2")]
+    pub no_h2: bool,
 
     /// Socket send/recv buffer size in KiB.
     ///
@@ -669,7 +687,17 @@ impl Config {
         // domain is configured or --default-domains was requested (in which
         // case CF proxy becomes the primary path for all DCs without explicit
         // IPs, and the default dc_ip list would be misleading).
-        if self.dc_ip.is_empty() && self.cf_domains.is_empty() && !self.default_domains {
+        if self.dc_ip.iter().any(|(dc, _)| *dc == 0) {
+            self.no_direct_dc = true;
+        }
+        if self.no_direct_dc {
+            self.dc_ip.clear();
+        }
+        if !self.no_direct_dc
+            && self.dc_ip.is_empty()
+            && self.cf_domains.is_empty()
+            && !self.default_domains
+        {
             self.dc_ip = DEFAULT_DC_IP_TARGETS
                 .iter()
                 .map(|(dc, ip)| (*dc, ip.to_string()))
@@ -820,7 +848,11 @@ impl Config {
             self.no_proxy.as_deref(),
             !self.no_outbound_proxy,
         )
-        .map(|connector| connector.with_socket_buffer_size(self.buf_bytes()))
+        .map(|connector| {
+            connector
+                .with_socket_buffer_size(self.buf_bytes())
+                .with_cf_disable_tls(self.cf_disable_tls)
+        })
     }
 
     /// The address the TCP listener actually binds to.

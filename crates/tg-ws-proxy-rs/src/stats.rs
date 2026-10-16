@@ -20,6 +20,9 @@ pub struct Stats {
     pool_misses: AtomicU64,
     cf_pool_hits: AtomicU64,
     cf_pool_misses: AtomicU64,
+    tcp_skipped: AtomicU64,
+    tcp_errors: AtomicU64,
+    cf_plain: AtomicU64,
 }
 
 pub struct ActiveConnection;
@@ -53,6 +56,9 @@ impl Stats {
             pool_misses: AtomicU64::new(0),
             cf_pool_hits: AtomicU64::new(0),
             cf_pool_misses: AtomicU64::new(0),
+            tcp_skipped: AtomicU64::new(0),
+            tcp_errors: AtomicU64::new(0),
+            cf_plain: AtomicU64::new(0),
         }
     }
 
@@ -73,6 +79,9 @@ impl Stats {
             &self.pool_misses,
             &self.cf_pool_hits,
             &self.cf_pool_misses,
+            &self.tcp_skipped,
+            &self.tcp_errors,
+            &self.cf_plain,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -134,6 +143,16 @@ impl Stats {
         self.cf_pool_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn tcp_skipped(&self) {
+        self.tcp_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn tcp_error(&self) {
+        self.tcp_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn cf_plain(&self) {
+        self.cf_plain.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn summary(&self) -> String {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let pool_hits = load(&self.pool_hits);
@@ -149,7 +168,7 @@ impl Stats {
         };
 
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} tcp_skipped={} tcp_errors={} cf_plain={}",
             load(&self.connections_total),
             load(&self.connections_active),
             load(&self.connections_ws),
@@ -163,6 +182,9 @@ impl Stats {
             ratio(cf_pool_hits, cf_pool_total),
             human_bytes(load(&self.bytes_up)),
             human_bytes(load(&self.bytes_down)),
+            load(&self.tcp_skipped),
+            load(&self.tcp_errors),
+            load(&self.cf_plain),
         )
     }
 }
@@ -194,7 +216,7 @@ mod tests {
 
         assert_eq!(
             stats.summary(),
-            "total=0 active=0 ws=0 tcp_fb=0 cf=0 front=0 bad=0 masked=0 err=0 pool=1/1 cf_pool=n/a up=2.0 KiB down=1.0 KiB"
+            "total=0 active=0 ws=0 tcp_fb=0 cf=0 front=0 bad=0 masked=0 err=0 pool=1/1 cf_pool=n/a up=2.0 KiB down=1.0 KiB tcp_skipped=0 tcp_errors=0 cf_plain=0"
         );
     }
 }

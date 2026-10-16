@@ -118,6 +118,8 @@ type PoolMap = HashMap<PoolKey, Bucket>;
 
 pub struct WsPool {
     pool_size: usize,
+    closed: std::sync::atomic::AtomicBool,
+    tasks: StdMutex<tokio::task::JoinSet<()>>,
     /// Maximum age for a pooled connection.  Connections older than this are
     /// discarded on next use rather than handed to a client.
     max_age: Duration,
@@ -166,6 +168,8 @@ impl WsPool {
     pub fn with_runtime(pool_size: usize, max_age: Duration, runtime: Arc<Runtime>) -> Self {
         Self {
             pool_size,
+            closed: std::sync::atomic::AtomicBool::new(false),
+            tasks: StdMutex::new(tokio::task::JoinSet::new()),
             max_age,
             runtime,
             idle: Mutex::new(HashMap::new()),
@@ -327,7 +331,7 @@ impl WsPool {
         #[cfg(test)]
         self.cf_refill_task_spawns.fetch_add(1, Ordering::Relaxed);
 
-        tokio::spawn(async move {
+        self.spawn_refill(async move {
             pool.cf_refill_reserved(target).await;
         });
     }
@@ -428,13 +432,35 @@ impl WsPool {
         let target_ip = target_ip.to_string();
         #[cfg(test)]
         self.refill_task_spawns.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
+        self.spawn_refill(async move {
             pool.refill_reserved(dc, is_media, target_ip, skip_tls)
                 .await;
         });
     }
 
+    fn spawn_refill(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        if !self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            tasks.spawn(task);
+        }
+    }
+
+    pub async fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        tasks.shutdown().await;
+        self.idle.lock().await.clear();
+        self.cf_idle.lock().await.clear();
+        self.refilling.lock().unwrap().clear();
+        self.cf_refilling.lock().unwrap().clear();
+    }
+
     fn reserve_refill(&self, key: PoolKey) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         let now = Instant::now();
         let mut refill_after = self.refill_after.lock().unwrap();
         if refill_after.get(&key).is_some_and(|after| now < *after) {
@@ -446,6 +472,9 @@ impl WsPool {
     }
 
     fn reserve_cf_refill(&self, key: CfKey) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         self.cf_refilling.lock().unwrap().insert(key)
     }
 

@@ -106,11 +106,17 @@
 
   <fieldset disabled={locked}>
     <legend>{$t("tg.dcRoutes")}</legend>
+    <label class="switch-row">
+      <input type="checkbox" checked={profile.tgWsDirectDcEnabled} disabled={locked}
+        onchange={(event) => onUpdate({ tgWsDirectDcEnabled: event.currentTarget.checked })} />
+      {$t("tg.directEnabled")}
+    </label>
     <label>
       {$t("tg.dcRoutesHint")}
       <textarea
         rows="4"
         spellcheck="false"
+        disabled={locked || !profile.tgWsDirectDcEnabled}
         value={profile.tgWsDcIps.join("\n")}
         oninput={(event) => onUpdate({ tgWsDcIps: splitLines(event.currentTarget.value) })}
       ></textarea>
@@ -236,6 +242,19 @@
       <span><ChevronDown class="summary-chevron" size={16} /> {$t("tg.advancedRouting")}</span>
     </summary>
     <div class="advanced-content">
+      <label class="switch-row">
+        <input type="checkbox" checked={profile.tgWsCfDisableTls}
+          disabled={locked || (!profile.tgWsCfProxyEnabled && !profile.tgWsCfWorkerEnabled)}
+          onchange={(event) => onUpdate({ tgWsCfDisableTls: event.currentTarget.checked })} />
+        {$t("tg.cfDisableTls")}
+      </label>
+      <small class="field-hint">{$t("tg.cfDisableTlsHint")}</small>
+      <label class="switch-row">
+        <input type="checkbox" checked={profile.tgWsH2Enabled} disabled={locked || !profile.tgWsCfProxyEnabled || profile.tgWsCfDisableTls}
+          onchange={(event) => onUpdate({ tgWsH2Enabled: event.currentTarget.checked })} />
+        {$t("tg.h2Enabled")}
+      </label>
+      <small class="field-hint">{$t("tg.h2Hint")}</small>
       <label>
         {$t("tg.frontingDomain")}
         <input

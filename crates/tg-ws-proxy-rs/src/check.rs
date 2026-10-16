@@ -147,7 +147,10 @@ pub async fn probe_cf_domain_all_dcs(
     let probes = TELEGRAM_TEST_DCS.into_iter().map(|dc| {
         let domain = domain.clone();
         async move {
-            let target = format!("kws{dc}.{domain}:443/apiws");
+            let target = format!(
+                "kws{dc}.{domain}:{}/apiws",
+                if outbound.cf_disable_tls() { 80 } else { 443 }
+            );
             let status = probe_cf_domain_status(&domain, dc, skip_tls, timeout, outbound).await;
             ConnectivityProbeResult::from_status(dc, target, status)
         }

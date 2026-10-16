@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.2.4-network-test.3",
+    [string]$Version = "2.2.4-network-test.5",
     [string]$TargetDir = "",
     [string]$OutputDir = "",
     [switch]$SkipMsi
@@ -38,6 +38,12 @@ $stageResources = Join-Path $stage "resources"
 New-Item -ItemType Directory -Path $stageResources | Out-Null
 Copy-Item -LiteralPath (Join-Path $root "resources\zapret") -Destination (Join-Path $stageResources "zapret") -Recurse
 Copy-Item -LiteralPath (Join-Path $root "resources\zapret2") -Destination (Join-Path $stageResources "zapret2") -Recurse
+foreach ($note in @("MANUAL_TEST_TG_WS_UPSTREAM.md", "TG_WS_UPSTREAM_1_11_2.md")) {
+    $notePath = Join-Path $root "docs\$note"
+    if (Test-Path -LiteralPath $notePath) {
+        Copy-Item -LiteralPath $notePath -Destination (Join-Path $stage $note)
+    }
+}
 New-Item -ItemType File -Path (Join-Path $stage "portable.flag") | Out-Null
 
 $data = Join-Path $stage "data"
@@ -75,6 +81,9 @@ $profiles = @{
             tgWsFrontingDomain = "sprinthost.ru"
             tgWsCfPriority = $false
             tgWsCfBalance = $false
+            tgWsCfDisableTls = $false
+            tgWsDirectDcEnabled = $true
+            tgWsH2Enabled = $false
             tgWsBufKb = 256
             tgWsPoolSize = 4
             tgWsVerbose = $false

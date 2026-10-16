@@ -395,7 +395,7 @@ pub fn configuration_summary(profile: &Profile) -> Result<String, String> {
         config.cf_worker_domains().join(",")
     };
     Ok(format!(
-        "listen={}:{}, dc_routes={}, cf_proxy={}, cf_workers={}, fronting={}, priority={}, balance={}, pool_size={}, socket_buffer_kib={}, force_test_dc={}, verbose={}",
+        "listen={}:{}, dc_routes={}, cf_proxy={}, cf_workers={}, fronting={}, priority={}, balance={}, pool_size={}, h2_media={}, cf_outer_tls={}, socket_buffer_kib={}, force_test_dc={}, verbose={}",
         config.bind_host(),
         config.port,
         config
@@ -410,6 +410,8 @@ pub fn configuration_summary(profile: &Profile) -> Result<String, String> {
         config.cf_priority,
         config.cf_balance,
         config.pool_size,
+        config.h2 && !config.no_h2 && !config.cf_disable_tls,
+        !config.cf_disable_tls,
         config.buf_kb,
         config.force_test_dc,
         config.verbose,
@@ -449,7 +451,11 @@ pub(crate) fn config_from_profile(profile: &Profile) -> Result<Config, String> {
         .filter(|domain| !domain.is_empty())
         .map(str::to_string);
 
-    let dc_ip = parse_dc_ip_list(&profile.tg_ws_dc_ips)?;
+    let dc_ip = if profile.tg_ws_direct_dc_enabled {
+        parse_dc_ip_list(&profile.tg_ws_dc_ips)?
+    } else {
+        Vec::new()
+    };
 
     let mut args = vec![
         "tg-ws-proxy".to_string(),
@@ -467,6 +473,15 @@ pub(crate) fn config_from_profile(profile: &Profile) -> Result<Config, String> {
         advertised_link_host(&profile.tg_ws_host),
         "--no-outbound-proxy".to_string(),
     ];
+    if !profile.tg_ws_direct_dc_enabled || dc_ip.is_empty() {
+        args.push("--no-direct-dc".to_string());
+    }
+    if profile.tg_ws_cf_disable_tls {
+        args.push("--cf-disable-tls".to_string());
+    }
+    if profile.tg_ws_h2_enabled && profile.tg_ws_cf_proxy_enabled {
+        args.push("--h2".to_string());
+    }
     for (dc, ip) in dc_ip {
         args.push("--dc-ip".to_string());
         args.push(format!("{dc}:{ip}"));
@@ -701,6 +716,29 @@ fn is_valid_tg_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_upstream_modes_follow_profile_and_empty_routes_stay_empty() {
+        let profile = Profile {
+            tg_ws_dc_ips: Vec::new(),
+            tg_ws_cf_proxy_enabled: false,
+            ..Profile::default()
+        };
+        let config = config_from_profile(&profile).unwrap();
+        assert!(config.dc_ip.is_empty());
+        assert!(config.no_direct_dc);
+        let profile = Profile {
+            tg_ws_direct_dc_enabled: false,
+            tg_ws_dc_ips: vec!["invalid disabled route".into()],
+            tg_ws_h2_enabled: true,
+            tg_ws_cf_disable_tls: true,
+            ..Profile::default()
+        };
+        let config = config_from_profile(&profile).unwrap();
+        assert!(config.dc_ip.is_empty());
+        assert!(config.h2);
+        assert!(config.cf_disable_tls);
+    }
 
     #[test]
     fn keeps_valid_hex_secret() {

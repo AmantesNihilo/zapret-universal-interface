@@ -228,6 +228,147 @@ enum ClientReader {
     },
 }
 
+/// Each direction runs in a tracked task so cancellation drops every cipher,
+/// packet budget and HTTP stream before the native channel is released.
+async fn bridge_h2(
+    mut reader: ClientReader,
+    mut writer: ClientWriter,
+    lane: Arc<crate::h2_transport::Lane>,
+    ciphers: ConnectionCiphers,
+    proto: ProtoTag,
+    runtime: Arc<Runtime>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    use crate::{cf_h2, native_packet};
+    let ConnectionCiphers {
+        mut clt_dec,
+        mut clt_enc,
+        ..
+    } = ciphers;
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(2);
+    let mut tasks = tokio::task::JoinSet::new();
+    let pool = runtime.h2.clone();
+    tasks.spawn(async move {
+        cf_h2::run(pool, lane, input_rx, output_tx).await;
+    });
+    let input_global = runtime.h2.input_bytes.clone();
+    tasks.spawn(async move {
+        async fn decrypted(
+            reader: &mut ClientReader,
+            cipher: &mut AesCtr256,
+            buf: &mut [u8],
+        ) -> Result<(), String> {
+            let mut offset = 0;
+            while offset < buf.len() {
+                let n = reader
+                    .read(&mut buf[offset..])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("native client closed".into());
+                }
+                offset += n;
+            }
+            cipher.apply_keystream(buf);
+            Ok(())
+        }
+        let budget = cf_h2::channel_budget();
+        loop {
+            let mut header = [0u8; 4];
+            if decrypted(&mut reader, &mut clt_dec, &mut header[..1])
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let n = native_packet::header_len(proto, header[0]);
+            if n > 1
+                && decrypted(&mut reader, &mut clt_dec, &mut header[1..n])
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+            let Ok(length) = native_packet::packet_len(proto, &header[..n]) else {
+                break;
+            };
+            // Reserve space before allocating or reading the native body.
+            let Ok(global) = input_global.clone().acquire_many_owned(length as u32).await else {
+                break;
+            };
+            let Ok(channel) = budget.clone().acquire_many_owned(length as u32).await else {
+                break;
+            };
+            let mut body = vec![0; length];
+            if decrypted(&mut reader, &mut clt_dec, &mut body)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let Ok(body) = native_packet::unpad(proto, body) else {
+                break;
+            };
+            let n = body.len();
+            if input_tx
+                .send(cf_h2::Packet {
+                    body,
+                    receiving: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    _global: global,
+                    _channel: channel,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            STATS.traffic(n as u64, 0);
+        }
+    });
+    while let Some(result) = output_rx.recv().await {
+        let (body, terminal, _reply) = match result {
+            Ok(reply) => (reply.body.clone(), false, Some(reply)),
+            Err(crate::h2_transport::H2Error::Transport(code)) => (
+                bytes::Bytes::copy_from_slice(&code.to_le_bytes()),
+                true,
+                None,
+            ),
+            Err(error) => {
+                warn!("H2 native channel closed: {}", error);
+                break;
+            }
+        };
+        let Ok((mut header, padding)) = native_packet::frame_header(proto, body.len()) else {
+            break;
+        };
+        let write = async {
+            clt_enc.apply_keystream(&mut header);
+            writer.write_all(&header).await?;
+            let mut buffer = vec![0; 32 * 1024];
+            for chunk in body.chunks(buffer.len()) {
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                clt_enc.apply_keystream(&mut buffer[..chunk.len()]);
+                writer.write_all(&buffer[..chunk.len()]).await?;
+            }
+            let mut tail: Vec<u8> = (0..padding).map(|_| rand::random()).collect();
+            clt_enc.apply_keystream(&mut tail);
+            writer.write_all(&tail).await
+        };
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(15), write).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+        STATS.traffic(0, body.len() as u64);
+        if terminal {
+            break;
+        }
+    }
+    tasks.shutdown().await;
+}
+
 #[derive(Default)]
 struct PendingData {
     data: Vec<u8>,
@@ -265,7 +406,16 @@ impl ClientReader {
                     return Ok(n);
                 }
 
-                read_tls_appdata(reader, buf).await
+                // Native H2 framing reads small headers; preserve the rest of
+                // a FakeTLS record instead of rejecting it for a short buffer.
+                let mut record = vec![0; TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM];
+                let n = read_tls_appdata(reader, &mut record).await?;
+                if n == 0 {
+                    return Ok(0);
+                }
+                record.truncate(n);
+                *pending = PendingData::from_record(record, 0);
+                Ok(pending.read(buf).unwrap_or(0))
             }
         }
     }
@@ -682,6 +832,10 @@ async fn select_bridge(
 // connect path for one move per connection.
 #[allow(clippy::large_enum_variant)]
 enum Upstream {
+    H2 {
+        lane: Arc<crate::h2_transport::Lane>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
     /// A WebSocket to Telegram — direct, via the Cloudflare proxy, or through
     /// a Cloudflare Worker tunnel.  See [`WsFraming`] for why the two are not
     /// interchangeable once bridged.
@@ -727,6 +881,9 @@ fn bridge_selected(
     } = params;
 
     match upstream {
+        Upstream::H2 { lane, permit } => Box::pin(bridge_h2(
+            reader, writer, lane, ciphers, proto, runtime, permit,
+        )),
         Upstream::Ws { ws, framing } => Box::pin(bridge_ws(
             reader,
             writer,
@@ -830,6 +987,9 @@ struct Route<'a> {
 /// Without it the direct WebSocket path is skipped entirely and the Python
 /// reference's order is used (Worker, CF proxy, upstream proxies, then TCP).
 async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<Upstream> {
+    if let Some(upstream) = route.h2_media().await {
+        return Some(upstream);
+    }
     if route.is_test {
         let target_ip = target_ip?;
         if let Some(ws) = route.direct_ws(target_ip).await {
@@ -1001,13 +1161,31 @@ impl Route<'_> {
         self.upstream_proxies(reason).await.map(Upstream::Mtproto)
     }
 
-    /// Both Cloudflare tiers in upstream's order: Worker tunnel first, then
-    /// the Cloudflare proxy.
-    ///
-    /// Kept as one step so `--cf-priority` and the post-failure fallback walk
-    /// the identical ladder — a Worker-only setup used to sit out
-    /// `--cf-priority` entirely and pay the full direct-WS timeout on every
-    /// connection before reaching its only working path.
+    /// H2 precedes the existing routing ladder for eligible media channels.
+    async fn h2_media(&self) -> Option<Upstream> {
+        if self.config.h2
+            && !self.config.no_h2
+            && !self.config.cf_disable_tls
+            && self.is_media
+            && !self.is_test
+        {
+            let pool = &self.runtime.h2;
+            if let Ok(permit) = pool.channels.clone().try_acquire_owned() {
+                let domains = self.runtime.cf_domains();
+                let first = balance_offset(&domains, self.config.cf_balance, &CF_BALANCE_COUNTER);
+                if let Some(lane) = pool
+                    .open(self.dc, &domains, first, self.runtime.outbound())
+                    .await
+                {
+                    info!("[{}] DC{} media -> H2 CF proxy", self.label, self.dc);
+                    return Some(Upstream::H2 { lane, permit });
+                }
+            }
+        }
+        None
+    }
+
+    /// Worker tunnel first, followed by the CF WebSocket proxy.
     async fn cf_tiers(&self, dst: &str, reason: &str) -> Option<Upstream> {
         if let Some(ws) = self.cf_worker(dst, reason).await {
             return Some(Upstream::Ws {
@@ -1046,11 +1224,14 @@ impl Route<'_> {
         rotation: &[String],
         counter: &AtomicUsize,
     ) -> CfTarget {
-        let domain = if self.config.cf_balance {
-            domain_order(rotation, balance_offset(rotation, true, counter))
+        let domain = if self.config.cf_balance && !rotation.is_empty() {
+            let selected = domain_order(rotation, balance_offset(rotation, true, counter))
                 .next()
-                .unwrap_or(domain)
-                .to_string()
+                .unwrap_or(domain);
+            match tier {
+                CfTier::Proxy => format!("kws{}.{}", self.dc, selected),
+                CfTier::Worker => selected.to_string(),
+            }
         } else {
             domain.to_string()
         };
@@ -1301,6 +1482,9 @@ impl Route<'_> {
     /// Open a fresh direct WebSocket to `target_ip`, applying the
     /// domain-fronting fallback and the per-DC cooldown on failure.
     async fn direct_ws(&self, target_ip: &str) -> Option<TgWsStream> {
+        let _singleflight = self
+            .runtime
+            .direct_attempt(self.dc, self.is_media, self.is_test)?;
         // While the domain-fronting fallback is in its sticky window, skip
         // straight to a fronted attempt instead of the normal per-domain
         // loop — matching upstream's "stay fronted while it keeps working"
@@ -1948,23 +2132,31 @@ async fn bridge_tcp(
         runtime,
     } = params;
 
+    let Some(mut attempt) = runtime.tcp_backoff.enter(&format!("{dst}:443")) else {
+        STATS.tcp_skipped();
+        debug!("[{}] TCP fallback skipped (backoff or connecting)", label);
+        return;
+    };
     let remote = match runtime.outbound().connect(dst, 443, connect_timeout).await {
         Ok(s) => s,
         Err(e) => {
+            STATS.tcp_error();
             warn!("[{}] TCP fallback connect failed: {}", label, e);
             return;
         }
     };
-    STATS.tcp_fallback();
-
     let _ = remote.set_nodelay(true);
     let (mut rem_reader, mut rem_writer) = remote.into_split();
 
     // Send relay init to the remote Telegram server.
     if let Err(e) = rem_writer.write_all(relay_init).await {
+        STATS.tcp_error();
         warn!("[{}] TCP fallback: send relay init failed: {}", label, e);
         return;
     }
+    attempt.success();
+    drop(attempt);
+    STATS.tcp_fallback();
 
     let ConnectionCiphers {
         mut clt_dec,

@@ -1,5 +1,28 @@
 use super::*;
 
+#[tokio::test]
+async fn close_cancels_inflight_refills_and_prevents_restarting_them() {
+    let pool = Arc::new(WsPool::new(4, Duration::from_secs(60)));
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let flag = DropFlag(dropped.clone());
+    pool.spawn_refill(async move {
+        let _flag = flag;
+        std::future::pending::<()>().await;
+    });
+    tokio::task::yield_now().await;
+    pool.close().await;
+    assert!(dropped.load(Ordering::Relaxed));
+    assert!(!pool.reserve_refill((2, false)));
+    assert!(!pool.reserve_cf_refill((CfTier::Worker, 2, false)));
+    assert!(pool.tasks.lock().unwrap().is_empty());
+}
+
 #[test]
 fn direct_refill_is_reserved_before_a_task_can_be_spawned() {
     let pool = WsPool::new(4, Duration::from_secs(60));

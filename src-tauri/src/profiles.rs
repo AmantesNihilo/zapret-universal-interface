@@ -144,6 +144,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_profile_keeps_existing_routes_and_new_modes_are_opt_in() {
+        let profile:Profile=serde_json::from_str(r#"{"id":"old","tgWsDcIps":["4:149.154.167.220"],"tgWsSecret":"00112233445566778899aabbccddeeff"}"#).unwrap();
+        assert!(profile.tg_ws_direct_dc_enabled);
+        assert!(!profile.tg_ws_h2_enabled);
+        assert!(!profile.tg_ws_cf_disable_tls);
+        assert_eq!(profile.tg_ws_dc_ips, vec!["4:149.154.167.220"]);
+        let roundtrip: Profile =
+            serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap();
+        assert_eq!(roundtrip.tg_ws_secret, profile.tg_ws_secret);
+    }
+
+    #[test]
     fn empty_legacy_secret_is_generated_once() {
         let mut profile = Profile {
             tg_ws_secret: String::new(),

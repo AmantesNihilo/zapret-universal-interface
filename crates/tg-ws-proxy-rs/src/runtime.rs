@@ -16,6 +16,11 @@ const DEFAULT_FRONTING_COOLDOWN: Duration = Duration::from_secs(1800);
 
 pub struct Runtime {
     outbound: OutboundConnector,
+    pub h2: std::sync::Arc<crate::cf_h2::Pool>,
+    pub tcp_backoff: std::sync::Arc<crate::connect_gate::Backoff>,
+    direct_attempts: StdMutex<
+        std::collections::HashMap<(u32, bool, bool), std::sync::Arc<tokio::sync::Semaphore>>,
+    >,
     /// Live Cloudflare proxy pool. Unlike the immutable CLI configuration,
     /// this can be refreshed while the server is running.
     cf_domains: RwLock<std::sync::Arc<Vec<String>>>,
@@ -34,6 +39,9 @@ impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
             outbound,
+            h2: std::sync::Arc::new(crate::cf_h2::Pool::default()),
+            tcp_backoff: std::sync::Arc::new(crate::connect_gate::Backoff::default()),
+            direct_attempts: StdMutex::new(std::collections::HashMap::new()),
             cf_domains: RwLock::new(std::sync::Arc::new(Vec::new())),
             fronting_domain: None,
             fronting_cooldown: DEFAULT_FRONTING_COOLDOWN,
@@ -46,6 +54,22 @@ impl Runtime {
         self.fronting_domain = domain;
         self.fronting_cooldown = cooldown;
         self
+    }
+
+    pub fn direct_attempt(
+        &self,
+        dc: u32,
+        media: bool,
+        test: bool,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.direct_attempts
+            .lock()
+            .unwrap()
+            .entry((dc, media, test))
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
 
     pub fn outbound(&self) -> &OutboundConnector {

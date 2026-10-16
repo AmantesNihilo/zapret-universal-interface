@@ -11,22 +11,19 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// Build a `rustls` `ClientConfig` using the bundled WebPKI root store.
-fn build_tls_config() -> rustls::ClientConfig {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
-}
-
 /// Perform an HTTPS GET and return the response body as a `String`.
 pub(super) async fn https_get(
     host: &str,
     path: &str,
     outbound: &OutboundConnector,
 ) -> Result<String, String> {
-    https_get_with_tls_config(host, path, outbound, Arc::new(build_tls_config())).await
+    https_get_with_tls_config(
+        host,
+        path,
+        outbound,
+        crate::ws_client::verifying_rustls_config(),
+    )
+    .await
 }
 
 async fn https_get_with_tls_config(

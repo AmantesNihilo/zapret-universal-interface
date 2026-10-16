@@ -179,6 +179,7 @@ pub async fn connect_ws_with_outbound(
         timeout,
         outbound,
         sni_override,
+        false,
     )
     .await
 }
@@ -203,9 +204,13 @@ async fn connect_ws_with_path(
     timeout: Duration,
     outbound: &OutboundConnector,
     sni_override: Option<&str>,
+    disable_tls: bool,
 ) -> WsConnectResult {
     // ── TCP connection to the configured IP ──────────────────────────────
-    let tcp = match outbound.connect(ip, 443, timeout).await {
+    let tcp = match outbound
+        .connect(ip, if disable_tls { 80 } else { 443 }, timeout)
+        .await
+    {
         Ok(s) => s,
         Err(e) if e.timed_out => return WsConnectResult::ConnectTimedOut(e.reason),
         Err(e) => return WsConnectResult::Failed(e.reason),
@@ -215,7 +220,8 @@ async fn connect_ws_with_path(
     let _ = tcp.set_nodelay(true);
 
     // ── Build WebSocket request with Telegram-required headers ───────────
-    let url = format!("wss://{}{}", domain, path);
+    let scheme = if disable_tls { "ws" } else { "wss" };
+    let url = format!("{scheme}://{domain}{path}");
     let mut request = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => return WsConnectResult::Failed(format!("bad URL: {}", e)),
@@ -241,10 +247,13 @@ async fn connect_ws_with_path(
     }
 
     // ── TLS handshake + WebSocket upgrade ─────────────────────────────────
-    let result = tokio::time::timeout(
-        timeout,
-        tls_handshake_and_upgrade(tcp, request, skip_tls_verify, sni_override),
-    )
+    let result = tokio::time::timeout(timeout, async {
+        if disable_tls {
+            client_async_with_config(request, MaybeTlsStream::Plain(tcp), Some(ws_config())).await
+        } else {
+            tls_handshake_and_upgrade(tcp, request, skip_tls_verify, sni_override).await
+        }
+    })
     .await;
 
     match result {
@@ -252,6 +261,9 @@ async fn connect_ws_with_path(
             let status = response.status().as_u16();
 
             if status == 101 {
+                if disable_tls {
+                    crate::stats::STATS.cf_plain();
+                }
                 WsConnectResult::Connected(ws)
             } else if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 WsConnectResult::Redirect(status)
@@ -459,6 +471,7 @@ pub async fn connect_ws_for_dc_path_with_outbound(
             timeout,
             outbound,
             sni_override,
+            false,
         )
         .await
         {
@@ -744,8 +757,18 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
 
         // Pass the CF domain as the TCP host so that Tokio's DNS resolution
         // returns Cloudflare's anycast IP rather than Telegram's DC IP.
-        match connect_ws_with_outbound(&domain, &domain, skip_tls_verify, timeout, outbound, None)
-            .await
+        match connect_ws_with_path(
+            &domain,
+            &domain,
+            "/apiws",
+            true,
+            skip_tls_verify,
+            timeout,
+            outbound,
+            None,
+            outbound.cf_disable_tls(),
+        )
+        .await
         {
             WsConnectResult::Connected(ws) => {
                 return (Some(ws), Some(domain), false);
@@ -796,7 +819,19 @@ pub async fn connect_cf_record_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> Option<TgWsStream> {
-    match connect_ws_with_outbound(record, record, skip_tls_verify, timeout, outbound, None).await {
+    match connect_ws_with_path(
+        record,
+        record,
+        "/apiws",
+        true,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        None,
+        outbound.cf_disable_tls(),
+    )
+    .await
+    {
         WsConnectResult::Connected(ws) => Some(ws),
         _ => None,
     }
@@ -855,6 +890,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
         timeout,
         outbound,
         None,
+        outbound.cf_disable_tls(),
     )
     .await
     {
@@ -953,11 +989,14 @@ fn build_tls_connector(skip_verify: bool) -> Connector {
 
 /// The shared certificate-verifying client config, using the bundled WebPKI
 /// root store.
-fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
+pub(crate) fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
     VERIFYING_CONFIG
         .get_or_init(|| {
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            for cert in rustls_native_certs::load_native_certs().certs {
+                let _ = root_store.add(cert);
+            }
 
             let mut config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)

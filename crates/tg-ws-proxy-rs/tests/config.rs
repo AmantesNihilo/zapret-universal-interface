@@ -2,6 +2,25 @@ use clap::Parser;
 use tg_ws_proxy_rs::config::Config;
 
 #[test]
+fn upstream_flags_and_explicit_empty_dc_do_not_restore_defaults() {
+    for args in [
+        vec!["tg-ws-proxy", "--dc-ip"],
+        vec!["tg-ws-proxy", "--no-direct-dc"],
+        vec!["tg-ws-proxy", "--dc-ip", "--h2"],
+    ] {
+        let config = Config::try_from_args(args).unwrap();
+        assert!(config.no_direct_dc);
+        assert!(config.dc_ip.is_empty());
+    }
+    let config = Config::try_from_args(["tg-ws-proxy", "--no-secure", "--h2"]).unwrap();
+    assert!(config.cf_disable_tls);
+    assert!(config.h2);
+    assert!(config.outbound_connector().unwrap().cf_disable_tls());
+    assert!(Config::try_from_args(["tg-ws-proxy", "--h2", "--no-h2"]).is_err());
+    assert!(!Config::try_from_args(["tg-ws-proxy"]).unwrap().h2);
+}
+
+#[test]
 fn ee_secret_supplies_inbound_faketls_domain_and_key() {
     let key = "2a519e5be6c3219c69879e5fa2a0eab8";
     let domain = "www.yandex.ru";
