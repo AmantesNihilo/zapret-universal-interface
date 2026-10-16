@@ -1,0 +1,30 @@
+{
+  "version": "2.2.4",
+  "sourceCommit": "273500fffd295f266a57c1bd12bc1ab95fea6cd0",
+  "captureDate": "2026-10-17",
+  "method": "Static Svelte server rendering of current UI components, captured using headless Chromium. These images are browser previews, not native Windows window captures.",
+  "profile": "Demonstration Classic profile using bundled preset names. Both services stopped; no proxy secret and no network results.",
+  "theme": "dark",
+  "accent": "cyan",
+  "language": "ru",
+  "deviceScaleFactor": 1.5,
+  "viewports": {
+    "main-portrait.png": [440, 700],
+    "main-landscape.png": [920, 560],
+    "network-tests.png": [920, 560],
+    "presets.png": [920, 560],
+    "telegram.png": [920, 560],
+    "appearance.png": [920, 560]
+  },
+  "componentSources": [
+    "src/lib/features/profiles/MainView.svelte",
+    "src/lib/features/settings/SettingsView.svelte",
+    "src/lib/features/settings/GeneralSettings.svelte",
+    "src/lib/features/settings/ServicesSettings.svelte",
+    "src/lib/features/network-test/NetworkTestSettings.svelte",
+    "src/lib/features/presets/PresetsSettings.svelte",
+    "src/lib/components/TgWsSettings.svelte",
+    "src/lib/styles/global.css",
+    "src/lib/styles/tokens.css"
+  ]
+}
