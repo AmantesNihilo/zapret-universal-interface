@@ -4,10 +4,10 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { CircleHelp, Minus, X } from "@lucide/svelte";
   import { commands } from "$lib/api/commands";
+  import { applyProfilePatch, type ProfilePatch } from "$lib/features/profiles/model";
   import type {
     ConflictProcess,
     Preset,
-    Profile,
     Settings as SettingsModel,
     TestTargetConfig,
     ZapretEngine
@@ -54,8 +54,6 @@
   import { diagnostics, loadDiagnostics } from "$lib/stores/diagnostics";
   import {
     batchRecommendations,
-    currentProgress,
-    currentTargets,
     testAbortReason,
     testResults,
     testRunning,
@@ -91,7 +89,7 @@
 
   const activeProfile = $derived.by(() => {
     const file = $profilesFile;
-    return file.profiles.find((profile) => profile.id === file.activeProfileId) ?? file.profiles[0];
+    return file.profiles.find((profile) => profile.id === file.activeProfileId) ?? file.profiles[0] ?? null;
   });
 
   const selectedPreset = $derived.by(() => {
@@ -279,14 +277,14 @@
     view = "settings";
   }
 
-  function updateProfile(patch: Partial<Profile>): Promise<void> {
+  function updateProfile(patch: ProfilePatch): Promise<void> {
     if (!activeProfile) return Promise.resolve();
     const profileId = activeProfile.id;
     const task = profileUpdateQueue.then(async () => {
       const file = get(profilesFile);
       const current = file.profiles.find((profile) => profile.id === profileId);
       if (!current) return;
-      await saveProfile({ ...current, ...patch });
+      await saveProfile(applyProfilePatch(current, patch));
     });
     profileUpdateQueue = task.catch((caught) => {
       error = String(caught);
@@ -548,7 +546,10 @@
               {serviceConfigLocked}
               updateInfo={updater.info}
               updateChecking={updater.checking}
-              updateMessage={updater.message}
+              updateError={updater.error}
+              updateLastChecked={updater.lastChecked}
+              updateManualChecked={updater.manualChecked}
+              updateInstalling={updater.installing}
               onChooseEngine={(engine) => runAction(() => chooseZapretEngine(engine))}
               onUpdateSettings={updateSettings}
               onUpdateWindowLayout={updateWindowLayout}

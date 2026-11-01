@@ -10,7 +10,10 @@
     serviceConfigLocked,
     updateInfo,
     updateChecking,
-    updateMessage,
+    updateError,
+    updateLastChecked,
+    updateManualChecked,
+    updateInstalling,
     onChooseEngine,
     onUpdateSettings,
     onUpdateWindowLayout,
@@ -20,7 +23,10 @@
     serviceConfigLocked: boolean;
     updateInfo: UpdateCheck | null;
     updateChecking: boolean;
-    updateMessage: string | null;
+    updateError: string | null;
+    updateLastChecked: number;
+    updateManualChecked: boolean;
+    updateInstalling: boolean;
     onChooseEngine: (engine: ZapretEngine) => void | Promise<void>;
     onUpdateSettings: (patch: Partial<Settings>) => void | Promise<void>;
     onUpdateWindowLayout: (layout: Settings["layoutOrientation"]) => void | Promise<void>;
@@ -175,8 +181,12 @@
     <div>
       <strong>{$t("update.title")}</strong>
       <span>
-        {#if updateMessage}
-          {updateMessage}
+        {#if updateChecking}
+          {$t("update.checking")}
+        {:else if updateError}
+          {$t("update.failed")}: {updateError}
+        {:else if updateManualChecked && updateInfo && !updateInfo.updateAvailable}
+          {$t("update.none", { version: updateInfo.currentVersion })}
         {:else if updateInfo?.updateAvailable}
           {$t("update.availableShort", { version: updateInfo.latestVersion ?? "" })}
         {:else if updateInfo}
@@ -185,8 +195,13 @@
           {$t("update.startupHint")}
         {/if}
       </span>
+      {#if updateLastChecked > 0 && updateError}
+        <small class="muted-text">{$t("update.lastSuccess", {
+          time: new Date(updateLastChecked).toLocaleString($settings.language === "ru" ? "ru-RU" : "en-US")
+        })}</small>
+      {/if}
     </div>
-    <button class="secondary-button" type="button" disabled={updateChecking} onclick={onCheckUpdates}>
+    <button class="secondary-button" type="button" disabled={updateChecking || updateInstalling} onclick={onCheckUpdates}>
       <RotateCw size={16} /> {updateChecking ? $t("update.checking") : $t("update.check")}
     </button>
   </div>

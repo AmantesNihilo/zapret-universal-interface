@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Activity, Cpu, Settings } from "@lucide/svelte";
   import type { AppState, Preset, Profile, ZapretEngine } from "$lib/api/types";
+  import type { ProfilePatch } from "./model";
   import PowerButton from "$lib/components/PowerButton.svelte";
   import ServiceRow from "$lib/components/ServiceRow.svelte";
   import { t } from "$lib/stores/i18n";
@@ -36,7 +37,7 @@
     serviceConfigLocked: boolean;
     tgProxyLink: string | null;
     onTogglePower: () => void | Promise<void>;
-    onUpdateProfile: (patch: Partial<Profile>) => void | Promise<void>;
+    onUpdateProfile: (patch: ProfilePatch) => void | Promise<void>;
     onConfigureZapret: () => void;
     onOpenSettings: (tab: "general" | "services") => void;
     onOpenActivity: () => void;

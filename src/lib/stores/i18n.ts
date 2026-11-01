@@ -5,6 +5,11 @@ type Vars = Record<string, string | number>;
 type Dictionary = Record<string, string>;
 
 const en: Dictionary = {
+  "form.integer.required": "Enter a number.",
+  "form.integer.integer": "Enter a whole number.",
+  "form.integer.range": "Enter a number from {min} to {max}.",
+  "form.saveFailed": "Could not save: {message}",
+  "tg.testUnexpectedKind": "The response belongs to a different connectivity test.",
   "app.subtitle": "zapret utility",
   "common.close": "Close",
   "common.cancel": "Cancel",
@@ -294,7 +299,8 @@ const en: Dictionary = {
   "update.available": "Update available",
   "update.availableShort": "Version {version} is available",
   "update.current": "Current version: {version}",
-  "update.startupHint": "ZUI checks GitHub releases on launch.",
+  "update.startupHint": "Check GitHub releases using the button below.",
+  "update.lastSuccess": "Previous successful check: {time}",
   "update.none": "No updates found. Current version: {version}",
   "update.failed": "Update check failed",
   "update.installFailed": "Update install failed",
@@ -351,6 +357,11 @@ const en: Dictionary = {
 };
 
 const ru: Dictionary = {
+  "form.integer.required": "Введите число.",
+  "form.integer.integer": "Введите целое число.",
+  "form.integer.range": "Введите число от {min} до {max}.",
+  "form.saveFailed": "Не удалось сохранить: {message}",
+  "tg.testUnexpectedKind": "Ответ относится к другому типу проверки подключения.",
   "app.subtitle": "утилита zapret",
   "common.close": "Закрыть",
   "common.cancel": "Отмена",
@@ -621,7 +632,8 @@ const ru: Dictionary = {
   "update.available": "Доступно обновление",
   "update.availableShort": "Доступна версия {version}",
   "update.current": "Текущая версия: {version}",
-  "update.startupHint": "ZUI проверяет релизы GitHub при запуске.",
+  "update.startupHint": "Проверьте релизы GitHub кнопкой ниже.",
+  "update.lastSuccess": "Последняя успешная проверка: {time}",
   "update.none": "Обновлений нет. Текущая версия: {version}",
   "update.failed": "Не удалось проверить обновления",
   "update.installFailed": "Не удалось установить обновление",

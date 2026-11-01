@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { invokeValidated } from "./client";
+import { parseConnectivityReport, parseUpdateCheck } from "./decoders";
 import type {
   AppState,
   ConflictProcess,
@@ -10,9 +12,7 @@ import type {
   ServiceStatus,
   Settings,
   TestResult,
-  TestTargetConfig,
-  TgWsConnectivityReport,
-  UpdateCheck
+  TestTargetConfig
 } from "./types";
 
 export const commands = {
@@ -43,9 +43,9 @@ export const commands = {
     invoke<ServiceStatus>("start_tg_ws", { host, port, secret }),
   stopTgWs: () => invoke<ServiceStatus>("stop_tg_ws"),
   testTgWsCfProxy: (profile: Profile) =>
-    invoke<TgWsConnectivityReport>("test_tg_ws_cf_proxy", { profile }),
+    invokeValidated("test_tg_ws_cf_proxy", parseConnectivityReport, { profile }),
   testTgWsCfWorker: (profile: Profile) =>
-    invoke<TgWsConnectivityReport>("test_tg_ws_cf_worker", { profile }),
+    invokeValidated("test_tg_ws_cf_worker", parseConnectivityReport, { profile }),
   getLogs: () => invoke<LogLine[]>("get_logs"),
   clearLogs: () => invoke<void>("clear_logs"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
@@ -73,6 +73,6 @@ export const commands = {
   importTestResults: (path: string) => invoke<TestResult[]>("import_test_results", { path }),
   getDiagnostics: () => invoke<Diagnostics>("get_diagnostics"),
   collectSupportReport: () => invoke<string>("collect_support_report"),
-  checkForUpdate: () => invoke<UpdateCheck>("check_for_update"),
+  checkForUpdate: () => invokeValidated("check_for_update", parseUpdateCheck),
   installUpdate: () => invoke<void>("install_update")
 };

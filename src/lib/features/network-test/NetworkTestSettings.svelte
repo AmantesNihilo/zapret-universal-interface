@@ -180,7 +180,7 @@
         <span>{$t("test.realityText")}</span>
       </details>
 
-      {#if displayedResults.length > 0}
+      {#if displayedResults[0]}
         <section class="test-results-section">
           <button class="test-results-toggle" type="button" aria-expanded={resultsExpanded} onclick={() => onResultsExpandedChange(!resultsExpanded)}>
             <span>

@@ -1,7 +1,11 @@
 <script lang="ts">
+  import { onDestroy, untrack } from "svelte";
   import { Check, ChevronDown, FlaskConical, RotateCw, X } from "@lucide/svelte";
   import { commands } from "$lib/api/commands";
-  import type { Profile, TgWsConnectivityReport } from "$lib/api/types";
+  import type { Profile, TgWsConnectivityKind } from "$lib/api/types";
+  import type { ProfilePatch } from "$lib/features/profiles/model";
+  import type { ConnectivityTestState } from "$lib/features/telegram/connectivity";
+  import IntegerField from "$lib/shared/ui/IntegerField.svelte";
   import { t } from "$lib/stores/i18n";
 
   let {
@@ -13,12 +17,24 @@
     profile: Profile;
     locked?: boolean;
     secretPreview: string;
-    onUpdate: (patch: Partial<Profile>) => void | Promise<void>;
+    onUpdate: (patch: ProfilePatch) => void | Promise<void>;
   }>();
 
-  let testKind = $state<"cfProxy" | "cfWorker" | null>(null);
-  let testReport = $state<TgWsConnectivityReport | null>(null);
-  let testError = $state<string | null>(null);
+  let testState = $state<ConnectivityTestState>({ status: "idle" });
+  let attempt = 0;
+  let testedProfile: Profile | undefined;
+
+  $effect(() => {
+    const current = profile;
+    untrack(() => {
+      if (current !== testedProfile) {
+        testedProfile = current;
+        attempt++;
+        testState = { status: "idle" };
+      }
+    });
+  });
+  onDestroy(() => { attempt++; });
 
   function splitLines(value: string): string[] {
     return value
@@ -33,18 +49,20 @@
     onUpdate({ tgWsSecret: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("") });
   }
 
-  async function runConnectivityTest(kind: "cfProxy" | "cfWorker") {
-    testKind = kind;
-    testReport = null;
-    testError = null;
+  async function runConnectivityTest(kind: TgWsConnectivityKind) {
+    if (testState.status === "loading") return;
+    const current = ++attempt;
+    testState = { status: "loading", kind };
     try {
-      testReport = kind === "cfProxy"
+      const report = kind === "cfProxy"
         ? await commands.testTgWsCfProxy(profile)
         : await commands.testTgWsCfWorker(profile);
-    } catch (caught) {
-      testError = String(caught);
-    } finally {
-      testKind = null;
+      if (current !== attempt) return;
+      if (report.kind !== kind) throw new Error($t("tg.testUnexpectedKind"));
+      testState = { status: "success", report };
+    } catch (caught: unknown) {
+      if (current !== attempt) return;
+      testState = { status: "error", message: caught instanceof Error ? caught.message : String(caught) };
     }
   }
 </script>
@@ -78,12 +96,14 @@
       </label>
       <label class="port-field">
         {$t("tg.port")}
-        <input
-          type="number"
-          min="1"
-          max="65535"
+        <IntegerField
+          min={1}
+          max={65535}
           value={profile.tgWsPort}
-          oninput={(event) => onUpdate({ tgWsPort: Number(event.currentTarget.value) })}
+          label={$t("tg.port")}
+          resetKey={profile.id}
+          disabled={locked}
+          onCommit={(value) => onUpdate({ tgWsPort: value })}
         />
       </label>
     </div>
@@ -138,10 +158,10 @@
       <button
         type="button"
         class="test-button"
-        disabled={testKind !== null || (profile.tgWsCfCustomEnabled && profile.tgWsCfDomains.length === 0)}
+        disabled={testState.status === "loading" || (profile.tgWsCfCustomEnabled && profile.tgWsCfDomains.length === 0)}
         onclick={() => runConnectivityTest("cfProxy")}
       >
-        {#if testKind === "cfProxy"}<span class="spin"><RotateCw size={16} /></span>{:else}<FlaskConical size={16} />{/if}
+        {#if testState.status === "loading" && testState.kind === "cfProxy"}<span class="spin"><RotateCw size={16} /></span>{:else}<FlaskConical size={16} />{/if}
         {$t("tg.test")}
       </button>
     </div>
@@ -189,10 +209,10 @@
       <button
         type="button"
         class="test-button"
-        disabled={testKind !== null || !(profile.tgWsCfWorkerDomain ?? "").trim()}
+        disabled={testState.status === "loading" || !(profile.tgWsCfWorkerDomain ?? "").trim()}
         onclick={() => runConnectivityTest("cfWorker")}
       >
-        {#if testKind === "cfWorker"}<span class="spin"><RotateCw size={16} /></span>{:else}<FlaskConical size={16} />{/if}
+        {#if testState.status === "loading" && testState.kind === "cfWorker"}<span class="spin"><RotateCw size={16} /></span>{:else}<FlaskConical size={16} />{/if}
         {$t("tg.test")}
       </button>
     </div>
@@ -209,24 +229,24 @@
     </label>
   </fieldset>
 
-  {#if testReport || testError}
-    <div class:error-result={Boolean(testError || (testReport && !testReport.allOk))} class="test-report">
+  {#if testState.status === "success" || testState.status === "error"}
+    <div class:error-result={testState.status === "error" || !testState.report.allOk} class="test-report">
       <div class="report-title">
-        {#if testError || !testReport?.allOk}<X size={17} />{:else}<Check size={17} />{/if}
+        {#if testState.status === "error" || !testState.report.allOk}<X size={17} />{:else}<Check size={17} />{/if}
         <strong>
-          {testError
+          {testState.status === "error"
             ? $t("tg.testFailed")
-            : testReport?.allOk
+            : testState.report.allOk
               ? $t("tg.testPassed")
               : $t("tg.testPartial")}
         </strong>
       </div>
-      {#if testError}
-        <p>{testError}</p>
-      {:else if testReport}
-        <p>{testReport.probes.filter((probe) => probe.ok).length}/{testReport.probes.length} {$t("tg.dcPassed")}</p>
+      {#if testState.status === "error"}
+        <p>{testState.message}</p>
+      {:else}
+        <p>{testState.report.probes.filter((probe) => probe.ok).length}/{testState.report.probes.length} {$t("tg.dcPassed")}</p>
         <div class="probe-grid">
-          {#each testReport.probes as probe}
+          {#each testState.report.probes as probe}
             <div class:failed={!probe.ok} class="probe-row" title={`${probe.target}\n${probe.detail}`}>
               <span>DC{probe.dc} · {probe.domain}</span>
               <strong>{probe.ok ? `${probe.latencyMs ?? 0} ms` : "FAIL"}</strong>
@@ -268,37 +288,39 @@
       <div class="form-row">
         <label>
           {$t("tg.bufferKb")}
-          <input
-            type="number"
-            min="4"
-            max="16384"
+          <IntegerField
+            min={4}
+            max={16384}
             value={profile.tgWsBufKb}
+            label={$t("tg.bufferKb")}
+            resetKey={profile.id}
             disabled={locked}
-            oninput={(event) => onUpdate({ tgWsBufKb: Number(event.currentTarget.value) })}
+            onCommit={(value) => onUpdate({ tgWsBufKb: value })}
           />
         </label>
         <label>
           {$t("tg.poolSize")}
-          <input
-            type="number"
-            min="0"
-            max="64"
+          <IntegerField
+            min={0}
+            max={64}
             value={profile.tgWsPoolSize}
+            label={$t("tg.poolSize")}
+            resetKey={profile.id}
             disabled={locked}
-            oninput={(event) => onUpdate({ tgWsPoolSize: Number(event.currentTarget.value) })}
+            onCommit={(value) => onUpdate({ tgWsPoolSize: value })}
           />
         </label>
       </div>
       <label>
         {$t("tg.logMaxMb")}
-        <input
-          type="number"
-          min="1"
-          max="1024"
-          step="1"
+        <IntegerField
+          min={1}
+          max={1024}
           value={profile.tgWsLogMaxMb}
+          label={$t("tg.logMaxMb")}
+          resetKey={profile.id}
           disabled={locked}
-          oninput={(event) => onUpdate({ tgWsLogMaxMb: Number(event.currentTarget.value) })}
+          onCommit={(value) => onUpdate({ tgWsLogMaxMb: value })}
         />
       </label>
       <label class="switch-row">

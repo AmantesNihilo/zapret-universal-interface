@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { ComponentProps } from "svelte";
   import { Cpu, FolderOpen, RotateCw } from "@lucide/svelte";
   import type { Diagnostics, Preset, Profile, ZapretEngine } from "$lib/api/types";
   import PresetDropdown from "$lib/components/PresetDropdown.svelte";
@@ -27,7 +28,7 @@
     serviceConfigLocked: boolean;
     diagnostics: Diagnostics | null;
     tgProxySecret: string;
-    onUpdateProfile: (patch: Partial<Profile>) => void | Promise<void>;
+    onUpdateProfile: ComponentProps<typeof TgWsSettings>["onUpdate"];
     onBeginEngineChange: () => void;
     onConfigureZapret: () => void;
     onOpenResources: () => void | Promise<void>;
