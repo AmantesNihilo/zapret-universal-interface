@@ -57,8 +57,8 @@ use crate::crypto::{
 };
 use crate::faketls::{
     TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_client_hello,
-    build_faketls_server_hello, drain_faketls_server_hello, parse_faketls_client_hello,
-    read_tls_appdata, read_tls_record_bytes, sign_faketls_client_hello, write_tls_appdata,
+    drain_faketls_server_hello, parse_faketls_client_hello, read_tls_appdata,
+    read_tls_record_bytes, sign_faketls_client_hello, write_tls_appdata,
 };
 use crate::outbound::OutboundConnector;
 use crate::pool::{CfTarget, CfTier, WsPool};
@@ -173,7 +173,6 @@ static IP_FAIL: CooldownMap<String> = CooldownMap::new();
 /// Per-upstream cooldown for MTProto proxies, keyed by `host:port`.
 static UPSTREAM_FAIL: CooldownMap<String> = CooldownMap::new();
 /// Per-Worker cooldown for the Cloudflare Worker path.
-static CF_WORKER_FAIL: CooldownMap<String> = CooldownMap::new();
 /// Per-DC cooldown for a *failed* domain-fronting attempt — distinct from
 /// `Runtime`'s sticky "fronting is currently working" state.  Without this, a
 /// network that blocks Telegram's DC IPs outright (not just by SNI) would
@@ -188,7 +187,6 @@ pub(crate) fn reset_route_health() {
     WS_FAIL.clear_all();
     IP_FAIL.clear_all();
     UPSTREAM_FAIL.clear_all();
-    CF_WORKER_FAIL.clear_all();
     FRONTING_FAIL.clear_all();
     CF_BALANCE_COUNTER.store(0, Ordering::Relaxed);
     CF_WORKER_BALANCE_COUNTER.store(0, Ordering::Relaxed);
@@ -398,6 +396,19 @@ impl PendingData {
 }
 
 impl ClientReader {
+    async fn disconnected_during_setup(&mut self) {
+        let reader = match self {
+            Self::Plain(reader) => reader,
+            Self::FakeTls { reader, pending } if pending.data.is_empty() => reader,
+            Self::FakeTls { .. } => return std::future::pending().await,
+        };
+        // Preserve any buffered client request for the bridge, including a TCP
+        // half-close after a valid request. peek is cancellation safe.
+        if matches!(reader.peek(&mut [0]).await, Ok(1)) {
+            std::future::pending().await
+        }
+    }
+
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(buf).await,
@@ -505,7 +516,20 @@ async fn accept_inbound_faketls(
         return None;
     }
 
-    let server_hello = build_faketls_server_hello(matched_secret, &hello);
+    if !crate::faketls::accept_client_hello_once(hello.random) {
+        debug!("[{}] rejected repeated FakeTLS ClientHello", label);
+        STATS.masked();
+        proxy_to_masking_domain(label, reader, writer, &record, expected_domain, runtime).await;
+        return None;
+    }
+
+    let server_hello = crate::faketls::build_profiled_server_hello(
+        matched_secret,
+        &hello,
+        runtime.faketls_appdata_len(),
+    );
+    let delay_ms = rand::random_range(8..=24);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     if let Err(e) = writer.write_all(&server_hello).await {
         debug!("[{}] write FakeTLS ServerHello: {}", label, e);
         return None;
@@ -590,7 +614,6 @@ struct Timeouts {
     upstream_connect: Duration,
     upstream_fail_cooldown: Duration,
     cf_connect: Duration,
-    cf_fail_cooldown: Duration,
     fronting_fail_cooldown: Duration,
 }
 
@@ -607,7 +630,6 @@ impl Timeouts {
             upstream_connect: Duration::from_secs(config.upstream_connect_timeout),
             upstream_fail_cooldown: Duration::from_secs(config.upstream_fail_cooldown),
             cf_connect: Duration::from_secs(config.cf_connect_timeout),
-            cf_fail_cooldown: Duration::from_secs(config.cf_fail_cooldown),
             fronting_fail_cooldown: Duration::from_secs(config.fronting_fail_cooldown),
         }
     }
@@ -657,6 +679,8 @@ pub async fn handle_client_with_runtime(
     let socket = socket2::SockRef::from(&stream);
     let _ = socket.set_send_buffer_size(config.buf_bytes());
     let _ = socket.set_recv_buffer_size(config.buf_bytes());
+    let _ =
+        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(120)));
 
     let secrets = config.normalized_secrets();
     let timeouts = Timeouts::from_config(&config);
@@ -731,7 +755,7 @@ pub async fn handle_client_with_runtime(
         );
 
         // Drain the connection silently to avoid giving information to scanners.
-        reader.drain().await;
+        let _ = tokio::time::timeout(timeouts.handshake, reader.drain()).await;
 
         return;
     };
@@ -817,13 +841,15 @@ pub async fn handle_client_with_runtime(
 async fn select_bridge(
     route: &Route<'_>,
     target_ip: Option<&str>,
-    reader: ClientReader,
+    mut reader: ClientReader,
     writer: ClientWriter,
     params: BridgeDispatch,
 ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
-    select_upstream(route, target_ip)
-        .await
-        .map(|upstream| bridge_selected(reader, writer, upstream, params))
+    let upstream = tokio::select! {
+        _ = reader.disconnected_during_setup() => return None,
+        upstream = select_upstream(route, target_ip) => upstream?,
+    };
+    Some(bridge_selected(reader, writer, upstream, params))
 }
 
 /// The upstream a connection was routed to, ready to be bridged.
@@ -1294,7 +1320,7 @@ impl Route<'_> {
         );
 
         for worker_domain in domain_order(worker_domains, first_worker) {
-            if CF_WORKER_FAIL.active(worker_domain) {
+            if self.runtime.outbound().cf_worker_cooling(worker_domain) {
                 debug!(
                     "[{}] DC{}{} CF Worker {} in cooldown, skipping",
                     self.label, self.dc, self.media, worker_domain
@@ -1321,7 +1347,6 @@ impl Route<'_> {
             match ws {
                 Some(ws) => {
                     STATS.cfproxy();
-                    CF_WORKER_FAIL.clear(worker_domain);
                     info!(
                         "[{}] DC{}{} {} → CF Worker connected ({})",
                         self.label, self.dc, self.media, reason, worker_domain
@@ -1343,17 +1368,7 @@ impl Route<'_> {
 
                     return Some(ws);
                 }
-                None => {
-                    CF_WORKER_FAIL.set(worker_domain.to_string(), self.timeouts.cf_fail_cooldown);
-                    warn!(
-                        "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
-                        self.label,
-                        self.dc,
-                        self.media,
-                        worker_domain,
-                        self.timeouts.cf_fail_cooldown.as_secs()
-                    );
-                }
+                None => continue,
             }
         }
 
@@ -1771,8 +1786,15 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         async move {
             // Keep every sink operation in this direction so upload and download
             // can be polled independently by `join_bridge`.
-            if let Err(e) = ws_sink.send(Message::Binary(relay_init.to_vec())).await {
-                warn!("[{}] failed to send relay init: {}", label, e);
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    ws_sink.send(Message::Binary(relay_init.to_vec()))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                warn!("[{}] failed to send WebSocket relay init", label);
                 return;
             }
 
@@ -2137,23 +2159,35 @@ async fn bridge_tcp(
         debug!("[{}] TCP fallback skipped (backoff or connecting)", label);
         return;
     };
-    let remote = match runtime.outbound().connect(dst, 443, connect_timeout).await {
-        Ok(s) => s,
-        Err(e) => {
+    let setup = async {
+        let mut remote = runtime
+            .outbound()
+            .connect(dst, 443, connect_timeout)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = remote.set_nodelay(true);
+        remote
+            .write_all(relay_init)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(remote)
+    };
+    let remote = tokio::select! {
+        _ = reader.disconnected_during_setup() => {
+            attempt.cancel();
+            return;
+        }
+        result = tokio::time::timeout(connect_timeout, setup) => result,
+    };
+    let remote = match remote.unwrap_or_else(|_| Err("timed out".to_string())) {
+        Ok(socket) => socket,
+        Err(error) => {
             STATS.tcp_error();
-            warn!("[{}] TCP fallback connect failed: {}", label, e);
+            warn!("[{}] TCP fallback setup failed: {}", label, error);
             return;
         }
     };
-    let _ = remote.set_nodelay(true);
     let (mut rem_reader, mut rem_writer) = remote.into_split();
-
-    // Send relay init to the remote Telegram server.
-    if let Err(e) = rem_writer.write_all(relay_init).await {
-        STATS.tcp_error();
-        warn!("[{}] TCP fallback: send relay init failed: {}", label, e);
-        return;
-    }
     attempt.success();
     drop(attempt);
     STATS.tcp_fallback();

@@ -1,9 +1,12 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use tokio::net::{TcpStream, lookup_host};
+use tokio::time::Instant;
 use tokio_socks::TargetAddr;
 use tokio_socks::tcp::Socks5Stream;
 
@@ -50,6 +53,9 @@ pub struct OutboundConnector {
     config: OutboundConfig,
     socket_buffer_bytes: Option<usize>,
     cf_disable_tls: bool,
+    cf_failure_cooldown: Duration,
+    cf_tls_cooldowns: Mutex<HashMap<String, Instant>>,
+    cf_worker_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl OutboundConnector {
@@ -61,6 +67,9 @@ impl OutboundConnector {
             },
             socket_buffer_bytes: None,
             cf_disable_tls: false,
+            cf_failure_cooldown: Duration::from_secs(60),
+            cf_tls_cooldowns: Mutex::default(),
+            cf_worker_cooldowns: Mutex::default(),
         }
     }
 
@@ -73,6 +82,9 @@ impl OutboundConnector {
             config: OutboundConfig::from_sources(outbound_proxy, no_proxy, use_env)?,
             socket_buffer_bytes: None,
             cf_disable_tls: false,
+            cf_failure_cooldown: Duration::from_secs(60),
+            cf_tls_cooldowns: Mutex::default(),
+            cf_worker_cooldowns: Mutex::default(),
         })
     }
 
@@ -89,6 +101,31 @@ impl OutboundConnector {
 
     pub fn cf_disable_tls(&self) -> bool {
         self.cf_disable_tls
+    }
+
+    pub(crate) fn with_cf_failure_cooldown(mut self, duration: Duration) -> Self {
+        self.cf_failure_cooldown = duration;
+        self
+    }
+
+    pub(crate) fn cf_failure_cooldown(&self) -> Duration {
+        self.cf_failure_cooldown
+    }
+
+    pub(crate) fn cf_tls_cooling(&self, host: &str) -> bool {
+        cooling(&self.cf_tls_cooldowns, host)
+    }
+
+    pub(crate) fn cool_cf_tls(&self, host: &str) {
+        cool(&self.cf_tls_cooldowns, host, Duration::from_secs(30));
+    }
+
+    pub(crate) fn cf_worker_cooling(&self, host: &str) -> bool {
+        cooling(&self.cf_worker_cooldowns, host)
+    }
+
+    pub(crate) fn cool_cf_worker(&self, host: &str, duration: Duration) {
+        cool(&self.cf_worker_cooldowns, host, duration);
     }
 
     pub fn summary(&self) -> Option<String> {
@@ -135,6 +172,24 @@ impl OutboundConnector {
             .no_proxy
             .as_ref()
             .is_some_and(|no_proxy| no_proxy.matches(target_host, target_port))
+    }
+}
+
+fn cooling(entries: &Mutex<HashMap<String, Instant>>, host: &str) -> bool {
+    entries
+        .lock()
+        .unwrap()
+        .get(host)
+        .is_some_and(|until| Instant::now() < *until)
+}
+
+fn cool(entries: &Mutex<HashMap<String, Instant>>, host: &str, duration: Duration) {
+    let now = Instant::now();
+    let mut entries = entries.lock().unwrap();
+    entries.retain(|_, until| now < *until);
+    if entries.len() < 1024 || entries.contains_key(host) {
+        let until = entries.entry(host.to_owned()).or_insert(now);
+        *until = (*until).max(now + duration);
     }
 }
 

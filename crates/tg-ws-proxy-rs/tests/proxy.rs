@@ -372,7 +372,6 @@ async fn proxy_protocol_v1_header_is_consumed_before_mtproto_handshake() {
         .unwrap();
     let (handshake, _, _) = generate_client_handshake(&secret, 2, ProtoTag::PaddedIntermediate);
     client.write_all(&handshake).await.unwrap();
-    drop(client);
 
     await_proxy_handler(handler).await;
 
@@ -409,8 +408,6 @@ async fn inbound_faketls_handshake_is_accepted_and_routed() {
 
     let (handshake, _, _) = generate_client_handshake(&secret, 2, ProtoTag::PaddedIntermediate);
     write_tls_appdata(&mut writer, &handshake).await.unwrap();
-    drop(writer);
-    drop(reader);
 
     await_proxy_handler(handler).await;
 

@@ -224,11 +224,22 @@ impl TgWsRuntimeHandle {
         !self.thread.is_finished()
     }
 
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.is_running() && self.shutdown_requested.load(Ordering::Acquire)
+    }
+
     pub fn failure(&self) -> Option<String> {
         self.failure.lock().ok().and_then(|failure| failure.clone())
     }
 
     pub fn stop(mut self) -> Result<(), String> {
+        self.wait_for_stop()?;
+        self.thread
+            .join()
+            .map_err(|_| "tg-ws runtime thread panicked".to_string())
+    }
+
+    pub(crate) fn wait_for_stop(&mut self) -> Result<(), String> {
         self.shutdown_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -238,13 +249,9 @@ impl TgWsRuntimeHandle {
             std::thread::sleep(Duration::from_millis(25));
         }
         if !self.thread.is_finished() {
-            return Err(
-                "tg-ws runtime did not stop within 5 seconds; its thread was detached".to_string(),
-            );
+            return Err("tg-ws runtime did not stop within 5 seconds".to_string());
         }
-        self.thread
-            .join()
-            .map_err(|_| "tg-ws runtime thread panicked".to_string())
+        Ok(())
     }
 }
 

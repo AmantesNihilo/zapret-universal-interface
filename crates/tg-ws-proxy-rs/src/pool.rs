@@ -318,7 +318,10 @@ impl WsPool {
     /// Worker (or a network that cannot reach Cloudflare at all) is not
     /// dialled again behind the user's back on every client connection.
     pub fn cf_prefetch(self: &Arc<Self>, target: CfTarget) {
-        if self.pool_size == 0 {
+        if self.pool_size == 0
+            || (target.tier == CfTier::Worker
+                && self.runtime.outbound().cf_worker_cooling(&target.domain))
+        {
             return;
         }
 

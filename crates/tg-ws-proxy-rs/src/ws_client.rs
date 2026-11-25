@@ -92,6 +92,8 @@ pub enum WsConnectResult {
     Redirect(u16),
     /// Any other non-101 status code or transport error.
     Failed(String),
+    /// An HTTP response where a WebSocket upgrade was expected.
+    HttpStatus(u16),
     /// The TCP connect ran out the clock: nothing at `ip:443` answered.
     ///
     /// Distinct from [`Self::TimedOut`] because the two call for opposite
@@ -281,7 +283,7 @@ async fn connect_ws_with_path(
                     return WsConnectResult::Redirect(status);
                 }
 
-                WsConnectResult::Failed(format!("HTTP {} from server", status))
+                WsConnectResult::HttpStatus(status)
             } else {
                 WsConnectResult::Failed(e.to_string())
             }
@@ -484,6 +486,13 @@ pub async fn connect_ws_for_dc_path_with_outbound(
                     dc, media, code, domain
                 );
                 // Keep trying next domain; still counts as all_redirects.
+            }
+            WsConnectResult::HttpStatus(status) => {
+                warn!(
+                    "WS DC{}{} failed on {}: HTTP {} from server",
+                    dc, media, domain, status
+                );
+                all_redirects = false;
             }
             WsConnectResult::Failed(reason) => {
                 warn!("WS DC{}{} failed on {}: {}", dc, media, domain, reason);
@@ -751,24 +760,15 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     let media = media_tag(is_media);
     let mut all_redirects = true;
     let mut attempts = CfAttempts::with_offset(dc, cf_domains, is_media, first_domain);
+    let mut timeouts = 0;
 
     while let Some(domain) = attempts.next_domain() {
         debug!("CF WS trying DC{}{} → {}", dc, media, domain);
 
         // Pass the CF domain as the TCP host so that Tokio's DNS resolution
         // returns Cloudflare's anycast IP rather than Telegram's DC IP.
-        match connect_ws_with_path(
-            &domain,
-            &domain,
-            "/apiws",
-            true,
-            skip_tls_verify,
-            timeout,
-            outbound,
-            None,
-            outbound.cf_disable_tls(),
-        )
-        .await
+        match connect_cf_transport(&domain, "/apiws", true, skip_tls_verify, timeout, outbound)
+            .await
         {
             WsConnectResult::Connected(ws) => {
                 return (Some(ws), Some(domain), false);
@@ -778,6 +778,13 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
                     "CF WS DC{}{} got {} from {} (redirect)",
                     dc, media, code, domain
                 );
+            }
+            WsConnectResult::HttpStatus(status) => {
+                warn!(
+                    "CF WS DC{}{} failed on {}: HTTP {} from server",
+                    dc, media, domain, status
+                );
+                all_redirects = false;
             }
             WsConnectResult::Failed(reason) => {
                 // A `kws{N}-1` record that is simply absent from the user's CF
@@ -801,6 +808,10 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
                 warn!("CF WS DC{}{} timed out on {}", dc, media, domain);
                 attempts.note_timed_out(&domain);
                 all_redirects = false;
+                timeouts += 1;
+                if timeouts >= 5 {
+                    break;
+                }
             }
         }
     }
@@ -819,19 +830,7 @@ pub async fn connect_cf_record_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> Option<TgWsStream> {
-    match connect_ws_with_path(
-        record,
-        record,
-        "/apiws",
-        true,
-        skip_tls_verify,
-        timeout,
-        outbound,
-        None,
-        outbound.cf_disable_tls(),
-    )
-    .await
-    {
+    match connect_cf_transport(record, "/apiws", true, skip_tls_verify, timeout, outbound).await {
         WsConnectResult::Connected(ws) => Some(ws),
         _ => None,
     }
@@ -874,6 +873,9 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> Option<TgWsStream> {
+    if outbound.cf_worker_cooling(worker_domain) {
+        return None;
+    }
     let path = cf_worker_path(dst, dc, is_media);
     let media = media_tag(is_media);
     debug!(
@@ -881,16 +883,13 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
         dc, media, dst, worker_domain
     );
 
-    match connect_ws_with_path(
-        worker_domain,
+    match connect_cf_transport(
         worker_domain,
         &path,
         false,
         skip_tls_verify,
         timeout,
         outbound,
-        None,
-        outbound.cf_disable_tls(),
     )
     .await
     {
@@ -902,6 +901,28 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
             );
             None
         }
+        WsConnectResult::HttpStatus(status) => {
+            if status == 429 || (500..600).contains(&status) {
+                let cooldown = if status == 429 {
+                    let unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    Duration::from_secs(86_400 - unix.as_secs() % 86_400)
+                } else {
+                    outbound.cf_failure_cooldown()
+                };
+                outbound.cool_cf_worker(worker_domain, cooldown);
+                warn!(
+                    "CF Worker {} returned HTTP {}; cooldown {}s",
+                    worker_domain,
+                    status,
+                    cooldown.as_secs()
+                );
+            } else {
+                warn!("CF Worker {} returned HTTP {}", worker_domain, status);
+            }
+            None
+        }
         WsConnectResult::Failed(reason) => {
             warn!(
                 "CF Worker DC{}{} failed on {}: {}",
@@ -910,10 +931,63 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
             None
         }
         WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_) => {
+            outbound.cool_cf_worker(worker_domain, outbound.cf_failure_cooldown());
             warn!("CF Worker DC{}{} timed out on {}", dc, media, worker_domain);
             None
         }
     }
+}
+
+/// The caller's budget covers both connection attempts, including TCP and upgrade.
+async fn connect_cf_transport(
+    host: &str,
+    path: &str,
+    binary: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> WsConnectResult {
+    // Regular CF proxy records share transport cooldown across DCs. Workers
+    // use their full hostname because arbitrary Worker names are supported.
+    let cooldown_host = if binary {
+        host.split_once('.').map_or(host, |(_, base)| base)
+    } else {
+        host
+    };
+    let dial = |plain, budget| async move {
+        tokio::time::timeout(
+            budget,
+            connect_ws_with_path(
+                host,
+                host,
+                path,
+                binary,
+                skip_tls_verify,
+                budget,
+                outbound,
+                None,
+                plain,
+            ),
+        )
+        .await
+        .unwrap_or(WsConnectResult::TimedOut)
+    };
+    if outbound.cf_disable_tls() || outbound.cf_tls_cooling(cooldown_host) {
+        return dial(true, timeout).await;
+    }
+
+    let tls_budget = (timeout / 2).min(Duration::from_secs(3));
+    let result = dial(false, tls_budget).await;
+    if !matches!(
+        result,
+        WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_)
+    ) {
+        return result;
+    }
+
+    outbound.cool_cf_tls(cooldown_host);
+    debug!("CF TLS timed out on {}; retrying WebSocket over HTTP", host);
+    dial(true, timeout - tls_budget).await
 }
 
 /// Send a binary WebSocket message and flush.

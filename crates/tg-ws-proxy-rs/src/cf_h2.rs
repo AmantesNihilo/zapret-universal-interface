@@ -94,7 +94,11 @@ impl Pool {
             if Instant::now() >= deadline {
                 break;
             }
-            let host = format!("kws{dc}.{}", domains[(first + offset) % domains.len()]);
+            let domain = &domains[(first + offset) % domains.len()];
+            if outbound.cf_tls_cooling(domain) {
+                continue;
+            }
+            let host = format!("kws{dc}.{domain}");
             if self
                 .cooling
                 .lock()

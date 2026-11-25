@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::check;
 use crate::config::Config;
@@ -328,6 +328,22 @@ pub async fn run_with_listen(
     // settings, so they are behind one `Arc` instead of a per-connection clone.
     let config = Arc::new(config);
     let mut background = JoinSet::new();
+    if let Some(domain) = config.normalized_listen_faketls_domain() {
+        let runtime = runtime.clone();
+        let domain = domain.to_owned();
+        background.spawn(async move {
+            if let Some(len) = crate::faketls::probe_appdata_len(&domain, runtime.outbound()).await
+            {
+                runtime.set_faketls_appdata_len(len);
+                debug!(
+                    "FakeTLS profile measured first encrypted record: {} bytes",
+                    len
+                );
+            } else {
+                debug!("FakeTLS profile unavailable; using default record sizes");
+            }
+        });
+    }
     if config.default_domains {
         let runtime_clone = Arc::clone(&runtime);
         let user_cf_domains = user_cf_domains.clone();

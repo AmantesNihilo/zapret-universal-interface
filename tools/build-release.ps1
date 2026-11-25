@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.2.4",
+    [string]$Version = "2.2.5",
     [string]$TargetDir = "",
     [string]$OutputDir = "",
     [switch]$SkipMsi
@@ -43,14 +43,6 @@ New-Item -ItemType File -Path (Join-Path $stage "portable.flag") | Out-Null
 $data = Join-Path $stage "data"
 New-Item -ItemType Directory -Path $data | Out-Null
 $utf8 = [Text.UTF8Encoding]::new($false)
-$secretBytes = New-Object byte[] 16
-$secretRng = [Security.Cryptography.RandomNumberGenerator]::Create()
-try {
-    $secretRng.GetBytes($secretBytes)
-} finally {
-    $secretRng.Dispose()
-}
-$defaultTgSecret = ($secretBytes | ForEach-Object { $_.ToString('x2') }) -join ''
 
 $profiles = @{
     activeProfileId = "default"
@@ -64,7 +56,8 @@ $profiles = @{
             tgWsEnabled = $false
             tgWsHost = "127.0.0.1"
             tgWsPort = 1443
-            tgWsSecret = $defaultTgSecret
+            # The app generates and saves a unique secret on first profile load.
+            tgWsSecret = ""
             tgWsDcIps = @("2:149.154.167.220", "4:149.154.167.220")
             tgWsCfProxyEnabled = $true
             tgWsCfCustomEnabled = $false

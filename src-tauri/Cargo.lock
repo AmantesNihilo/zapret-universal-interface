@@ -4289,7 +4289,7 @@ dependencies = [
 
 [[package]]
 name = "tg-ws-proxy-rs"
-version = "2.3.4-zui.4"
+version = "2.3.4-zui.6"
 dependencies = [
  "aes",
  "async-http-proxy",
@@ -6039,7 +6039,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zui"
-version = "2.2.4"
+version = "2.2.5"
 dependencies = [
  "futures-util",
  "hex",

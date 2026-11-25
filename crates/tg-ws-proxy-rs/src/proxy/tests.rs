@@ -1,5 +1,38 @@
 use super::*;
 
+#[tokio::test]
+async fn setup_detects_empty_disconnect_without_consuming_buffered_request() {
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    let (reader, _writer) = accepted.into_split();
+    let mut reader = ClientReader::Plain(reader);
+    client.write_all(b"request").await.unwrap();
+    client.shutdown().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            reader.disconnected_during_setup()
+        )
+        .await
+        .is_err()
+    );
+    let mut request = [0; 7];
+    let mut offset = 0;
+    while offset < request.len() {
+        let read = reader.read(&mut request[offset..]).await.unwrap();
+        assert_ne!(read, 0);
+        offset += read;
+    }
+    assert_eq!(&request, b"request");
+    tokio::time::timeout(Duration::from_secs(1), reader.disconnected_during_setup())
+        .await
+        .unwrap();
+}
+
 #[test]
 fn balancing_cf_refill_keeps_the_expanded_dc_hostname() {
     let config = Config::try_from_args(["tg-ws-proxy", "--cf-balance"]).unwrap();

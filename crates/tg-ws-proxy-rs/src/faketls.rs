@@ -15,7 +15,7 @@
 //!    records, the standard MTProto obfuscation (AES-CTR) is used.
 
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -55,12 +55,114 @@ const TLS_CHANGE_CIPHER_SPEC_VALUE: u8 = 0x01;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const CLIENT_HELLO_TOLERANCE: u64 = 120;
+const X25519: u16 = 0x001d;
+const X25519_MLKEM768: u16 = 0x11ec;
+const HYBRID_CLIENT_SHARE_LEN: usize = 1216;
+const MLKEM_CIPHERTEXT_LEN: usize = 1088;
+
+#[derive(Default)]
+struct HelloReplayCache {
+    accepted: std::collections::HashSet<[u8; TLS_DIGEST_LEN]>,
+    expiry: std::collections::VecDeque<(std::time::Instant, [u8; TLS_DIGEST_LEN])>,
+}
+
+impl HelloReplayCache {
+    fn first_seen(&mut self, random: [u8; TLS_DIGEST_LEN], now: std::time::Instant) -> bool {
+        while self
+            .expiry
+            .front()
+            .is_some_and(|(expires, _)| *expires <= now)
+        {
+            let (_, expired) = self.expiry.pop_front().expect("checked front");
+            self.accepted.remove(&expired);
+        }
+        if self.accepted.len() >= 65_536 || !self.accepted.insert(random) {
+            return false;
+        }
+        let expires = now + std::time::Duration::from_secs(2 * CLIENT_HELLO_TOLERANCE + 1);
+        self.expiry.push_back((expires, random));
+        true
+    }
+}
+
+/// Remember authenticated incoming hellos across listener restarts.
+pub(crate) fn accept_client_hello_once(random: [u8; TLS_DIGEST_LEN]) -> bool {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<HelloReplayCache>> =
+        std::sync::LazyLock::new(Default::default);
+    CACHE
+        .lock()
+        .unwrap()
+        .first_seen(random, std::time::Instant::now())
+}
+
+#[cfg(test)]
+#[test]
+fn accepted_hello_is_rejected_until_replay_window_expires() {
+    let mut cache = HelloReplayCache::default();
+    let now = std::time::Instant::now();
+    let random = [42; TLS_DIGEST_LEN];
+    assert!(cache.first_seen(random, now));
+    assert!(!cache.first_seen(random, now + std::time::Duration::from_secs(240)));
+    assert!(cache.first_seen(random, now + std::time::Duration::from_secs(241)));
+}
+
+#[cfg(test)]
+#[test]
+fn server_hello_reflects_only_a_well_formed_hybrid_share() {
+    let mut extension = Vec::new();
+    extension.extend_from_slice(&((HYBRID_CLIENT_SHARE_LEN + 4) as u16).to_be_bytes());
+    extension.extend_from_slice(&X25519_MLKEM768.to_be_bytes());
+    extension.extend_from_slice(&(HYBRID_CLIENT_SHARE_LEN as u16).to_be_bytes());
+    extension.resize(6 + HYBRID_CLIENT_SHARE_LEN, 0);
+    assert!(valid_hybrid_share(&extension));
+    assert!(!valid_hybrid_share(&extension[..extension.len() - 1]));
+
+    let mut hello = FakeTlsClientHello {
+        random: [0; TLS_DIGEST_LEN],
+        session_id: vec![0; 32],
+        cipher_suite: [0x13, 0x01],
+        hostname: None,
+        hybrid_key_share: true,
+    };
+    for (hybrid, group, key_len) in [
+        (true, X25519_MLKEM768, MLKEM_CIPHERTEXT_LEN + 32),
+        (false, X25519, 32),
+    ] {
+        hello.hybrid_key_share = hybrid;
+        let answer = build_profiled_server_hello(&[42; 16], &hello, Some(213));
+        let group_offset = 9 + 40 + hello.session_id.len() + 10;
+        assert_eq!(
+            &answer[group_offset..group_offset + 2],
+            &group.to_be_bytes()
+        );
+        assert_eq!(
+            &answer[group_offset + 2..group_offset + 4],
+            &(key_len as u16).to_be_bytes()
+        );
+        let first_len = u16::from_be_bytes([answer[3], answer[4]]) as usize;
+        let appdata = 5 + first_len + 6;
+        assert_eq!(&answer[appdata..appdata + 5], &[0x17, 3, 3, 0, 213]);
+        assert_eq!(answer.len(), appdata + 5 + 213);
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn profile_reads_only_the_first_encrypted_record_header() {
+    let input: &[u8] = &[0x16, 3, 3, 0, 1, 2, 0x14, 3, 3, 0, 1, 1, 0x17, 3, 3, 1, 125];
+    assert_eq!(appdata_record_length(&mut &input[..]).await, Some(381));
+    assert_eq!(appdata_record_length(&mut &input[12..]).await, None);
+    assert_eq!(appdata_record_length(&mut &input[..5]).await, None);
+}
+
 #[derive(Clone, Debug)]
 pub struct FakeTlsClientHello {
     pub random: [u8; TLS_DIGEST_LEN],
     pub session_id: Vec<u8>,
     pub cipher_suite: [u8; 2],
     pub hostname: Option<String>,
+    hybrid_key_share: bool,
 }
 
 // ─── ClientHello construction ───────────────────────────────────────────────
@@ -220,6 +322,13 @@ pub fn parse_faketls_client_hello(record: &[u8], secret: &[u8]) -> Option<FakeTl
     if xored[..28].iter().any(|&b| b != 0) {
         return None;
     }
+    let timestamp = u32::from_le_bytes(xored[28..].try_into().ok()?);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    if now.as_secs().abs_diff(u64::from(timestamp)) > CLIENT_HELLO_TOLERANCE {
+        return None;
+    }
 
     let body = &handshake[4..];
     if body.len() < 2 + 32 + 1 {
@@ -252,24 +361,62 @@ pub fn parse_faketls_client_hello(record: &[u8], secret: &[u8]) -> Option<FakeTl
         return None;
     }
 
-    let hostname = parse_sni_extension(&body[p..p + extensions_len]);
+    let extensions = &body[p..p + extensions_len];
+    let hostname = parse_sni_extension(extensions);
 
     Some(FakeTlsClientHello {
         random: client_random,
         session_id,
         cipher_suite,
         hostname,
+        hybrid_key_share: offers_hybrid_key_share(extensions),
     })
 }
 
-/// Select the first real TLS 1.3 suite offered by the client. Telegram clients
-/// may put an RFC 8701 GREASE value first; echoing that value in ServerHello is
-/// invalid and makes the FakeTLS stream easy to distinguish or reject.
 fn select_tls13_cipher_suite(cipher_suites: &[u8]) -> [u8; 2] {
-    cipher_suites
-        .chunks_exact(2)
-        .find(|suite| suite[0] == 0x13 && (0x01..=0x03).contains(&suite[1]))
-        .map_or([0x13, 0x01], |suite| [suite[0], suite[1]])
+    [[0x13, 0x01], [0x13, 0x03], [0x13, 0x02]]
+        .into_iter()
+        .find(|suite| {
+            cipher_suites
+                .chunks_exact(2)
+                .any(|offered| offered == suite)
+        })
+        .unwrap_or([0x13, 0x01])
+}
+
+fn offers_hybrid_key_share(mut extensions: &[u8]) -> bool {
+    while let [hi, lo, len_hi, len_lo, rest @ ..] = extensions {
+        let len = u16::from_be_bytes([*len_hi, *len_lo]) as usize;
+        let Some((extension, remaining)) = rest.split_at_checked(len) else {
+            return false;
+        };
+        if [*hi, *lo] == [0, 0x33] {
+            return valid_hybrid_share(extension);
+        }
+        extensions = remaining;
+    }
+    false
+}
+
+fn valid_hybrid_share(extension: &[u8]) -> bool {
+    let [len_hi, len_lo, shares @ ..] = extension else {
+        return false;
+    };
+    let mut shares = shares;
+    if u16::from_be_bytes([*len_hi, *len_lo]) as usize != shares.len() {
+        return false;
+    }
+    let mut hybrid = false;
+    while let [hi, lo, size_hi, size_lo, rest @ ..] = shares {
+        let len = u16::from_be_bytes([*size_hi, *size_lo]) as usize;
+        let Some(remaining) = rest.get(len..) else {
+            return false;
+        };
+        hybrid |=
+            u16::from_be_bytes([*hi, *lo]) == X25519_MLKEM768 && len == HYBRID_CLIENT_SHARE_LEN;
+        shares = remaining;
+    }
+    hybrid && shares.is_empty()
 }
 
 fn parse_sni_extension(mut extensions: &[u8]) -> Option<String> {
@@ -303,11 +450,43 @@ fn parse_sni_extension(mut extensions: &[u8]) -> Option<String> {
 }
 
 pub fn build_faketls_server_hello(secret: &[u8], hello: &FakeTlsClientHello) -> Vec<u8> {
+    build_profiled_server_hello(secret, hello, None)
+}
+
+pub(crate) fn build_profiled_server_hello(
+    secret: &[u8],
+    hello: &FakeTlsClientHello,
+    appdata_len: Option<usize>,
+) -> Vec<u8> {
     let mut rng = rand::rng();
-    let mut key_share = [0u8; 32];
+    let group = if hello.hybrid_key_share {
+        X25519_MLKEM768
+    } else {
+        X25519
+    };
+    let mut key_share = vec![
+        0u8;
+        if hello.hybrid_key_share {
+            MLKEM_CIPHERTEXT_LEN
+        } else {
+            0
+        }
+    ];
     rng.fill_bytes(&mut key_share);
-    let cert_len = 1024 + (rng.next_u32() as usize % 3092);
-    let server_body_len = 86 + hello.session_id.len();
+    if let Ok(exchange) = rustls::crypto::ring::kx_group::X25519.start() {
+        key_share.extend_from_slice(exchange.pub_key());
+    } else {
+        let mut key = [0u8; 32];
+        rng.fill_bytes(&mut key);
+        key[31] &= 0x7f;
+        key_share.extend_from_slice(&key);
+    }
+    let cert_len = appdata_len.map_or_else(
+        || rng.random_range(64..=160),
+        |len| len.clamp(64, TLS_MAX_RECORD_PAYLOAD),
+    );
+    let extensions_len = 14 + key_share.len();
+    let server_body_len = 40 + extensions_len + hello.session_id.len();
     let handshake_len = 4 + server_body_len;
     let mut packet = Vec::with_capacity(5 + handshake_len + 6 + 5 + cert_len);
 
@@ -323,10 +502,12 @@ pub fn build_faketls_server_hello(secret: &[u8], hello: &FakeTlsClientHello) -> 
     packet.push(hello.session_id.len() as u8);
     packet.extend_from_slice(&hello.session_id);
     packet.extend_from_slice(&hello.cipher_suite);
-    packet.extend_from_slice(&[
-        0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d,
-        0x00, 0x20,
-    ]);
+    packet.push(0);
+    packet.extend_from_slice(&(extensions_len as u16).to_be_bytes());
+    packet.extend_from_slice(&[0, 0x2b, 0, 2, 3, 4, 0, 0x33]);
+    packet.extend_from_slice(&((4 + key_share.len()) as u16).to_be_bytes());
+    packet.extend_from_slice(&group.to_be_bytes());
+    packet.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
     packet.extend_from_slice(&key_share);
 
     push_tls_record_header(&mut packet, TLS_RECORD_CHANGE_CIPHER_SPEC, 1);
@@ -344,6 +525,64 @@ pub fn build_faketls_server_hello(secret: &[u8], hello: &FakeTlsClientHello) -> 
         .copy_from_slice(&digest);
 
     packet
+}
+
+/// Inspect only the initial TLS 1.3 flight. No HTTP request or proxy secret is sent.
+pub(crate) async fn probe_appdata_len(
+    domain: &str,
+    outbound: &crate::outbound::OutboundConnector,
+) -> Option<usize> {
+    let timeout = std::time::Duration::from_secs(5);
+    tokio::time::timeout(timeout, async {
+        let mut config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .ok()?
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let mut tls = rustls::ClientConnection::new(
+            config.into(),
+            rustls::pki_types::ServerName::try_from(domain.to_owned()).ok()?,
+        )
+        .ok()?;
+        let mut hello = Vec::new();
+        while tls.wants_write() {
+            tls.write_tls(&mut hello).ok()?;
+        }
+        let mut stream = outbound.connect(domain, 443, timeout).await.ok()?;
+        stream.write_all(&hello).await.ok()?;
+        appdata_record_length(&mut stream).await
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn appdata_record_length(reader: &mut (impl AsyncRead + Unpin)) -> Option<usize> {
+    let mut saw_handshake = false;
+    for _ in 0..TLS_MAX_HANDSHAKE_RECORDS {
+        let mut header = [0; 5];
+        reader.read_exact(&mut header).await.ok()?;
+        let size = u16::from_be_bytes([header[3], header[4]]) as usize;
+        match header[0] {
+            TLS_RECORD_APPLICATION_DATA if saw_handshake && size > 0 => return Some(size),
+            TLS_RECORD_HANDSHAKE => saw_handshake = true,
+            TLS_RECORD_CHANGE_CIPHER_SPEC if saw_handshake => {}
+            _ => return None,
+        }
+        if size > TLS_MAX_RECORD_PAYLOAD {
+            return None;
+        }
+        let copied = tokio::io::copy(&mut reader.take(size as u64), &mut tokio::io::sink())
+            .await
+            .ok()?;
+        if copied != size as u64 {
+            return None;
+        }
+    }
+    None
 }
 
 fn push_tls_record_header(out: &mut Vec<u8>, record_type: u8, payload_len: usize) {

@@ -5,6 +5,7 @@
 //! stateless pass-throughs to `config`, kept as methods so call sites can take
 //! everything they need from one place.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ const DEFAULT_FRONTING_COOLDOWN: Duration = Duration::from_secs(1800);
 
 pub struct Runtime {
     outbound: OutboundConnector,
+    faketls_appdata_len: AtomicUsize,
     pub h2: std::sync::Arc<crate::cf_h2::Pool>,
     pub tcp_backoff: std::sync::Arc<crate::connect_gate::Backoff>,
     direct_attempts: StdMutex<
@@ -39,6 +41,7 @@ impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
             outbound,
+            faketls_appdata_len: AtomicUsize::new(0),
             h2: std::sync::Arc::new(crate::cf_h2::Pool::default()),
             tcp_backoff: std::sync::Arc::new(crate::connect_gate::Backoff::default()),
             direct_attempts: StdMutex::new(std::collections::HashMap::new()),
@@ -74,6 +77,15 @@ impl Runtime {
 
     pub fn outbound(&self) -> &OutboundConnector {
         &self.outbound
+    }
+
+    pub(crate) fn set_faketls_appdata_len(&self, len: usize) {
+        self.faketls_appdata_len.store(len, Ordering::Relaxed);
+    }
+
+    pub(crate) fn faketls_appdata_len(&self) -> Option<usize> {
+        let len = self.faketls_appdata_len.load(Ordering::Relaxed);
+        (len != 0).then_some(len)
     }
 
     /// Return a consistent snapshot for one connection attempt.

@@ -7,6 +7,131 @@ use tokio_tungstenite::accept_hdr_async;
 
 use super::*;
 
+async fn read_connect(socket: &mut TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(socket.read_u8().await.unwrap());
+    }
+    String::from_utf8(request).unwrap()
+}
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn cf_timeout_retries_plain_and_reuses_route_during_cooldown() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    install_rustls_provider();
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = proxy.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut tls, _) = proxy.accept().await.unwrap();
+        assert!(
+            read_connect(&mut tls)
+                .await
+                .starts_with("CONNECT kws2.example.test:443 ")
+        );
+        tls.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        assert_eq!(tls.read_u8().await.unwrap(), 0x16);
+        // Leave the TLS handshake unanswered while accepting the fallback.
+        for _ in 0..2 {
+            let (mut plain, _) = proxy.accept().await.unwrap();
+            assert!(
+                read_connect(&mut plain)
+                    .await
+                    .starts_with("CONNECT kws2.example.test:80 ")
+            );
+            plain.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+            let _ws = accept_hdr_async(
+                plain,
+                |req: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    assert_eq!(req.uri().path(), "/apiws");
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", HeaderValue::from_static("binary"));
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let outbound =
+        OutboundConnector::from_config(Some(&format!("http://{address}")), Some(""), false)
+            .unwrap();
+    let timeout = Duration::from_secs(2);
+    let (ws, host, _) = connect_cf_ws_for_dc_with_outbound(
+        2,
+        &["example.test".into()],
+        false,
+        false,
+        timeout,
+        &outbound,
+    )
+    .await;
+    assert!(ws.is_some());
+    let record = host.unwrap();
+    assert!(outbound.cf_tls_cooling("example.test"));
+    assert!(
+        connect_cf_record_with_outbound(&record, false, timeout, &outbound)
+            .await
+            .is_some()
+    );
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_rate_limit_applies_to_other_dcs() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = proxy.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = proxy.accept().await.unwrap();
+        assert!(
+            read_connect(&mut socket)
+                .await
+                .starts_with("CONNECT worker.example.test:80 ")
+        );
+        socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+        socket
+            .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        proxy
+    });
+    let outbound =
+        OutboundConnector::from_config(Some(&format!("http://{address}")), Some(""), false)
+            .unwrap()
+            .with_cf_disable_tls(true);
+    let timeout = Duration::from_secs(2);
+    let host = "worker.example.test";
+    assert!(
+        connect_cf_worker_ws_for_dc_with_outbound(
+            host, "1.1.1.1", 2, false, false, timeout, &outbound
+        )
+        .await
+        .is_none()
+    );
+    let proxy = task.await.unwrap();
+    assert!(outbound.cf_worker_cooling(host));
+    assert!(
+        connect_cf_worker_ws_for_dc_with_outbound(
+            host, "1.1.1.1", 4, false, false, timeout, &outbound
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), proxy.accept())
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::result_large_err)]
 async fn cloudflare_plaintext_uses_port_80_and_preserves_websocket_framing() {

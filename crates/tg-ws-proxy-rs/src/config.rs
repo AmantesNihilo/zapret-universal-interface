@@ -852,6 +852,7 @@ impl Config {
             connector
                 .with_socket_buffer_size(self.buf_bytes())
                 .with_cf_disable_tls(self.cf_disable_tls)
+                .with_cf_failure_cooldown(std::time::Duration::from_secs(self.cf_fail_cooldown))
         })
     }
 

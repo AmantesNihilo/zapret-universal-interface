@@ -245,8 +245,8 @@ pub async fn await_task<T>(task: JoinHandle<T>) -> T {
 }
 
 /// Drive one full client connection through the proxy: connect, send a valid
-/// MTProto handshake for DC 2, then disconnect and wait for the handler to
-/// finish its fallback chain.
+/// MTProto handshake for DC 2, then stay connected while all rejected
+/// upstream attempts run through the fallback chain.
 pub async fn run_proxy_once(config: Config) {
     run_proxy_once_for_dc(config, 2).await;
 }
@@ -260,8 +260,6 @@ pub async fn run_proxy_once_for_dc(config: Config, dc: i16) {
 
     let (handshake, _, _) = generate_client_handshake(&secret, dc, ProtoTag::PaddedIntermediate);
     client.write_all(&handshake).await.unwrap();
-    drop(client);
-
     await_proxy_handler(handler).await;
 }
 

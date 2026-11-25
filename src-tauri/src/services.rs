@@ -814,6 +814,8 @@ fn validate_zapret2_resources(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+static TG_WS_LIFECYCLE: Mutex<()> = Mutex::new(());
+
 pub fn start_tg_ws(
     app: &AppHandle,
     state: &Mutex<RuntimeState>,
@@ -821,6 +823,16 @@ pub fn start_tg_ws(
     port: u16,
     secret: String,
 ) -> Result<ServiceStatus, String> {
+    let _lifecycle = TG_WS_LIFECYCLE.lock().unwrap();
+    if state
+        .lock()
+        .unwrap()
+        .tg_ws_runtime
+        .as_ref()
+        .is_some_and(|handle| handle.is_stopping())
+    {
+        return Err("tg-ws runtime is still stopping".to_string());
+    }
     refresh_status(app, state);
     if state
         .lock()
@@ -915,8 +927,9 @@ pub fn start_tg_ws(
 }
 
 pub fn stop_tg_ws(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<ServiceStatus, String> {
+    let _lifecycle = TG_WS_LIFECYCLE.lock().unwrap();
     let runtime_handle = state.lock().unwrap().tg_ws_runtime.take();
-    if let Some(runtime_handle) = runtime_handle {
+    if let Some(mut runtime_handle) = runtime_handle {
         logging::push(
             app,
             state,
@@ -928,7 +941,8 @@ pub fn stop_tg_ws(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servic
                 runtime_handle.port
             ),
         );
-        if let Err(error) = runtime_handle.stop() {
+        if let Err(error) = runtime_handle.wait_for_stop() {
+            state.lock().unwrap().tg_ws_runtime = Some(runtime_handle);
             logging::push(
                 app,
                 state,
@@ -937,6 +951,7 @@ pub fn stop_tg_ws(app: &AppHandle, state: &Mutex<RuntimeState>) -> Result<Servic
             );
             return Err(error);
         }
+        runtime_handle.stop()?;
         logging::push(app, state, LogSource::TgWs, "Shutdown completed");
     }
 

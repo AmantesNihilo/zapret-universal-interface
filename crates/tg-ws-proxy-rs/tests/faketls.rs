@@ -38,7 +38,7 @@ fn server_hello_skips_a_grease_cipher_suite() {
     sign_faketls_client_hello(&mut hello, &secret);
 
     let parsed = parse_faketls_client_hello(&hello, &secret).expect("valid FakeTLS hello");
-    assert_eq!(parsed.cipher_suite, [0x13, 0x02]);
+    assert_eq!(parsed.cipher_suite, [0x13, 0x03]);
 }
 
 #[test]

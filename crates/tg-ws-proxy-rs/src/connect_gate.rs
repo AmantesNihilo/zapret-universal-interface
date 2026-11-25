@@ -16,6 +16,7 @@ pub struct Attempt {
     state: Arc<Backoff>,
     key: String,
     success: bool,
+    cancelled: bool,
 }
 pub fn delay(failures: u32) -> Duration {
     Duration::from_secs(
@@ -36,10 +37,15 @@ impl Backoff {
             state: self.clone(),
             key: key.to_string(),
             success: false,
+            cancelled: false,
         })
     }
 }
 impl Attempt {
+    pub(crate) fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+
     pub fn success(&mut self) {
         self.success = true;
     }
@@ -51,6 +57,9 @@ impl Drop for Attempt {
             entries.remove(&self.key);
         } else if let Some(entry) = entries.get_mut(&self.key) {
             entry.connecting = false;
+            if self.cancelled {
+                return;
+            }
             entry.failures = entry.failures.saturating_add(1);
             entry.until = Some(Instant::now() + delay(entry.failures));
         }
@@ -66,6 +75,9 @@ mod tests {
         assert!(state.enter("dc:443").is_none());
         attempt.success();
         drop(attempt);
+        let mut cancelled = state.enter("dc:443").unwrap();
+        cancelled.cancel();
+        drop(cancelled);
         drop(state.enter("dc:443").unwrap());
         assert!(state.enter("dc:443").is_none());
         assert_eq!(delay(1), Duration::from_secs(30));
